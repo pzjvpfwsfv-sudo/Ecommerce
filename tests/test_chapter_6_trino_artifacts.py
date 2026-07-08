@@ -83,7 +83,10 @@ class Chapter6TrinoArtifactsTest(unittest.TestCase):
 
         self.assertIn("event_count", script_text)
         self.assertIn("Invoke-RestMethod", script_text)
+        self.assertIn("Invoke-CheckedCommand", script_text)
+        self.assertIn("Failed to start Trino with docker compose.", script_text)
         self.assertIn("nextUri", script_text)
+        self.assertIn("Expected exactly 2 non-empty SQL statements", script_text)
         self.assertIn("throw", script_text)
 
     def test_docs_mention_chapter6_trino_validation(self) -> None:

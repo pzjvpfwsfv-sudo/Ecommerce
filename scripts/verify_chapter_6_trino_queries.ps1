@@ -10,6 +10,20 @@ $chapter5Verify = Join-Path $repoRoot "scripts/verify_chapter_5_end_to_end.ps1"
 $querySqlPath = Join-Path $repoRoot "jobs/sql/11_trino_read_iceberg_user_behavior.sql"
 $trinoBaseUrl = "http://localhost:8088"
 
+function Invoke-CheckedCommand {
+    param(
+        [Parameter(Mandatory = $true)]
+        [scriptblock]$Command,
+        [Parameter(Mandatory = $true)]
+        [string]$FailureMessage
+    )
+
+    & $Command
+    if ($LASTEXITCODE -ne 0) {
+        throw $FailureMessage
+    }
+}
+
 function Wait-ForTrinoReady {
     param([int]$TimeoutSeconds = 90)
 
@@ -65,7 +79,9 @@ Write-Host "[chapter6-verify] preparing iceberg data through chapter 5 verificat
 & $chapter5Verify
 
 Write-Host "[chapter6-verify] starting trino service..."
-docker compose --env-file $envFile -f $composeFile --profile lakehouse up -d trino | Out-Null
+Invoke-CheckedCommand `
+    -Command { docker compose --env-file $envFile -f $composeFile --profile lakehouse up -d trino | Out-Null } `
+    -FailureMessage "Failed to start Trino with docker compose."
 
 Write-Host "[chapter6-verify] waiting for trino readiness..."
 Wait-ForTrinoReady
@@ -73,6 +89,9 @@ Wait-ForTrinoReady
 $sqlText = Get-Content -Path $querySqlPath -Raw
 $statements = $sqlText -split ";"
 $statements = $statements | ForEach-Object { $_.Trim() } | Where-Object { $_ }
+if ($statements.Count -ne 2) {
+    throw "Expected exactly 2 non-empty SQL statements in $querySqlPath but found $($statements.Count)."
+}
 
 $countRows = Invoke-TrinoStatement -Sql $statements[0]
 if (-not $countRows -or [int]$countRows[0][0] -le 0) {
