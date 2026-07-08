@@ -95,9 +95,11 @@ class Chapter6TrinoArtifactsTest(unittest.TestCase):
 
         self.assertIn("第 6 章：Trino + Iceberg 湖表查询", readme_text)
         self.assertIn("Trino + Iceberg", readme_text)
+        self.assertIn("./scripts/verify_chapter_6_trino_queries.ps1", readme_text)
         self.assertIn("verify_chapter_6_trino_queries.ps1", readme_text)
         self.assertIn("第 6 章：Trino + Iceberg 湖表查询", jobs_text)
         self.assertIn("Trino + Iceberg", jobs_text)
+        self.assertIn("./scripts/verify_chapter_6_trino_queries.ps1", jobs_text)
         self.assertIn("11_trino_read_iceberg_user_behavior.sql", jobs_text)
 
 
