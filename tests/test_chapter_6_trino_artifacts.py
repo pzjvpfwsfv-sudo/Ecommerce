@@ -45,10 +45,10 @@ class Chapter6TrinoArtifactsTest(unittest.TestCase):
         ).read_text(encoding="utf-8")
 
         self.assertIn("verify_chapter_5_end_to_end.ps1", script_text)
-        self.assertIn("Trino count query returned zero rows.", script_text)
-        self.assertIn("Trino group query returned no event_type rows.", script_text)
-        self.assertIn("event_count=", script_text)
-        self.assertIn("top_event_type=", script_text)
+        self.assertIn("/v1/info", script_text)
+        self.assertIn("/v1/statement", script_text)
+        self.assertIn("event_count", script_text)
+        self.assertIn("event_type", script_text)
 
     def test_docs_mention_chapter6_trino_validation(self) -> None:
         readme_text = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
