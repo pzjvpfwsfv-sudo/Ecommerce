@@ -76,6 +76,16 @@ class Chapter6TrinoArtifactsTest(unittest.TestCase):
         self.assertIn("event_count", script_text)
         self.assertIn("event_type", script_text)
 
+    def test_verification_script_checks_nonzero_rows(self) -> None:
+        script_text = (
+            REPO_ROOT / "scripts" / "verify_chapter_6_trino_queries.ps1"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("event_count", script_text)
+        self.assertIn("Invoke-RestMethod", script_text)
+        self.assertIn("nextUri", script_text)
+        self.assertIn("throw", script_text)
+
     def test_docs_mention_chapter6_trino_validation(self) -> None:
         readme_text = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
         jobs_text = (REPO_ROOT / "jobs" / "README.md").read_text(encoding="utf-8")
