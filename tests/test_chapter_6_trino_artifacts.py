@@ -36,7 +36,15 @@ class Chapter6TrinoArtifactsTest(unittest.TestCase):
         self.assertIn("connector.name=iceberg", catalog_text)
         self.assertIn("iceberg.catalog.type=hadoop", catalog_text)
         self.assertIn("iceberg.hadoop.warehouse=s3a://warehouse/iceberg", catalog_text)
-        self.assertIn("hive.s3.endpoint=http://minio:9000", catalog_text)
+        self.assertIn("fs.s3.enabled=true", catalog_text)
+        self.assertIn("s3.endpoint=http://minio:9000", catalog_text)
+        self.assertIn("s3.region=us-east-1", catalog_text)
+        self.assertIn("s3.path-style-access=true", catalog_text)
+        self.assertIn("s3.aws-access-key=minioadmin", catalog_text)
+        self.assertIn("s3.aws-secret-key=minioadmin123", catalog_text)
+        self.assertNotIn("hive.s3.endpoint=http://minio:9000", catalog_text)
+        self.assertNotIn("hive.s3.path-style-access=true", catalog_text)
+        self.assertNotIn("hive.s3.ssl.enabled=false", catalog_text)
 
     def test_query_sql_covers_count_and_group_by(self) -> None:
         sql_text = (
