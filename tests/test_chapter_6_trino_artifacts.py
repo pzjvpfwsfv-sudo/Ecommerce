@@ -15,6 +15,14 @@ class Chapter6TrinoArtifactsTest(unittest.TestCase):
         self.assertIn("trino:", compose_text)
         self.assertIn("trinodb/trino", compose_text)
 
+    def test_compose_mounts_trino_catalog_and_port(self) -> None:
+        compose_text = (REPO_ROOT / "infra" / "docker-compose.yml").read_text(encoding="utf-8")
+
+        self.assertIn('profiles: ["lakehouse"]', compose_text)
+        self.assertIn('- "${TRINO_PORT}:8080"', compose_text)
+        self.assertIn("TRINO_CONTAINER_NAME", compose_text)
+        self.assertIn("./compose/trino/catalog:/etc/trino/catalog:ro", compose_text)
+
     def test_trino_catalog_points_to_minio_iceberg(self) -> None:
         catalog_text = (
             REPO_ROOT

@@ -1,0 +1,265 @@
+name: ${PROJECT_NAME}
+
+networks:
+  platform-net:
+    name: ${PROJECT_NAME}-net
+  custom_network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.21.80.0/24
+
+services:
+  zookeeper:
+    profiles: ["core", "flink"]
+    image: confluentinc/cp-zookeeper:7.6.1
+    container_name: ${ZOOKEEPER_CONTAINER_NAME}
+    hostname: zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: ${ZOOKEEPER_PORT}
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "${ZOOKEEPER_PORT}:${ZOOKEEPER_PORT}"
+    networks:
+      - platform-net
+
+  kafka:
+    profiles: ["core", "flink"]
+    image: confluentinc/cp-kafka:7.6.1
+    container_name: ${KAFKA_CONTAINER_NAME}
+    hostname: kafka
+    depends_on:
+      - zookeeper
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:${ZOOKEEPER_PORT}
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:29092,PLAINTEXT_HOST://0.0.0.0:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:${KAFKA_PORT}
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    ports:
+      - "${KAFKA_PORT}:9092"
+    networks:
+      - platform-net
+
+  api:
+    profiles: ["serving"]
+    image: python:3.12-slim
+    container_name: ${API_CONTAINER_NAME}
+    depends_on:
+      - doris-fe
+    ports:
+      - "${API_PORT}:8000"
+    environment:
+      DORIS_HOST: doris-fe
+      DORIS_PORT: ${DORIS_FE_QUERY_PORT}
+      DORIS_DATABASE: ${DORIS_DATABASE}
+      DORIS_USERNAME: ${DORIS_USERNAME}
+      DORIS_PASSWORD: ${DORIS_PASSWORD}
+    volumes:
+      - ../services/api:/app
+    working_dir: /app
+    command:
+      - sh
+      - -lc
+      - pip install -r requirements.txt && uvicorn app.main:app --host 0.0.0.0 --port 8000
+    networks:
+      - platform-net
+      - custom_network
+
+  flink-jobmanager:
+    profiles: ["flink"]
+    image: flink:1.19.2-scala_2.12-java17
+    container_name: ${FLINK_JOBMANAGER_CONTAINER_NAME}
+    hostname: flink-jobmanager
+    depends_on:
+      - kafka
+    command: jobmanager
+    ports:
+      - "${FLINK_REST_PORT}:8081"
+    environment:
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: flink-jobmanager
+        rest.address: flink-jobmanager
+      HADOOP_CONF_DIR: /opt/hadoop-conf
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
+      AWS_REGION: us-east-1
+      AWS_EC2_METADATA_DISABLED: "true"
+    volumes:
+      - ../:/workspace
+      - ./compose/flink/conf:/opt/hadoop-conf:ro
+      - ./compose/flink/lib/flink-sql-connector-kafka-3.3.0-1.19.jar:/opt/flink/lib/flink-sql-connector-kafka-3.3.0-1.19.jar:ro
+      - ./compose/flink/lib/flink-doris-connector-1.19-25.1.0.jar:/opt/flink/lib/flink-doris-connector-1.19-25.1.0.jar:ro
+      - ./compose/flink/lib/iceberg-flink-runtime-1.19-1.6.1.jar:/opt/flink/lib/iceberg-flink-runtime-1.19-1.6.1.jar:ro
+      - ./compose/flink/lib/iceberg-aws-bundle-1.6.1.jar:/opt/flink/lib/iceberg-aws-bundle-1.6.1.jar:ro
+      - ./compose/flink/lib/hadoop-client-api-3.3.6.jar:/opt/flink/lib/hadoop-client-api-3.3.6.jar:ro
+      - ./compose/flink/lib/hadoop-client-runtime-3.3.6.jar:/opt/flink/lib/hadoop-client-runtime-3.3.6.jar:ro
+      - ./compose/flink/lib/hadoop-aws-3.3.6.jar:/opt/flink/lib/hadoop-aws-3.3.6.jar:ro
+      - ./compose/flink/lib/aws-java-sdk-bundle-1.12.262.jar:/opt/flink/lib/aws-java-sdk-bundle-1.12.262.jar:ro
+    working_dir: /workspace
+    networks:
+      - platform-net
+      - custom_network
+
+  flink-taskmanager:
+    profiles: ["flink"]
+    image: flink:1.19.2-scala_2.12-java17
+    container_name: ${FLINK_TASKMANAGER_CONTAINER_NAME}
+    hostname: flink-taskmanager
+    depends_on:
+      - flink-jobmanager
+    command: taskmanager
+    environment:
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: flink-jobmanager
+        rest.address: flink-jobmanager
+        taskmanager.numberOfTaskSlots: ${FLINK_TASKMANAGER_SLOTS}
+      HADOOP_CONF_DIR: /opt/hadoop-conf
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
+      AWS_REGION: us-east-1
+      AWS_EC2_METADATA_DISABLED: "true"
+    volumes:
+      - ../:/workspace
+      - ./compose/flink/conf:/opt/hadoop-conf:ro
+      - ./compose/flink/lib/flink-sql-connector-kafka-3.3.0-1.19.jar:/opt/flink/lib/flink-sql-connector-kafka-3.3.0-1.19.jar:ro
+      - ./compose/flink/lib/flink-doris-connector-1.19-25.1.0.jar:/opt/flink/lib/flink-doris-connector-1.19-25.1.0.jar:ro
+      - ./compose/flink/lib/iceberg-flink-runtime-1.19-1.6.1.jar:/opt/flink/lib/iceberg-flink-runtime-1.19-1.6.1.jar:ro
+      - ./compose/flink/lib/iceberg-aws-bundle-1.6.1.jar:/opt/flink/lib/iceberg-aws-bundle-1.6.1.jar:ro
+      - ./compose/flink/lib/hadoop-client-api-3.3.6.jar:/opt/flink/lib/hadoop-client-api-3.3.6.jar:ro
+      - ./compose/flink/lib/hadoop-client-runtime-3.3.6.jar:/opt/flink/lib/hadoop-client-runtime-3.3.6.jar:ro
+      - ./compose/flink/lib/hadoop-aws-3.3.6.jar:/opt/flink/lib/hadoop-aws-3.3.6.jar:ro
+      - ./compose/flink/lib/aws-java-sdk-bundle-1.12.262.jar:/opt/flink/lib/aws-java-sdk-bundle-1.12.262.jar:ro
+    working_dir: /workspace
+    networks:
+      - platform-net
+      - custom_network
+
+  flink-sql-client:
+    profiles: ["flink"]
+    image: flink:1.19.2-scala_2.12-java17
+    container_name: ${FLINK_SQL_CLIENT_CONTAINER_NAME}
+    hostname: flink-sql-client
+    depends_on:
+      - flink-jobmanager
+      - flink-taskmanager
+    command: ["tail", "-f", "/dev/null"]
+    environment:
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: flink-jobmanager
+        rest.address: flink-jobmanager
+      HADOOP_CONF_DIR: /opt/hadoop-conf
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
+      AWS_REGION: us-east-1
+      AWS_EC2_METADATA_DISABLED: "true"
+    volumes:
+      - ../:/workspace
+      - ./compose/flink/conf:/opt/hadoop-conf:ro
+      - ./compose/flink/lib/flink-sql-connector-kafka-3.3.0-1.19.jar:/opt/flink/lib/flink-sql-connector-kafka-3.3.0-1.19.jar:ro
+      - ./compose/flink/lib/flink-doris-connector-1.19-25.1.0.jar:/opt/flink/lib/flink-doris-connector-1.19-25.1.0.jar:ro
+      - ./compose/flink/lib/iceberg-flink-runtime-1.19-1.6.1.jar:/opt/flink/lib/iceberg-flink-runtime-1.19-1.6.1.jar:ro
+      - ./compose/flink/lib/iceberg-aws-bundle-1.6.1.jar:/opt/flink/lib/iceberg-aws-bundle-1.6.1.jar:ro
+      - ./compose/flink/lib/hadoop-client-api-3.3.6.jar:/opt/flink/lib/hadoop-client-api-3.3.6.jar:ro
+      - ./compose/flink/lib/hadoop-client-runtime-3.3.6.jar:/opt/flink/lib/hadoop-client-runtime-3.3.6.jar:ro
+      - ./compose/flink/lib/hadoop-aws-3.3.6.jar:/opt/flink/lib/hadoop-aws-3.3.6.jar:ro
+      - ./compose/flink/lib/aws-java-sdk-bundle-1.12.262.jar:/opt/flink/lib/aws-java-sdk-bundle-1.12.262.jar:ro
+    working_dir: /workspace
+    networks:
+      - platform-net
+      - custom_network
+
+  doris-fe:
+    profiles: ["serving"]
+    image: apache/doris:fe-${DORIS_VERSION}
+    container_name: ${DORIS_FE_CONTAINER_NAME}
+    hostname: doris-fe
+    ports:
+      - "${DORIS_FE_HTTP_PORT}:8030"
+      - "${DORIS_FE_QUERY_PORT}:9030"
+      - "9010:9010"
+    environment:
+      FE_SERVERS: fe1:172.21.80.2:9010
+      FE_ID: 1
+    command:
+      - sh
+      - -lc
+      - /opt/apache-doris/fe/bin/start_fe.sh --daemon && tail -f /dev/null
+    networks:
+      custom_network:
+        ipv4_address: 172.21.80.2
+
+  doris-be:
+    profiles: ["serving"]
+    image: apache/doris:be-${DORIS_VERSION}
+    container_name: ${DORIS_BE_CONTAINER_NAME}
+    hostname: doris-be
+    depends_on:
+      - doris-fe
+    ports:
+      - "8040:8040"
+      - "${DORIS_BE_HEARTBEAT_PORT}:9050"
+    environment:
+      FE_SERVERS: fe1:172.21.80.2:9010
+      BE_ADDR: 172.21.80.3:9050
+      SKIP_CHECK_ULIMIT: "true"
+    command:
+      - sh
+      - -lc
+      - /opt/apache-doris/be/bin/start_be.sh --daemon && tail -f /dev/null
+    networks:
+      custom_network:
+        ipv4_address: 172.21.80.3
+
+  minio:
+    profiles: ["lakehouse"]
+    image: minio/minio:RELEASE.2025-02-28T09-55-16Z
+    container_name: ecom-minio
+    hostname: minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    ports:
+      - "${MINIO_API_PORT}:9000"
+      - "${MINIO_CONSOLE_PORT}:9001"
+    volumes:
+      - ./compose/minio/data:/data
+    networks:
+      - platform-net
+
+  minio-init:
+    profiles: ["lakehouse"]
+    image: minio/mc:RELEASE.2025-03-12T17-29-24Z
+    container_name: ecom-minio-init
+    depends_on:
+      - minio
+    entrypoint:
+      - /bin/sh
+      - -lc
+      - >
+        until mc alias set local http://minio:9000 ${MINIO_ROOT_USER} ${MINIO_ROOT_PASSWORD}; do sleep 2; done &&
+        mc mb --ignore-existing local/${MINIO_BUCKET} &&
+        tail -f /dev/null
+    networks:
+      - platform-net
+
+  trino:
+    profiles: ["lakehouse"]
+    image: trinodb/trino:458
+    container_name: ${TRINO_CONTAINER_NAME}
+    hostname: trino
+    depends_on:
+      - minio
+      - minio-init
+    ports:
+      - "${TRINO_PORT}:8080"
+    volumes:
+      - ./compose/trino/catalog:/etc/trino/catalog:ro
+    networks:
+      - platform-net
