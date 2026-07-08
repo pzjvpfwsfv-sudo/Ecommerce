@@ -45,20 +45,20 @@ class Chapter6TrinoArtifactsTest(unittest.TestCase):
         ).read_text(encoding="utf-8")
 
         self.assertIn("verify_chapter_5_end_to_end.ps1", script_text)
-        self.assertIn("/v1/info", script_text)
-        self.assertIn("/v1/statement", script_text)
-        self.assertIn("event_count", script_text)
-        self.assertIn("event_type", script_text)
+        self.assertIn("Trino count query returned zero rows.", script_text)
+        self.assertIn("Trino group query returned no event_type rows.", script_text)
+        self.assertIn("event_count=", script_text)
+        self.assertIn("top_event_type=", script_text)
 
     def test_docs_mention_chapter6_trino_validation(self) -> None:
         readme_text = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
         jobs_text = (REPO_ROOT / "jobs" / "README.md").read_text(encoding="utf-8")
 
-        self.assertIn("绗?6 绔?", readme_text)
-        self.assertIn("Trino", readme_text)
+        self.assertIn("第 6 章：Trino + Iceberg 湖表查询", readme_text)
+        self.assertIn("Trino + Iceberg", readme_text)
         self.assertIn("verify_chapter_6_trino_queries.ps1", readme_text)
-        self.assertIn("绗?6 绔?", jobs_text)
-        self.assertIn("Trino", jobs_text)
+        self.assertIn("第 6 章：Trino + Iceberg 湖表查询", jobs_text)
+        self.assertIn("Trino + Iceberg", jobs_text)
         self.assertIn("11_trino_read_iceberg_user_behavior.sql", jobs_text)
 
 
