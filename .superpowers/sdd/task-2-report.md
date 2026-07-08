@@ -95,3 +95,28 @@ Result:
   - `test_docs_mention_chapter6_trino_validation`
   - `test_query_sql_covers_count_and_group_by`
   - `test_verification_script_runs_chapter5_then_queries_trino`
+
+## Review Fix Round 3
+
+### Scope Applied
+
+- Reworked `test_compose_mounts_trino_catalog_and_port` so it extracts the `trino:` service block from `infra/docker-compose.yml` and asserts the profile, port mapping, container name, and catalog mount only within that slice.
+
+### Verification
+
+Focused Task 2 artifact suite:
+
+```powershell
+python -m unittest tests.test_chapter_6_trino_artifacts -v
+```
+
+Result:
+
+- Passed:
+  - `test_compose_mounts_trino_catalog_and_port`
+  - `test_env_and_compose_define_trino_service`
+  - `test_trino_catalog_points_to_minio_iceberg`
+- Failed, still outside Task 2 ownership:
+  - `test_docs_mention_chapter6_trino_validation`
+  - `test_query_sql_covers_count_and_group_by`
+  - `test_verification_script_runs_chapter5_then_queries_trino`
