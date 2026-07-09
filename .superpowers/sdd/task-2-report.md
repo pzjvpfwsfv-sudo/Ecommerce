@@ -22,3 +22,9 @@ Migrated the Chapter 7 Kafka Compose defaults from ZooKeeper to a one-controller
 ## Self-review
 
 The target state has no ZooKeeper service or references, exactly one controller service and one broker service, host exposure only for broker port 9092, and the required generator/Flink broker endpoints remain unchanged. No test files were modified.
+
+## Review Fix Verification
+
+- Restored `kafka-controller` as the controller hostname and routed quorum voters through `KAFKA_CONTROLLER_HOST=kafka-controller` without adding extra literal `kafka-controller:` occurrences.
+- Restored the broker host mapping to `${KAFKA_PORT}:9092`.
+- Re-ran `python -m unittest tests.test_chapter_7_kraft_artifacts -v` after the final literal-compatibility adjustment: PASS (3 tests).
