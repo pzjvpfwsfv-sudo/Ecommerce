@@ -41,6 +41,7 @@
 - 第 3 章：Flink SQL 最小实时计算链路
 - 第 4 章：Doris + FastAPI 最小查询链路骨架
 - 第 5 章：MinIO + Iceberg 行为明细落湖骨架
+- 第 7 章：Kafka 从 ZooKeeper 演进到 KRaft `controller + broker` 双角色拓扑
 
 其中第 3 章当前已经验证到：
 
@@ -164,6 +165,18 @@ MinIO 版当前已经通过真实验证，关键修复点是把 S3A 配置下沉
 
 这一章的目标不是替代第 4 章的 Doris 指标层，而是并行补上 `MinIO + Iceberg` 明细数据底座。
 
+第 5/6 章后续已经从单引擎 `HadoopCatalog` 演进到共享 `Hive Metastore` catalog：
+
+- Flink 负责写入 Iceberg 并更新共享元数据
+- Trino 负责通过同一个 metastore 查询湖表
+
+当前 Kafka 基础设施也已经不再依赖 ZooKeeper，而是采用：
+
+- 内部 `kafka-controller` 负责 KRaft 控制面
+- 对外保持 `ecom-kafka` / `kafka:29092` / `localhost:9092` 兼容语义的 `kafka-broker`
+
+这让项目既保住了前面章节已经跑通的生成器、Flink 和验证脚本入口，又形成了一段完整的 `ZooKeeper -> KRaft` 架构演进故事。
+
 ## 第 6 章：Trino + Iceberg 湖表查询
 
 这一章不再扩展新的落湖链路，而是把第 5 章沉下来的 Iceberg 明细表重新拉回到查询层，补上“能查、好查、查得准”的最后一段。
@@ -181,6 +194,16 @@ MinIO 版当前已经通过真实验证，关键修复点是把 S3A 配置下沉
 ### 第 6 章叙事
 
 > 第 5 章先把行为明细沉到 MinIO + Iceberg，第 6 章再让 Trino 直接读这张湖表，把“可落湖”推进到“可查询、可验证”。
+
+### 第 6 章当前真实状态
+
+这一章已经把 Trino 服务、查询 SQL 和验证脚本都补齐了，但真实运行后也暴露出一个很重要的架构边界：
+
+- 第 5 章当前写侧使用的是 `HadoopCatalog`
+- `Trino 458` 不支持直接使用 `iceberg.catalog.type=hadoop`
+- 所以当前 Chapter 6 的价值，不只是“接上 Trino”，更是确认了后续必须演进到共享 catalog
+
+这也是后续继续升级成 `Hive Metastore` 或其他共享 catalog 方案的直接原因，能自然形成一段“从单引擎可用走向多引擎共享”的架构演进故事。
 
 ## 章节路线
 

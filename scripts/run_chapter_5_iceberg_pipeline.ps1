@@ -121,6 +121,7 @@ Write-Host "[chapter5] starting Kafka, Flink, MinIO, and Hive Metastore services
 Invoke-CheckedCommand -Command { docker compose --env-file $envFile -f $composeFile --profile flink --profile lakehouse up -d --force-recreate --quiet-pull } -FailureMessage "Failed to start the Chapter 5 Compose stack."
 Wait-ForHiveMetastorePortReady -TimeoutSeconds 90
 
+New-Item -ItemType Directory -Force -Path "tmp" | Out-Null
 [System.IO.File]::WriteAllText($combinedSqlFile, "", $utf8NoBom)
 foreach ($sqlFile in $sqlFiles) {
     [System.IO.File]::AppendAllText($combinedSqlFile, (Get-Content -Raw $sqlFile), $utf8NoBom)

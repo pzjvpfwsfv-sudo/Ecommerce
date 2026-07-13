@@ -24,6 +24,9 @@ if (-not (Test-Path $connectorJar)) {
 
 Write-Host "启动 Flink 最小运行环境..."
 docker compose --env-file $envFile -f $composeFile --profile flink up -d --force-recreate
+if ($LASTEXITCODE -ne 0) {
+    throw "Flink 最小运行环境启动失败。"
+}
 
 for ($attempt = 1; $attempt -le 30; $attempt++) {
     try {
@@ -66,5 +69,8 @@ foreach ($sqlFile in $sqlFiles) {
 
 Write-Host "提交 SQL: $containerSqlPath"
 docker exec $containerName /opt/flink/bin/sql-client.sh -f $containerSqlPath
+if ($LASTEXITCODE -ne 0) {
+    throw "Flink SQL 提交失败。"
+}
 
 Write-Host "SQL 提交完成，可访问 http://localhost:8081 查看 Flink Web UI。"

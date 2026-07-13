@@ -7,6 +7,7 @@ SOURCE_SQL = ROOT / "jobs" / "sql" / "01_source_user_behavior.sql"
 SINK_SQL = ROOT / "jobs" / "sql" / "02_sink_print_metrics.sql"
 METRIC_SQL = ROOT / "jobs" / "sql" / "03_pv_uv_metrics.sql"
 RUN_SCRIPT = ROOT / "scripts" / "run_flink_sql_job.ps1"
+CHAPTER5_RUN_SCRIPT = ROOT / "scripts" / "run_chapter_5_iceberg_pipeline.ps1"
 COMPOSE_FILE = ROOT / "infra" / "docker-compose.yml"
 
 
@@ -47,6 +48,7 @@ class FlinkSqlArtifactsTest(unittest.TestCase):
 
         self.assertIn("docker compose", text)
         self.assertIn("--profile flink", text)
+        self.assertIn('throw "Flink 最小运行环境启动失败。"', text)
         self.assertIn('$connectorJar = "infra/compose/flink/lib/flink-sql-connector-kafka-3.3.0-1.19.jar"', text)
         self.assertIn('$connectorUrl = "https://repo.maven.apache.org/maven2/org/apache/flink/flink-sql-connector-kafka/3.3.0-1.19/flink-sql-connector-kafka-3.3.0-1.19.jar"', text)
         self.assertIn("Invoke-WebRequest -Uri $connectorUrl -OutFile $connectorJar", text)
@@ -62,7 +64,14 @@ class FlinkSqlArtifactsTest(unittest.TestCase):
         self.assertIn('[System.IO.File]::AppendAllText($combinedSqlFile, "`r`n`r`n", $utf8NoBom)', text)
         self.assertIn('$containerSqlPath = "/workspace/tmp/chapter_3_flink_job.sql"', text)
         self.assertIn("docker exec $containerName /opt/flink/bin/sql-client.sh -f $containerSqlPath", text)
+        self.assertIn('throw "Flink SQL 提交失败。"', text)
         self.assertNotIn("zookeeper", text.lower())
+
+    def test_chapter5_runner_creates_tmp_before_writing_combined_sql(self):
+        text = CHAPTER5_RUN_SCRIPT.read_text(encoding="utf-8")
+
+        self.assertIn('New-Item -ItemType Directory -Force -Path "tmp" | Out-Null', text)
+        self.assertIn('[System.IO.File]::WriteAllText($combinedSqlFile, "", $utf8NoBom)', text)
 
     def test_compose_defines_minimal_flink_runtime(self):
         text = COMPOSE_FILE.read_text(encoding="utf-8")
