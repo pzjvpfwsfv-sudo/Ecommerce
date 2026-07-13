@@ -7,6 +7,13 @@ ENV_FILE = REPO_ROOT / "infra" / ".env.example"
 COMPOSE_FILE = REPO_ROOT / "infra" / "docker-compose.yml"
 KAFKA_README = REPO_ROOT / "infra" / "compose" / "kafka" / "README.md"
 TOP_LEVEL_README = REPO_ROOT / "README.md"
+KRAFT_DESIGN = (
+    REPO_ROOT
+    / "docs"
+    / "superpowers"
+    / "specs"
+    / "2026-07-10-chapter-7-kraft-migration-design.md"
+)
 
 
 class Chapter7KRaftArtifactsTest(unittest.TestCase):
@@ -52,6 +59,16 @@ class Chapter7KRaftArtifactsTest(unittest.TestCase):
         self.assertNotIn("ZooKeeper + Kafka", kafka_text)
         self.assertIn("controller + broker", kafka_text)
         self.assertIn("KRaft", readme_text)
+
+    def test_kraft_design_records_landed_topology_and_regression(self) -> None:
+        text = KRAFT_DESIGN.read_text(encoding="utf-8")
+
+        self.assertIn("最终落地与回归证据", text)
+        self.assertIn("迁移已经完成", text)
+        self.assertIn("localhost:9092", text)
+        self.assertIn("kafka:29092", text)
+        self.assertIn("filesystem Iceberg", text)
+        self.assertIn("RUNNING", text)
 
 
 if __name__ == "__main__":
