@@ -164,6 +164,12 @@ docker compose --env-file infra/.env.example -f infra/docker-compose.yml --profi
 
 > 第 4 章我先把实时指标服务化，第 5 章我再把行为明细沉到 MinIO + Iceberg，让项目同时具备“实时指标层”和“可追溯明细层”。
 
+### 第 5/6 章共享 Catalog 演进
+
+- 第 5 章先用 `HadoopCatalog` 跑通最小落湖闭环
+- 为了让 Trino 读取同一张 Iceberg 表，后续升级成共享 `Hive Metastore`
+- 当前 Flink 与 Trino 共用 `thrift://hive-metastore:9083`
+
 ## 第 6 章：Trino + Iceberg 湖表查询
 
 这一章不再新增写入链路，而是把第 5 章已经沉下去的 Iceberg 明细表重新暴露到查询层，让湖表真正“可查、可验、可复用”。
@@ -186,3 +192,9 @@ docker compose --env-file infra/.env.example -f infra/docker-compose.yml --profi
 ### 第 6 章叙事
 
 > 第 5 章先把行为明细沉到 MinIO + Iceberg，第 6 章再让 Trino 直接读这张湖表，把“可落湖”推进到“可查询、可验证”。
+
+### 第 6 章真实排障结论
+
+- 第 5 章最初使用 `HadoopCatalog` 跑通 Flink 单引擎写入，但 `Trino 458` 不能直接共享这套元数据
+- 项目已经升级到 `Hive Metastore`，Flink 与 Trino 共用 `thrift://hive-metastore:9083`
+- 第 6 章验证脚本现已能查询同一张 Iceberg 表，并校验非零 `event_count` 和 `event_type` 聚合结果

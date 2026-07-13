@@ -197,13 +197,13 @@ MinIO 版当前已经通过真实验证，关键修复点是把 S3A 配置下沉
 
 ### 第 6 章当前真实状态
 
-这一章已经把 Trino 服务、查询 SQL 和验证脚本都补齐了，但真实运行后也暴露出一个很重要的架构边界：
+真实运行最初暴露出一个重要边界：第 5 章最小闭环采用的 `HadoopCatalog` 无法被 `Trino 458` 直接共享。项目随后已经完成共享 Catalog 演进：
 
-- 第 5 章当前写侧使用的是 `HadoopCatalog`
-- `Trino 458` 不支持直接使用 `iceberg.catalog.type=hadoop`
-- 所以当前 Chapter 6 的价值，不只是“接上 Trino”，更是确认了后续必须演进到共享 catalog
+- Flink 与 Trino 共用 `thrift://hive-metastore:9083`
+- Flink 继续把明细写入 MinIO 上的 Iceberg 表
+- Trino 已能查询同一张表并返回非零 `event_count` 与 `event_type` 聚合结果
 
-这也是后续继续升级成 `Hive Metastore` 或其他共享 catalog 方案的直接原因，能自然形成一段“从单引擎可用走向多引擎共享”的架构演进故事。
+因此第 6 章已经从“接入查询脚手架”推进到“多引擎共享元数据并真实读通”，形成了完整的 `HadoopCatalog -> Hive Metastore` 架构演进故事。
 
 ## 章节路线
 

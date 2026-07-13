@@ -15,5 +15,7 @@ dist/
 logs/
 tmp/
 data/
+infra/compose/flink/lib/
+infra/compose/minio/data/
 
 *.log
