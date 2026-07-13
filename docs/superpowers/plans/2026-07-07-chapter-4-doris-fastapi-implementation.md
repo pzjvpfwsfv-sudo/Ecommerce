@@ -250,3 +250,26 @@ python -m unittest tests.test_chapter_4_artifacts tests.test_api_service -v
 - 从实现角度看，第 4 章留下的排障方法论也被证明是可复用的：先验证容器状态，再验证中间件可用性，最后验证业务链路与数据可见性，而不是一开始就盲改 SQL 或接口代码。
 
 因此，这次回补不是单纯“补文档”，而是把第 4 章的现场故障、后续第 5/6 章的链路扩展、以及第 7 章的 KRaft 架构迁移真正串成一条能复述、能追问、也经得起追问的实现故事线。
+
+## 11. 2026-07-14 收尾复验与脚本加固
+
+本次从干净重建路径再次执行 `run_chapter_4_pipeline.ps1`，补齐了三处只有真实全链路运行才会暴露的问题。
+
+### 11.1 初始化顺序导致 Doris 表被重建清空
+
+原脚本先初始化 Doris 表，再使用 `--force-recreate` 启动完整栈。由于当前教学环境没有为 Doris 配置持久卷，后一次容器重建会删除刚创建的表。最终将顺序调整为“启动完整栈 -> 初始化 Doris -> 生成 SQL -> 提交 Flink 作业”，并在写入 `tmp/chapter_4_flink_job.sql` 前显式创建 `tmp` 目录。
+
+### 11.2 静态地址与动态地址池发生竞态冲突
+
+Doris FE/BE 使用 `172.21.80.2` 和 `172.21.80.3` 固定地址，但 API 与 Flink 也连接同一自定义网络。并行启动时 API 先动态获得了 `.3`，导致 BE 报 `Address already in use`。最终在 IPAM 中增加 `ip_range: 172.21.80.128/25`，把动态地址限制在高位地址段，从网络设计上隔离 Doris 的固定地址。
+
+### 11.3 容器启动不等于业务依赖已经就绪
+
+FE 的 MySQL 端口可连接时，BE 可能仍是 `Alive=false`，此时建表会报“available backend num is 0”。脚本因此新增 `SHOW BACKENDS` 轮询，只有 BE 心跳变为 Alive 后才执行建表。同时，Kafka broker 被重建后 topic 不会自动保留，脚本新增幂等的 `kafka-topics --create --if-not-exists`，确保 Flink 提交前 `user_behavior_events` 已存在。
+
+### 11.4 最终复验结果
+
+- Flink 作业 `8e28ec4ed2a21af0f4ed8720747d85cf` 保持 `RUNNING`。
+- 向 Kafka 写入 3 条事件后，Doris 返回 `pv = 3`、`uv = 2`。
+- `GET /health` 返回服务正常，`GET /metrics/realtime` 返回与 Doris 一致的 `pv = 3`、`uv = 2`。
+- 第 4 章 15 个自动化测试全部通过。
