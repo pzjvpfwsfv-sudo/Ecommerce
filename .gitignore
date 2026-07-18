@@ -17,5 +17,6 @@ tmp/
 data/
 infra/compose/flink/lib/
 infra/compose/minio/data/
+.worktrees/
 
 *.log
