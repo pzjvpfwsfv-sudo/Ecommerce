@@ -36,8 +36,11 @@ def create_app(
     def analyze_realtime(request: AnalysisRequest) -> AnalysisResponse:
         if len(request.question) > settings.ai_max_question_length:
             raise HTTPException(status_code=422, detail="question is too long")
+        stage = "analysis_route"
         try:
-            return analysis_service.analyze(request.question)
+            result = analysis_service.analyze(request.question)
+            stage = "analysis_response"
+            return AnalysisResponse.model_validate(result)
         except RealtimeDataUnavailableError:
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -51,7 +54,7 @@ def create_app(
         except Exception as exc:
             logger.error(
                 "analysis_route_failed",
-                extra={"stage": "analysis_route", "error_type": type(exc).__name__},
+                extra={"stage": stage, "error_type": type(exc).__name__},
             )
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,

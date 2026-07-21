@@ -3,7 +3,9 @@ from __future__ import annotations
 from datetime import datetime
 import unicodedata
 
-from pydantic import BaseModel, Field, field_validator
+from typing import Literal
+
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class AnalysisRequest(BaseModel):
@@ -53,6 +55,17 @@ class AnalysisNarrative(BaseModel):
     insights: list[str] = Field(default_factory=list)
     risks: list[str] = Field(default_factory=list)
     actions: list[str] = Field(default_factory=list)
+
+
+class AnalysisSelection(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    summary: Literal["realtime_overview", "realtime_incomplete"]
+    insights: list[
+        Literal["visits_per_user", "historical_event_count", "top_event_type_share"]
+    ]
+    risks: list[Literal["cumulative_metric_limit", "zero_uv"]]
+    actions: list[Literal["add_time_window_metrics"]]
 
 
 class AnalysisResponse(AnalysisNarrative):

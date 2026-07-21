@@ -18,7 +18,7 @@ from app.config import ApiSettings, load_settings
 
 
 class OpenAICompatibleAnalyzerTest(unittest.TestCase):
-    def test_adapter_sends_evidence_and_parses_structured_narrative(self):
+    def test_adapter_sends_evidence_and_renders_strict_claim_selection(self):
         captured = {}
 
         def handler(request: httpx.Request) -> httpx.Response:
@@ -34,11 +34,10 @@ class OpenAICompatibleAnalyzerTest(unittest.TestCase):
                             "message": {
                                 "content": json.dumps(
                                     {
-                                        "summary": "Grounded conclusion",
-                                        "insights": [],
-                                        "risks": [],
-                                        "actions": [],
-                                        "extra": "allowed",
+                                        "summary": "realtime_overview",
+                                        "insights": ["visits_per_user"],
+                                        "risks": ["cumulative_metric_limit"],
+                                        "actions": ["add_time_window_metrics"],
                                     }
                                 )
                             }
@@ -62,19 +61,77 @@ class OpenAICompatibleAnalyzerTest(unittest.TestCase):
 
         result = analyzer.analyze(context)
 
-        self.assertEqual("Grounded conclusion", result.summary)
+        self.assertEqual("当前累计访问 12 次，覆盖 5 名用户。", result.summary)
+        self.assertEqual(["人均访问次数约为 2.4 次。"], result.insights)
+        self.assertNotIn("realtime_overview", result.model_dump_json())
         self.assertEqual("Bearer secret", captured["authorization"])
         self.assertEqual("http://model.local/v1/chat/completions", captured["url"])
         self.assertEqual({"connect": 7, "read": 7, "write": 7, "pool": 7}, captured["timeout"])
         self.assertEqual("demo-model", captured["body"]["model"])
         self.assertEqual(12, json.loads(captured["body"]["messages"][1]["content"])["evidence"]["realtime"]["pv"])
         system_prompt = captured["body"]["messages"][0]["content"]
-        for requirement in ("evidence", "SQL", "outside", "insufficient", "Chinese or English"):
+        for requirement in ("evidence", "SQL", "outside", "insufficient", "claim IDs"):
             self.assertIn(requirement, system_prompt)
+
+    def test_free_text_unknown_claims_and_extra_fields_degrade_without_entering_response(self):
+        complete_selection = {
+            "summary": "realtime_overview",
+            "insights": [],
+            "risks": [],
+            "actions": [],
+        }
+        malicious_outputs = (
+            {**complete_selection, "summary": "SHOW TABLES"},
+            {**complete_selection, "summary": "DESCRIBE user_behavior_detail"},
+            {**complete_selection, "summary": "CALL system.runtime.kill_query('x')"},
+            {**complete_selection, "summary": "EXPLAIN SELECT NULL"},
+            {**complete_selection, "summary": "VALUES (secret)"},
+            {**complete_selection, "summary": "WITH leaked AS (SELECT NULL) SELECT * FROM leaked"},
+            {**complete_selection, "summary": "USE secret_catalog"},
+            {**complete_selection, "summary": "SET SESSION hidden = true"},
+            {**complete_selection, "summary": "import os"},
+            {**complete_selection, "summary": "unknown_claim"},
+            {**complete_selection, "extra": "SHOW TABLES"},
+        )
+        for model_output in malicious_outputs:
+            with self.subTest(model_output=model_output):
+                analyzer = analyzers.OpenAICompatibleAnalyzer(
+                    api_key="test-key",
+                    base_url="http://model.local/v1",
+                    model="demo-model",
+                    client_factory=lambda output=model_output: httpx.Client(
+                        transport=httpx.MockTransport(
+                            lambda request: httpx.Response(
+                                200,
+                                json={
+                                    "choices": [
+                                        {"message": {"content": json.dumps(output)}}
+                                    ]
+                                },
+                            )
+                        )
+                    ),
+                )
+                realtime = Mock()
+                realtime.fetch_all_metrics.return_value = {"pv": 12, "uv": 5}
+                historical = Mock()
+                historical.fetch_summary.return_value = HistoricalEvidence(event_count=0)
+                service = AnalysisService(
+                    realtime, historical, analyzer, analyzers.RuleBasedAnalyzer()
+                )
+
+                with self.assertLogs("app.analysis_service", level="WARNING"):
+                    result = service.analyze("Analyze activity")
+
+                self.assertEqual("rule_based", result.analyzer)
+                serialized = result.model_dump_json()
+                self.assertNotIn(str(model_output.get("summary")), serialized)
+                if "extra" in model_output:
+                    self.assertNotIn(str(model_output["extra"]), serialized)
 
     def test_adapter_failures_degrade_analysis_service_to_rule_based(self):
         complete_narrative = {
-            "summary": "Grounded conclusion",
+            "summary": "realtime_overview",
             "insights": [],
             "risks": [],
             "actions": [],
@@ -116,9 +173,7 @@ class OpenAICompatibleAnalyzerTest(unittest.TestCase):
                 json={
                     "choices": [
                         {
-                            "message": {
-                                "content": json.dumps({**complete_narrative, "insights": "not-a-list"})
-                            }
+                            "message": {"content": json.dumps({**complete_narrative, "insights": "not-a-list"})}
                         }
                     ]
                 },

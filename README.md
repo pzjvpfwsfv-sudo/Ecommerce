@@ -208,7 +208,7 @@ MinIO 版当前已经通过真实验证，关键修复点是把 S3A 配置下沉
 
 ## 第 8 章：可信指标 AI 分析助手
 
-第一版由后端执行预定义查询，把 Doris 实时 PV/UV 与 Trino 历史聚合组装为 `evidence`，再交给分析器生成四字段叙事；默认 `rule_based` 模式不需要 API Key，也不允许模型生成或执行 SQL。真实端到端验证使用：
+第一版由后端执行预定义查询，把 Doris 实时 PV/UV 与 Trino 历史聚合组装为 `evidence`。模型只能返回严格枚举的四类分析选择 claim ID，最终叙事由后端自有模板渲染；默认 `rule_based` 模式不需要 API Key，模型也始终不能生成或执行 SQL。真实端到端验证使用：
 
 ```powershell
 ./scripts/verify_chapter_8_analysis.ps1
@@ -219,8 +219,8 @@ MinIO 版当前已经通过真实验证，关键修复点是把 S3A 配置下沉
 ### 严格可信模式与安全边界
 
 - 叙事中的数字只允许来自响应 `evidence` 或后端预定义派生值，主分析器与回退分析器使用同一个数字来源守卫。
-- 守卫先做 NFKC 归一化，再按 fail-closed 策略拒绝无法确认的数字表达；目前只支持可见中文/英文数字分隔语义。
-- 模型结果必须显式完整提供 `summary`、`insights`、`risks`、`actions` 四字段。异常边界的实际保证是固定安全响应、普通日志不含异常消息或 stack，并以 `from None` 抑制默认 traceback context；Python `__context__` 对象仍可能存在，因此不宣称递归擦除异常链对象。
+- 守卫先做 NFKC 归一化，再按 fail-closed 策略拒绝无法确认的数字表达；目前只支持可见中文/英文数字分隔语义，自然语言词典并不完备，完整保证来自 claim ID 与模板而不是词典枚举。
+- 模型分析选择必须显式完整提供 `summary`、`insights`、`risks`、`actions` 四字段，且每个值都必须属于允许的 claim ID 枚举；任意自由文本、额外字段或未知枚举都会触发降级。异常边界的实际保证是固定安全响应、普通日志不含异常消息或 stack，并以 `from None` 抑制默认 traceback context；Python `__context__` 对象仍可能存在，因此不宣称递归擦除异常链对象。
 - 数值可追溯不等于整句语义正确。当前边界防止无依据数字进入响应，但不能证明因果、趋势或建议合理；后续仍需离线评测和结构化 claim 校验。
 
 ### 演进故事
@@ -244,8 +244,8 @@ MinIO 版当前已经通过真实验证，关键修复点是把 S3A 配置下沉
 
 ## 最终审查加固
 
-- 主分析器与回退分析器共用 SQL/代码输出守卫：拒绝代码围栏及结构化识别到的 SELECT、DDL、DML 语句；模型路径违规时安全降级，回退路径违规时返回固定安全失败。模型仍不得生成或执行 SQL，系统也没有引入 NL2SQL。
+- 生产模型路径的完整 SQL/代码输出硬边界来自严格枚举 claim ID 与后端自有模板：模型自由文本不会进入 API。主分析器与回退分析器仍共用 SQL/代码输出守卫作为 defense-in-depth，但安全保证不依赖正则，也不宣称正则能识别全部代码。系统没有引入 NL2SQL。
 - 输入和叙事在 NFKC 后全局拒绝 Cc/Cf 控制或格式字符；数字 token 只接受 ASCII 0-9 的明确格式，并拒绝残留 Unicode 数字、中英文数字词或数量词及无穷等数值符号。
 - 历史 evidence 由单条 Trino statement 返回总数、事件类型计数和最新时间；`try(from_iso8601_timestamp(event_time))` 使无效时间变为 NULL 后不参与 MAX。构造 evidence 前校验计数非负且分组和等于总数，否则按 Trino 不可用降级。
 - `TRINO_CATALOG` 与 `TRINO_SCHEMA` 只接受严格 ASCII 标识符白名单，查询表名逐段安全双引号，statement 与 Trino header 使用同一配置。
-- 真实脚本是隔离验证：先要求 PV、UV、updated_at 连续 3 次稳定，再发布两个唯一用户，并只接受 PV/UV 精确增长 2 且 updated_at 推进；并发或 backlog 导致 overshoot 会失败。该验证不是按 runId 从 Doris 做明细审计，不能据此宣称完成了事件级归因。
+- 真实脚本是隔离验证：先要求 PV、UV、updated_at 连续 3 次稳定，再启动独立 consumer group 的 latest-offset Iceberg 审计作业并确认 RUNNING，然后发布两个唯一用户。成功必须同时满足 PV/UV 精确增长 2、updated_at 推进，以及 Trino 按两个精确 event_id 返回事件数/不同事件 ID/不同用户均为 2；这是 Iceberg 明细 runId 审计 + Doris 聚合双证据，并发或 backlog 导致聚合 overshoot 会失败。

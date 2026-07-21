@@ -9,6 +9,16 @@ from app.trino_repository import (
 
 
 class TrinoAnalyticsRepositoryTest(unittest.TestCase):
+    @staticmethod
+    def _repository_for_rows(rows):
+        transport = httpx.MockTransport(
+            lambda request: httpx.Response(200, json={"data": rows})
+        )
+        return TrinoAnalyticsRepository(
+            base_url="http://trino:8080",
+            client_factory=lambda: httpx.Client(transport=transport),
+        )
+
     def test_latest_event_time_is_parsed_as_iso_timestamp_before_max(self):
         normalized_sql = " ".join(SUMMARY_SQL.split()).lower()
 
@@ -94,6 +104,54 @@ class TrinoAnalyticsRepositoryTest(unittest.TestCase):
 
                 with self.assertRaises(ValueError):
                     repository.fetch_summary()
+
+    def test_fetch_summary_accepts_only_the_canonical_empty_row_across_pages(self):
+        repository = self._repository_for_rows([[0, None, None, None]])
+
+        result = repository.fetch_summary()
+
+        self.assertEqual(0, result.event_count)
+        self.assertEqual({}, result.event_type_counts)
+        self.assertIsNone(result.latest_event_time)
+
+        def paged_handler(request: httpx.Request) -> httpx.Response:
+            if request.method == "POST":
+                return httpx.Response(
+                    200,
+                    json={"data": [], "nextUri": "http://trino:8080/v1/next/empty"},
+                )
+            return httpx.Response(200, json={"data": [[0, None, None, None]]})
+
+        paged = TrinoAnalyticsRepository(
+            base_url="http://trino:8080",
+            client_factory=lambda: httpx.Client(
+                transport=httpx.MockTransport(paged_handler)
+            ),
+        ).fetch_summary()
+        self.assertEqual(0, paged.event_count)
+
+    def test_fetch_summary_rejects_coercions_placeholders_and_duplicate_rows(self):
+        malformed_rows = (
+            [[True, "view", True, "2026-07-18T10:00:00Z"]],
+            [[1.0, "view", 1, "2026-07-18T10:00:00Z"]],
+            [["1", "view", 1, "2026-07-18T10:00:00Z"]],
+            [[1, "view", 1.0, "2026-07-18T10:00:00Z"]],
+            [[1, "view", "1", "2026-07-18T10:00:00Z"]],
+            [[1, "", 1, "2026-07-18T10:00:00Z"]],
+            [[1, 7, 1, "2026-07-18T10:00:00Z"]],
+            [[1, None, None, "2026-07-18T10:00:00Z"]],
+            [[1, "view", None, "2026-07-18T10:00:00Z"]],
+            [[0, None, None, None], [0, None, None, None]],
+            [[1, "view", 1, "2026-07-18T10:00:00Z"], [1, None, None, None]],
+            [
+                [2, "view", 1, "2026-07-18T10:00:00Z"],
+                [2, "view", 1, "2026-07-18T10:00:00Z"],
+            ],
+        )
+        for rows in malformed_rows:
+            with self.subTest(rows=rows):
+                with self.assertRaises(ValueError):
+                    self._repository_for_rows(rows).fetch_summary()
 
     def test_constructor_rejects_unsafe_catalog_or_schema_identifiers(self):
         unsafe_values = ("", "lake.house", 'lake"house', "analytics; DROP TABLE users", "two words")

@@ -103,6 +103,37 @@ class AnalysisApiTest(unittest.TestCase):
         self.assertIsNone(record.exc_info)
         self.assertNotIn("sensitive internal payload", record.getMessage())
 
+    def test_malformed_service_response_returns_safe_503_after_explicit_validation(self):
+        malformed_responses = (
+            {"summary": "sensitive missing fields"},
+            {
+                "summary": ["sensitive wrong type"],
+                "evidence": {"realtime": {"pv": 12, "uv": 5}},
+                "analyzer": "rule_based",
+                "generated_at": "2026-07-18T00:00:00Z",
+            },
+        )
+        for malformed in malformed_responses:
+            with self.subTest(malformed=malformed):
+                service = Mock()
+                service.analyze.return_value = malformed
+                client = TestClient(create_app(repository=Mock(), analysis_service=service))
+
+                with self.assertLogs("app.main", level="ERROR") as captured:
+                    response = client.post(
+                        "/analysis/realtime", json={"question": "Analyze activity"}
+                    )
+
+                self.assertEqual(503, response.status_code)
+                self.assertEqual(
+                    {"detail": "analysis is temporarily unavailable"}, response.json()
+                )
+                record = captured.records[0]
+                self.assertEqual("analysis_response", record.stage)
+                self.assertEqual("ValidationError", record.error_type)
+                self.assertIsNone(record.exc_info)
+                self.assertNotIn("sensitive", record.getMessage())
+
 
 if __name__ == "__main__":
     unittest.main()

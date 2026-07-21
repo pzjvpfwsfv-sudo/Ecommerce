@@ -38,12 +38,24 @@ _ENGLISH_NUMBER_WORD_PATTERN = re.compile(
     r"billion|trillion|dozen|score)\b",
     re.IGNORECASE,
 )
+_UNSUPPORTED_NUMERIC_WORD_PATTERN = re.compile(
+    r"\b(?:infinity|nan|twice|double|half|quarter)\b", re.IGNORECASE
+)
 _CHINESE_QUANTITY_PATTERN = re.compile(r"(?:几|数|上|近|逾|超|过)(?:十|百|千|万|亿)")
 _UNSUPPORTED_NUMERIC_SYMBOLS = frozenset("∞≈≠≤≥±∓")
 _PROHIBITED_OUTPUT_PATTERNS = (
     re.compile(r"```|~~~"),
-    re.compile(r"(?:^|[\r\n])\s*select\b", re.IGNORECASE),
-    re.compile(r"\bselect\b[\s\S]{0,200}\bfrom\b", re.IGNORECASE),
+    re.compile(r"^\s*select\s+(?:\*|[\w\"'(])[^\r\n;]*\s+from\s+[\w\"]", re.IGNORECASE),
+    re.compile(r"^\s*select\s+(?:null|true|false|[-+]?[0-9]+(?:\.[0-9]+)?|'[^']*')\s*;?\s*$", re.IGNORECASE),
+    re.compile(r"^\s*(?:show|describe)\s+(?:tables?|schemas?|catalogs?|columns?|functions?)\b", re.IGNORECASE),
+    re.compile(r"^\s*describe\s+(?:[\w\"]+\.)*[\w\"]*_[\w\"]+\s*;?\s*$", re.IGNORECASE),
+    re.compile(r"^\s*call\s+[\w.\"]+\s*\(", re.IGNORECASE),
+    re.compile(r"^\s*explain\s+(?:analyze\s+)?(?:select|insert|update|delete|merge)\b", re.IGNORECASE),
+    re.compile(r"^\s*values\s*\(", re.IGNORECASE),
+    re.compile(r"^\s*with\s+[\w\"]+\s+as\s*\([\s\S]*\bselect\b", re.IGNORECASE),
+    re.compile(r"^\s*use\s+[\w\"]+(?:\.[\w\"]+)?\s*;?\s*$", re.IGNORECASE),
+    re.compile(r"^\s*set\s+(?:session\s+)?[\w.\"]+\s*=", re.IGNORECASE),
+    re.compile(r"^\s*(?:from\s+[\w.]+\s+)?import\s+[\w.]", re.IGNORECASE),
     re.compile(r"\binsert\s+into\b", re.IGNORECASE),
     re.compile(r"\bupdate\s+[A-Za-z_][\w.\"]*\s+set\b", re.IGNORECASE),
     re.compile(r"\bdelete\s+from\b", re.IGNORECASE),
@@ -52,7 +64,11 @@ _PROHIBITED_OUTPUT_PATTERNS = (
         re.IGNORECASE,
     ),
     re.compile(r"\bmerge\s+into\b", re.IGNORECASE),
-    re.compile(r"\b(?:grant|revoke)\b[\s\S]{0,100}\bon\b", re.IGNORECASE),
+    re.compile(
+        r"^\s*(?:grant|revoke)\s+(?:select|insert|update|delete|all|usage|execute|ownership)\b"
+        r"[\s\S]{0,100}\bon\s+(?:table|schema|catalog|[\w\"]+)",
+        re.IGNORECASE,
+    ),
 )
 
 
@@ -103,6 +119,8 @@ def _numbers_in(value: Any, *, fail_closed: bool = False) -> set[Decimal]:
     if fail_closed:
         if any(unicodedata.category(character) in {"Cc", "Cf"} for character in normalized):
             raise NarrativeProvenanceError("Narrative contains an invisible control character")
+        if any(unicodedata.category(character) in {"Mn", "Mc", "Me"} for character in normalized):
+            raise NarrativeProvenanceError("Narrative contains an unsupported Unicode mark")
         if any(character.isnumeric() and character not in "0123456789" for character in text):
             raise NarrativeProvenanceError("Narrative contains an unsupported numeric form")
         if any(
@@ -110,9 +128,9 @@ def _numbers_in(value: Any, *, fail_closed: bool = False) -> set[Decimal]:
             or (character.isnumeric() and character not in "0123456789")
             or character in _UNSUPPORTED_NUMERIC_SYMBOLS
             for character in normalized
-        ) or _ENGLISH_NUMBER_WORD_PATTERN.search(normalized) or _CHINESE_QUANTITY_PATTERN.search(
+        ) or _ENGLISH_NUMBER_WORD_PATTERN.search(normalized) or _UNSUPPORTED_NUMERIC_WORD_PATTERN.search(
             normalized
-        ):
+        ) or _CHINESE_QUANTITY_PATTERN.search(normalized):
             raise NarrativeProvenanceError("Narrative contains an unsupported numeric form")
 
     matches = list(_NUMBER_PATTERN.finditer(normalized))

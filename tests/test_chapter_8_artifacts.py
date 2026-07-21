@@ -133,6 +133,108 @@ $newTime = [DateTimeOffset]::Parse("2026-07-22T00:00:01Z")
         self.assertEqual(0, functions_only.returncode, functions_only.stderr or functions_only.stdout)
         self.assertIn("loaded", functions_only.stdout)
 
+    def test_verification_requires_exact_run_id_audit_and_aggregate_delta(self):
+        source_path = ROOT / "jobs/sql/12_source_user_behavior_chapter_8_audit.sql"
+        self.assertTrue(source_path.exists(), "Chapter 8 audit source SQL is missing")
+        source_text = source_path.read_text(encoding="utf-8")
+        self.assertIn("__AUDIT_GROUP_ID__", source_text)
+        self.assertIn("'scan.startup.mode' = 'latest-offset'", source_text)
+
+        script_text = (ROOT / "scripts/verify_chapter_8_analysis.ps1").read_text(
+            encoding="utf-8"
+        )
+        for marker in (
+            "Wait-ForFlinkJobRunning",
+            "pipeline.name",
+            "/jobs/overview",
+            "Invoke-Chapter8RunAudit",
+            "COUNT(DISTINCT event_id)",
+            "COUNT(DISTINCT user_id)",
+            "$eventIds[0]",
+            "$eventIds[1]",
+            "audit_event_count=",
+            "audit_distinct_event_id=",
+            "audit_distinct_user_id=",
+        ):
+            self.assertIn(marker, script_text)
+
+        command = r'''
+$ErrorActionPreference = "Stop"
+. (Resolve-Path "scripts/verify_chapter_8_analysis.ps1") -FunctionsOnly
+$baselineTime = [DateTimeOffset]::Parse("2026-07-22T00:00:00Z")
+$newTime = [DateTimeOffset]::Parse("2026-07-22T00:00:01Z")
+[ordered]@{
+    aggregate_without_audit = Test-Chapter8VerificationEvidence -BaselinePv 100 -BaselineUv 50 -BaselineUpdatedAt $baselineTime -CurrentPv 102 -CurrentUv 52 -CurrentUpdatedAt $newTime -AuditEventCount 0 -AuditDistinctEventId 0 -AuditDistinctUserId 0
+    audit_without_aggregate = Test-Chapter8VerificationEvidence -BaselinePv 100 -BaselineUv 50 -BaselineUpdatedAt $baselineTime -CurrentPv 101 -CurrentUv 51 -CurrentUpdatedAt $newTime -AuditEventCount 2 -AuditDistinctEventId 2 -AuditDistinctUserId 2
+    exact_dual_evidence = Test-Chapter8VerificationEvidence -BaselinePv 100 -BaselineUv 50 -BaselineUpdatedAt $baselineTime -CurrentPv 102 -CurrentUv 52 -CurrentUpdatedAt $newTime -AuditEventCount 2 -AuditDistinctEventId 2 -AuditDistinctUserId 2
+} | ConvertTo-Json -Compress
+'''
+        result = self._run_powershell(command)
+        self.assertEqual(0, result.returncode, result.stderr or result.stdout)
+        payload = json.loads(result.stdout.strip().splitlines()[-1])
+        self.assertFalse(payload["aggregate_without_audit"])
+        self.assertFalse(payload["audit_without_aggregate"])
+        self.assertTrue(payload["exact_dual_evidence"])
+
+        audit_command = r'''
+$ErrorActionPreference = "Stop"
+. (Resolve-Path "scripts/verify_chapter_8_analysis.ps1") -FunctionsOnly
+function Invoke-Chapter8TrinoStatement {
+    param([string]$Sql, [string]$TrinoBaseUrl)
+    $script:capturedAuditSql = $Sql
+    return ,@([object[]]@(2, 2, 2))
+}
+$audit = Invoke-Chapter8RunAudit -eventIds @("chapter8-run-view", "chapter8-run-click")
+[ordered]@{
+    event_count = $audit.EventCount
+    distinct_event_id = $audit.DistinctEventId
+    distinct_user_id = $audit.DistinctUserId
+    exact_view = $capturedAuditSql.Contains("'chapter8-run-view'")
+    exact_click = $capturedAuditSql.Contains("'chapter8-run-click'")
+    no_prefix_like = -not $capturedAuditSql.Contains("LIKE")
+} | ConvertTo-Json -Compress
+'''
+        audit_result = self._run_powershell(audit_command)
+        self.assertEqual(0, audit_result.returncode, audit_result.stderr or audit_result.stdout)
+        audit_payload = json.loads(audit_result.stdout.strip().splitlines()[-1])
+        self.assertEqual(2, audit_payload["event_count"])
+        self.assertEqual(2, audit_payload["distinct_event_id"])
+        self.assertEqual(2, audit_payload["distinct_user_id"])
+        self.assertTrue(audit_payload["exact_view"])
+        self.assertTrue(audit_payload["exact_click"])
+        self.assertTrue(audit_payload["no_prefix_like"])
+
+    def test_functions_only_dot_source_does_not_pollute_caller_state(self):
+        command = r'''
+$ErrorActionPreference = "Continue"
+$repoRoot = "caller-repo"
+$analysisUrl = "caller-url"
+$previousApiKey = "caller-key"
+$env:AI_ANALYZER_MODE = "caller-mode"
+$env:AI_API_KEY = "caller-api-key"
+$beforeLocation = (Get-Location).Path
+. (Resolve-Path "scripts/verify_chapter_8_analysis.ps1") -FunctionsOnly
+[ordered]@{
+    error_action = [string]$ErrorActionPreference
+    repo_root = $repoRoot
+    analysis_url = $analysisUrl
+    previous_api_key = $previousApiKey
+    analyzer_mode = $env:AI_ANALYZER_MODE
+    api_key = $env:AI_API_KEY
+    location_unchanged = ((Get-Location).Path -eq $beforeLocation)
+} | ConvertTo-Json -Compress
+'''
+        result = self._run_powershell(command)
+        self.assertEqual(0, result.returncode, result.stderr or result.stdout)
+        payload = json.loads(result.stdout.strip().splitlines()[-1])
+        self.assertEqual("Continue", payload["error_action"])
+        self.assertEqual("caller-repo", payload["repo_root"])
+        self.assertEqual("caller-url", payload["analysis_url"])
+        self.assertEqual("caller-key", payload["previous_api_key"])
+        self.assertEqual("caller-mode", payload["analyzer_mode"])
+        self.assertEqual("caller-api-key", payload["api_key"])
+        self.assertTrue(payload["location_unchanged"])
+
     def test_connector_downloads_are_hash_pinned_partial_and_atomic(self):
         text = (ROOT / "scripts/verify_chapter_8_analysis.ps1").read_text(encoding="utf-8")
         for marker in (
@@ -262,13 +364,23 @@ $waitResult = @(Wait-ForIcebergDataCommit -BaselineMetadataNames $empty -Baselin
             "标识符白名单",
             "连续 3 次稳定",
             "PV/UV 精确增长 2",
-            "不是按 runId 从 Doris 做明细审计",
+            "claim ID",
+            "后端自有模板",
+            "defense-in-depth",
+            "不依赖正则",
+            "自然语言词典并不完备",
+            "latest-offset",
+            "精确 event_id",
+            "Iceberg 明细 runId 审计",
+            "Doris 聚合双证据",
         )
         for path in paths:
             with self.subTest(path=path.name):
                 text = path.read_text(encoding="utf-8")
                 for marker in markers:
                     self.assertIn(marker, text)
+                self.assertNotIn("该验证不是按 runId 从 Doris 做明细审计", text)
+                self.assertNotIn("模型结果必须显式完整提供 `summary`", text)
 
 
 if __name__ == "__main__":

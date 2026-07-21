@@ -78,20 +78,35 @@ class TrinoAnalyticsRepository:
 
         if any(len(row) != 4 for row in rows):
             raise ValueError("Trino summary returned malformed rows")
-        event_count = int(rows[0][0])
+
+        if (
+            len(rows) == 1
+            and type(rows[0][0]) is int
+            and rows[0][0] == 0
+            and rows[0][1:] == [None, None, None]
+        ):
+            return HistoricalEvidence(
+                event_count=0,
+                event_type_counts={},
+                latest_event_time=None,
+            )
+
+        event_count = self._strict_count(rows[0][0], "total")
+        if event_count <= 0:
+            raise ValueError("Trino non-empty summary must have a positive total")
         latest_event_time = rows[0][3]
+        if latest_event_time is None:
+            raise ValueError("Trino non-empty summary requires a latest event time")
         counts: dict[str, int] = {}
         for row in rows:
-            if int(row[0]) != event_count or row[3] != latest_event_time:
+            if self._strict_count(row[0], "total") != event_count or row[3] != latest_event_time:
                 raise ValueError("Trino summary rows are inconsistent")
-            if row[1] is None:
-                if row[2] is not None:
-                    raise ValueError("Trino summary contains an invalid event type")
-                continue
-            event_type = str(row[1])
+            if type(row[1]) is not str or not row[1].strip():
+                raise ValueError("Trino summary contains an invalid event type")
+            event_type = row[1]
             if event_type in counts:
                 raise ValueError("Trino summary contains a duplicate event type")
-            counts[event_type] = int(row[2])
+            counts[event_type] = self._strict_count(row[2], "event type")
 
         if event_count < 0 or any(count < 0 for count in counts.values()):
             raise ValueError("Trino summary contains negative counts")
@@ -102,6 +117,12 @@ class TrinoAnalyticsRepository:
             event_type_counts=counts,
             latest_event_time=latest_event_time,
         )
+
+    @staticmethod
+    def _strict_count(value: Any, label: str) -> int:
+        if type(value) is not int:
+            raise ValueError(f"Trino {label} count must be an integer")
+        return value
 
     def _execute(self, sql: str) -> list[list[Any]]:
         rows: list[list[Any]] = []

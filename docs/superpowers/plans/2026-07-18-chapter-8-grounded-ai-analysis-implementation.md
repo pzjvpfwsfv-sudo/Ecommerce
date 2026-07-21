@@ -27,7 +27,7 @@
 - 主分析器与回退分析器共用同一个数字来源守卫，任何路径出现无依据数字都不得返回给调用方。
 - 日志通过结构化 `LogRecord.extra` 记录 request ID、analyzer、阶段、错误类型和耗时，避免字符串拼接敏感上下文。
 - 异常边界的实际保证是固定安全响应、普通日志不含异常消息或 stack，并以 `from None` 抑制默认 traceback context。Python `__context__` 对象仍可能存在，因此不宣称递归擦除 `__cause__` 或 `__context__` 对象；不得记录密钥、Authorization、Prompt、模型原始响应或内部堆栈。
-- 模型叙事的 `summary`、`insights`、`risks`、`actions` 四字段显式完整，不能依赖模型校验层的默认值静默补齐。
+- 模型分析选择的 `summary`、`insights`、`risks`、`actions` 四字段显式完整，且只能携带严格枚举的 claim ID；最终叙事由后端自有模板渲染，不能把模型自由文本带入 API。
 - 边界声明：数值可追溯不等于整句语义正确；本章守卫不验证因果和建议质量，后续必须增加离线评测、回归数据集与结构化 claim。
 
 ---
@@ -719,7 +719,7 @@ from app.config import load_settings
 
 
 class OpenAICompatibleAnalyzerTest(unittest.TestCase):
-    def test_adapter_sends_evidence_and_parses_structured_narrative(self):
+    def test_adapter_sends_evidence_and_renders_strict_claim_selection(self):
         captured = {}
 
         def handler(request: httpx.Request) -> httpx.Response:
@@ -727,7 +727,7 @@ class OpenAICompatibleAnalyzerTest(unittest.TestCase):
             captured["authorization"] = request.headers["Authorization"]
             return httpx.Response(
                 200,
-                json={"choices": [{"message": {"content": '{"summary":"可信结论","insights":[],"risks":[],"actions":[]}'}}]},
+                json={"choices": [{"message": {"content": '{"summary":"realtime_overview","insights":["visits_per_user"],"risks":["cumulative_metric_limit"],"actions":["add_time_window_metrics"]}'}}]},
             )
 
         analyzer = OpenAICompatibleAnalyzer(
@@ -744,7 +744,7 @@ class OpenAICompatibleAnalyzerTest(unittest.TestCase):
 
         result = analyzer.analyze(context)
 
-        self.assertEqual("可信结论", result.summary)
+        self.assertEqual("当前累计访问 12 次，覆盖 5 名用户。", result.summary)
         self.assertIn('"pv":12', captured["body"].replace(" ", ""))
         self.assertEqual("Bearer secret", captured["authorization"])
 
@@ -821,7 +821,7 @@ from collections.abc import Callable
 
 import httpx
 
-from app.analysis_models import AnalysisNarrative
+from app.analysis_models import AnalysisNarrative, AnalysisSelection
 
 
 class OpenAICompatibleAnalyzer:
@@ -850,9 +850,8 @@ class OpenAICompatibleAnalyzer:
                 {
                     "role": "system",
                     "content": (
-                        "你是电商指标分析助手。只能使用用户消息中的 evidence；"
-                        "不得生成 SQL，不得声称访问其他数据。只返回 JSON，字段为 "
-                        "summary、insights、risks、actions。"
+                        "只能选择 evidence 支持的严格枚举 claim ID；不得生成 SQL、"
+                        "代码或自由文本。只返回四个分析选择字段及允许的 claim ID。"
                     ),
                 },
                 {"role": "user", "content": context.model_dump_json()},
@@ -868,8 +867,11 @@ class OpenAICompatibleAnalyzer:
             )
         response.raise_for_status()
         content = response.json()["choices"][0]["message"]["content"]
-        return AnalysisNarrative.model_validate(json.loads(content))
+        selection = AnalysisSelection.model_validate(json.loads(content))
+        return render_analysis_selection(selection, context)
 ```
+
+这里的 `render_analysis_selection` 是后端自有模板渲染器；模型响应使用 `extra="forbid"` 的严格 Pydantic 模型校验，任意自由文本、缺失/额外字段或未知 claim ID 都触发规则降级。共享 SQL/代码正则只保留为 defense-in-depth，完整保证不依赖正则。
 
 - [ ] **Step 5: Implement dependency construction**
 
@@ -1314,8 +1316,9 @@ docker compose --env-file infra/.env.example -f infra/docker-compose.yml --profi
 
 ## 最终审查加固
 
-- 主分析器与回退分析器共用 SQL/代码输出守卫：拒绝代码围栏及结构化识别到的 SELECT、DDL、DML 语句；模型路径违规时安全降级，回退路径违规时返回固定安全失败。模型仍不得生成或执行 SQL，系统也没有引入 NL2SQL。
+- 生产模型路径的完整 SQL/代码输出硬边界来自严格枚举 claim ID 与后端自有模板：模型自由文本不会进入 API。主分析器与回退分析器仍共用 SQL/代码输出守卫作为 defense-in-depth，但安全保证不依赖正则，也不宣称正则覆盖全部代码。模型不得生成或执行 SQL，系统没有引入 NL2SQL。
+- NFKC 后的共享守卫拒绝 Cc/Cf 与 Unicode Mark，并拦截明确的非有限值和倍数词；自然语言词典并不完备，完整数字边界来自 claim ID 与模板。
 - 输入和叙事在 NFKC 后全局拒绝 Cc/Cf 控制或格式字符；数字 token 只接受 ASCII 0-9 的明确格式，并拒绝残留 Unicode 数字、中英文数字词或数量词及无穷等数值符号。
 - 历史 evidence 由单条 Trino statement 返回总数、事件类型计数和最新时间；`try(from_iso8601_timestamp(event_time))` 使无效时间变为 NULL 后不参与 MAX。构造 evidence 前校验计数非负且分组和等于总数，否则按 Trino 不可用降级。
 - `TRINO_CATALOG` 与 `TRINO_SCHEMA` 只接受严格 ASCII 标识符白名单，查询表名逐段安全双引号，statement 与 Trino header 使用同一配置。
-- 真实脚本是隔离验证：先要求 PV、UV、updated_at 连续 3 次稳定，再发布两个唯一用户，并只接受 PV/UV 精确增长 2 且 updated_at 推进；并发或 backlog 导致 overshoot 会失败。该验证不是按 runId 从 Doris 做明细审计，不能据此宣称完成了事件级归因。
+- 真实脚本先要求 PV、UV、updated_at 连续 3 次稳定，再启动独立 consumer group 的 latest-offset Iceberg 审计作业并确认 RUNNING，之后才发布两个唯一用户。成功要求 Doris PV/UV 精确增长 2、updated_at 推进，并由 Trino 对两个精确 event_id 得到 2/2/2；这是 Iceberg 明细 runId 审计 + Doris 聚合双证据，聚合 overshoot 会失败。
