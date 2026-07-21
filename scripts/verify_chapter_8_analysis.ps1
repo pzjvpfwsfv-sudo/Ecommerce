@@ -8,8 +8,10 @@ $chapter4Run = Join-Path $repoRoot "scripts/run_chapter_4_pipeline.ps1"
 $analysisUrl = "http://localhost:8000/analysis/realtime"
 $kafkaConnectorJar = Join-Path $repoRoot "infra/compose/flink/lib/flink-sql-connector-kafka-3.3.0-1.19.jar"
 $kafkaConnectorUrl = "https://repo.maven.apache.org/maven2/org/apache/flink/flink-sql-connector-kafka/3.3.0-1.19/flink-sql-connector-kafka-3.3.0-1.19.jar"
+$kafkaConnectorSha256 = "F46F69333445C598EBA9E5068B0A58DD2B4BA797738FD0FD3EE4E862FE281691"
 $dorisConnectorJar = Join-Path $repoRoot "infra/compose/flink/lib/flink-doris-connector-1.19-25.1.0.jar"
 $dorisConnectorUrl = "https://repo1.maven.org/maven2/org/apache/doris/flink-doris-connector-1.19/25.1.0/flink-doris-connector-1.19-25.1.0.jar"
+$dorisConnectorSha256 = "CE1C35B6A16B24F67E61EE95B7DAB9802B1FB654B9DA4FE171C174B2F8B1CA36"
 $previousAnalyzerMode = [Environment]::GetEnvironmentVariable("AI_ANALYZER_MODE", "Process")
 $previousApiKey = [Environment]::GetEnvironmentVariable("AI_API_KEY", "Process")
 
@@ -35,18 +37,64 @@ function Ensure-ConnectorFile {
         [Parameter(Mandatory = $true)]
         [string]$Url,
         [Parameter(Mandatory = $true)]
-        [string]$Name
+        [string]$Name,
+        [Parameter(Mandatory = $true)]
+        [string]$ExpectedSha256
     )
 
+    $partialPath = "$FilePath.partial"
     if (Test-Path -LiteralPath $FilePath -PathType Container) {
         # Docker creates an empty directory when a missing bind-mounted JAR is referenced.
         Remove-Item -LiteralPath $FilePath -Force
     }
-    if (-not (Test-Path -LiteralPath $FilePath -PathType Leaf)) {
-        New-Item -ItemType Directory -Force -Path (Split-Path $FilePath) | Out-Null
-        Write-Host "[chapter8-verify] downloading shared Flink $Name connector..."
-        Invoke-WebRequest -Uri $Url -OutFile $FilePath
+
+    if (Test-Path -LiteralPath $FilePath -PathType Leaf) {
+        $currentHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $FilePath).Hash
+        if ($currentHash -eq $ExpectedSha256) {
+            return
+        }
     }
+
+    New-Item -ItemType Directory -Force -Path (Split-Path $FilePath) | Out-Null
+    if (Test-Path -LiteralPath $partialPath) {
+        Remove-Item -LiteralPath $partialPath -Force
+    }
+
+    try {
+        Write-Host "[chapter8-verify] downloading shared Flink $Name connector..."
+        Invoke-WebRequest -Uri $Url -OutFile $partialPath
+        $downloadedHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $partialPath).Hash
+        if ($downloadedHash -ne $ExpectedSha256) {
+            throw "Downloaded $Name connector checksum mismatch."
+        }
+
+        Move-Item -LiteralPath $partialPath -Destination $FilePath -Force
+    } finally {
+        if (Test-Path -LiteralPath $partialPath) {
+            Remove-Item -LiteralPath $partialPath -Force
+        }
+    }
+}
+
+function Get-AnalysisResponseState {
+    param($Response)
+
+    return "analyzer=$($Response.analyzer), pv=$($Response.evidence.realtime.pv), uv=$($Response.evidence.realtime.uv), updated_at=$($Response.evidence.realtime.updated_at), historical=$($Response.evidence.historical.event_count)"
+}
+
+function Get-AnalysisTimeoutDetail {
+    param(
+        [AllowNull()][string]$LastRequestError,
+        [AllowNull()][string]$LatestInvalidResponse
+    )
+
+    if ($LastRequestError) {
+        return " Last request error: $LastRequestError"
+    }
+    if ($LatestInvalidResponse) {
+        return " Latest invalid response: $LatestInvalidResponse"
+    }
+    return ""
 }
 
 Push-Location $repoRoot
@@ -55,8 +103,8 @@ try {
     $env:AI_ANALYZER_MODE = "rule_based"
     $env:AI_API_KEY = ""
 
-    Ensure-ConnectorFile -FilePath $kafkaConnectorJar -Url $kafkaConnectorUrl -Name "Kafka"
-    Ensure-ConnectorFile -FilePath $dorisConnectorJar -Url $dorisConnectorUrl -Name "Doris"
+    Ensure-ConnectorFile -FilePath $kafkaConnectorJar -Url $kafkaConnectorUrl -Name "Kafka" -ExpectedSha256 $kafkaConnectorSha256
+    Ensure-ConnectorFile -FilePath $dorisConnectorJar -Url $dorisConnectorUrl -Name "Doris" -ExpectedSha256 $dorisConnectorSha256
 
     Write-Host "[chapter8-verify] preparing Iceberg history and Trino..."
     & $chapter6Verify
@@ -64,12 +112,48 @@ try {
     Write-Host "[chapter8-verify] preparing Doris realtime metrics and API..."
     & $chapter4Run
 
+    $body = @{ question = "How active are the current users?" } | ConvertTo-Json
+    $baselineResponse = $null
+    $lastRequestError = $null
+    $latestInvalidResponse = $null
+    $baselineDeadline = (Get-Date).AddSeconds(120)
+    do {
+        try {
+            $candidate = Invoke-RestMethod -Method Post -Uri $analysisUrl -ContentType "application/json" -Body $body
+            $lastRequestError = $null
+            $latestInvalidResponse = Get-AnalysisResponseState -Response $candidate
+            if (
+                $candidate.analyzer -eq "rule_based" -and
+                $null -ne $candidate.evidence.realtime.pv -and
+                $candidate.evidence.realtime.updated_at -and
+                $candidate.evidence.realtime.uv -gt 0 -and
+                $candidate.evidence.historical.event_count -gt 0
+            ) {
+                $baselineResponse = $candidate
+                break
+            }
+        } catch {
+            $lastRequestError = $_.Exception.Message
+        }
+
+        Start-Sleep -Seconds 3
+    } while ((Get-Date) -lt $baselineDeadline)
+
+    if ($null -eq $baselineResponse) {
+        $detail = Get-AnalysisTimeoutDetail -LastRequestError $lastRequestError -LatestInvalidResponse $latestInvalidResponse
+        throw "Chapter 8 analysis endpoint did not return a usable baseline in time.$detail"
+    }
+
+    $baselinePv = [long]$baselineResponse.evidence.realtime.pv
+    $baselineUpdatedAt = [DateTimeOffset]::Parse([string]$baselineResponse.evidence.realtime.updated_at)
+    Write-Host "[chapter8-verify] baseline_pv=$baselinePv baseline_updated_at=$($baselineUpdatedAt.ToString('o'))"
+
     $runId = [Guid]::NewGuid().ToString("N")
     $eventTime = [DateTimeOffset]::UtcNow.ToString("o")
     $events = @(
         [ordered]@{
             event_id = "chapter8-$runId-view"
-            user_id = "chapter8-user-view"
+            user_id = "chapter8-$runId-user-view"
             product_id = "chapter8-product-view"
             event_type = "view"
             event_time = $eventTime
@@ -79,7 +163,7 @@ try {
         },
         [ordered]@{
             event_id = "chapter8-$runId-click"
-            user_id = "chapter8-user-click"
+            user_id = "chapter8-$runId-user-click"
             product_id = "chapter8-product-click"
             event_type = "click"
             event_time = $eventTime
@@ -96,14 +180,22 @@ try {
 
     $response = $null
     $lastRequestError = $null
+    $latestInvalidResponse = $null
     $deadline = (Get-Date).AddSeconds(120)
     do {
         try {
-            $body = @{ question = "How active are the current users?" } | ConvertTo-Json
             $candidate = Invoke-RestMethod -Method Post -Uri $analysisUrl -ContentType "application/json" -Body $body
+            $lastRequestError = $null
+            $latestInvalidResponse = Get-AnalysisResponseState -Response $candidate
+            $candidateUpdatedAt = if ($candidate.evidence.realtime.updated_at) {
+                [DateTimeOffset]::Parse([string]$candidate.evidence.realtime.updated_at)
+            } else {
+                $null
+            }
             if (
                 $candidate.analyzer -eq "rule_based" -and
-                $candidate.evidence.realtime.pv -gt 0 -and
+                $candidate.evidence.realtime.pv -gt $baselinePv -and
+                $candidateUpdatedAt -gt $baselineUpdatedAt -and
                 $candidate.evidence.realtime.uv -gt 0 -and
                 $candidate.evidence.historical.event_count -gt 0
             ) {
@@ -118,12 +210,12 @@ try {
     } while ((Get-Date) -lt $deadline)
 
     if ($null -eq $response) {
-        $detail = if ($lastRequestError) { " Last request error: $lastRequestError" } else { "" }
-        throw "Chapter 8 analysis endpoint did not return positive rule-based evidence in time.$detail"
+        $detail = Get-AnalysisTimeoutDetail -LastRequestError $lastRequestError -LatestInvalidResponse $latestInvalidResponse
+        throw "Chapter 8 analysis endpoint did not return fresh positive rule-based evidence in time.$detail"
     }
 
     Write-Host "[chapter8-verify] analyzer=$($response.analyzer)"
-    Write-Host "[chapter8-verify] pv=$($response.evidence.realtime.pv) uv=$($response.evidence.realtime.uv)"
+    Write-Host "[chapter8-verify] post_pv=$($response.evidence.realtime.pv) post_updated_at=$($response.evidence.realtime.updated_at) uv=$($response.evidence.realtime.uv)"
     Write-Host "[chapter8-verify] historical_event_count=$($response.evidence.historical.event_count)"
 } finally {
     Restore-ProcessEnvironmentVariable -Name "AI_ANALYZER_MODE" -Value $previousAnalyzerMode

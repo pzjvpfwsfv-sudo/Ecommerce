@@ -26,7 +26,7 @@
 - 校验先执行 NFKC 归一化，再按 fail-closed 策略处理无法识别的数字表达；当前只支持可见中文/英文数字分隔语义。
 - 主分析器与回退分析器共用同一个数字来源守卫，任何路径出现无依据数字都不得返回给调用方。
 - 日志通过结构化 `LogRecord.extra` 记录 request ID、analyzer、阶段、错误类型和耗时，避免字符串拼接敏感上下文。
-- 异常链脱敏递归覆盖 `__cause__` 与 `__context__`，不得记录密钥、Authorization、Prompt、模型原始响应或内部堆栈。
+- 异常边界的实际保证是固定安全响应、普通日志不含异常消息或 stack，并以 `from None` 抑制默认 traceback context。Python `__context__` 对象仍可能存在，因此不宣称递归擦除 `__cause__` 或 `__context__` 对象；不得记录密钥、Authorization、Prompt、模型原始响应或内部堆栈。
 - 模型叙事的 `summary`、`insights`、`risks`、`actions` 四字段显式完整，不能依赖模型校验层的默认值静默补齐。
 - 边界声明：数值可追溯不等于整句语义正确；本章守卫不验证因果和建议质量，后续必须增加离线评测、回归数据集与结构化 claim。
 

@@ -1,3 +1,8 @@
+[CmdletBinding()]
+param(
+    [switch]$FunctionsOnly
+)
+
 $ErrorActionPreference = "Stop"
 
 function Invoke-CheckedCommand {
@@ -110,25 +115,37 @@ function Publish-ValidationEvents {
     }
 }
 
+function Invoke-MinioAdminJson {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ObjectPath
+    )
+
+    $listing = docker exec ecom-minio-init mc ls --recursive --json $ObjectPath
+    if ($LASTEXITCODE -ne 0) {
+        throw "Failed to inspect Iceberg objects in MinIO at path: $ObjectPath"
+    }
+
+    return $listing
+}
+
 function Get-IcebergObjectNames {
     param(
         [Parameter(Mandatory = $true)]
         [string]$ObjectPath
     )
 
-    $listing = docker exec ecom-minio-init sh -lc "mc ls --recursive $ObjectPath"
-    if ($LASTEXITCODE -ne 0) {
-        throw "Failed to inspect Iceberg objects in MinIO at path: $ObjectPath"
-    }
-
+    $listing = Invoke-MinioAdminJson -ObjectPath $ObjectPath
     $names = New-Object System.Collections.Generic.HashSet[string]
     foreach ($line in $listing) {
-        $trimmed = $line.Trim()
+        $trimmed = ([string]$line).Trim()
         if ([string]::IsNullOrWhiteSpace($trimmed)) {
             continue
         }
 
-        $name = [regex]::Match($trimmed, "(?<name>\S+)$").Groups["name"].Value
+        $entry = $trimmed | ConvertFrom-Json
+        $key = ([string]$entry.key).TrimEnd("/")
+        $name = ($key -split "/")[-1]
         if (-not [string]::IsNullOrWhiteSpace($name)) {
             [void]$names.Add($name)
         }
@@ -140,8 +157,10 @@ function Get-IcebergObjectNames {
 function Wait-ForIcebergDataCommit {
     param(
         [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
         [System.Collections.Generic.HashSet[string]]$BaselineMetadataNames,
         [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
         [System.Collections.Generic.HashSet[string]]$BaselineDataNames,
         [int]$TimeoutSeconds = 90
     )
@@ -179,6 +198,10 @@ function Wait-ForIcebergDataCommit {
     }
 
     throw "Timed out waiting for new Iceberg metadata and data files in MinIO."
+}
+
+if ($FunctionsOnly) {
+    return
 }
 
 Assert-DockerAvailable
