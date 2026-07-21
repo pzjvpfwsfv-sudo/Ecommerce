@@ -46,6 +46,8 @@ class ApiServiceArtifactsTest(unittest.TestCase):
         self.assertIn('@app.get("/health")', text)
         self.assertIn('@app.get("/metrics/realtime")', text)
         self.assertIn('@app.get("/metrics/{metric_name}")', text)
+        self.assertIn('@app.post("/analysis/realtime"', text)
+        self.assertIn("build_analysis_service", text)
         self.assertIn("create_app", text)
 
 
