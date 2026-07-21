@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 import sys
 import unittest
+from unittest.mock import Mock
 
 import httpx
 
@@ -11,7 +12,8 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str((ROOT / "services" / "api").resolve()))
 
 from app import analyzers
-from app.analysis_models import AnalysisContext, AnalysisEvidence, RealtimeEvidence
+from app.analysis_models import AnalysisContext, AnalysisEvidence, HistoricalEvidence, RealtimeEvidence
+from app.analysis_service import AnalysisService
 from app.config import ApiSettings, load_settings
 
 
@@ -22,6 +24,8 @@ class OpenAICompatibleAnalyzerTest(unittest.TestCase):
         def handler(request: httpx.Request) -> httpx.Response:
             captured["body"] = json.loads(request.read())
             captured["authorization"] = request.headers["Authorization"]
+            captured["url"] = str(request.url)
+            captured["timeout"] = request.extensions["timeout"]
             return httpx.Response(
                 200,
                 json={
@@ -34,6 +38,7 @@ class OpenAICompatibleAnalyzerTest(unittest.TestCase):
                                         "insights": [],
                                         "risks": [],
                                         "actions": [],
+                                        "extra": "allowed",
                                     }
                                 )
                             }
@@ -46,6 +51,7 @@ class OpenAICompatibleAnalyzerTest(unittest.TestCase):
             api_key="secret",
             base_url="http://model.local/v1",
             model="demo-model",
+            timeout_seconds=7,
             client_factory=lambda: httpx.Client(transport=httpx.MockTransport(handler)),
         )
         context = AnalysisContext(
@@ -58,10 +64,88 @@ class OpenAICompatibleAnalyzerTest(unittest.TestCase):
 
         self.assertEqual("Grounded conclusion", result.summary)
         self.assertEqual("Bearer secret", captured["authorization"])
+        self.assertEqual("http://model.local/v1/chat/completions", captured["url"])
+        self.assertEqual({"connect": 7, "read": 7, "write": 7, "pool": 7}, captured["timeout"])
+        self.assertEqual("demo-model", captured["body"]["model"])
         self.assertEqual(12, json.loads(captured["body"]["messages"][1]["content"])["evidence"]["realtime"]["pv"])
         system_prompt = captured["body"]["messages"][0]["content"]
         for requirement in ("evidence", "SQL", "outside", "insufficient", "Chinese or English"):
             self.assertIn(requirement, system_prompt)
+
+    def test_adapter_failures_degrade_analysis_service_to_rule_based(self):
+        complete_narrative = {
+            "summary": "Grounded conclusion",
+            "insights": [],
+            "risks": [],
+            "actions": [],
+        }
+        cases = {
+            "non_2xx": lambda: httpx.Response(503, json={"error": "unavailable"}),
+            "invalid_outer_json": lambda: httpx.Response(200, content=b"not-json"),
+            "invalid_choices_structure": lambda: httpx.Response(200, json={"choices": []}),
+            "invalid_message_structure": lambda: httpx.Response(200, json={"choices": [{}]}),
+            "invalid_content_structure": lambda: httpx.Response(
+                200,
+                json={"choices": [{"message": {}}]},
+            ),
+            "invalid_inner_json": lambda: httpx.Response(
+                200,
+                json={"choices": [{"message": {"content": "not-json"}}]},
+            ),
+            **{
+                f"missing_{missing_key}": (
+                    lambda key=missing_key: httpx.Response(
+                        200,
+                        json={
+                            "choices": [
+                                {
+                                    "message": {
+                                        "content": json.dumps(
+                                            {name: value for name, value in complete_narrative.items() if name != key}
+                                        )
+                                    }
+                                }
+                            ]
+                        },
+                    )
+                )
+                for missing_key in complete_narrative
+            },
+            "invalid_narrative_type": lambda: httpx.Response(
+                200,
+                json={
+                    "choices": [
+                        {
+                            "message": {
+                                "content": json.dumps({**complete_narrative, "insights": "not-a-list"})
+                            }
+                        }
+                    ]
+                },
+            ),
+        }
+
+        for case_name, response_factory in cases.items():
+            with self.subTest(case=case_name):
+                analyzer = analyzers.OpenAICompatibleAnalyzer(
+                    api_key="test-key",
+                    base_url="http://model.local/v1",
+                    model="demo-model",
+                    client_factory=lambda factory=response_factory: httpx.Client(
+                        transport=httpx.MockTransport(lambda request: factory())
+                    ),
+                )
+                realtime = Mock()
+                realtime.fetch_all_metrics.return_value = {"pv": 12, "uv": 5}
+                historical = Mock()
+                historical.fetch_summary.return_value = HistoricalEvidence(event_count=0)
+                service = AnalysisService(realtime, historical, analyzer, analyzers.RuleBasedAnalyzer())
+
+                with self.assertLogs("app.analysis_service", level="WARNING"):
+                    result = service.analyze("Analyze activity")
+
+                self.assertEqual("rule_based", result.analyzer)
+                self.assertTrue(any("\u6a21\u578b\u5206\u6790" in warning for warning in result.warnings))
 
     def test_load_settings_defaults_to_rule_mode(self):
         settings = load_settings(environ={})

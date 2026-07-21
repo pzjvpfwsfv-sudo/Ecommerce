@@ -93,4 +93,11 @@ class OpenAICompatibleAnalyzer:
             )
         response.raise_for_status()
         content = response.json()["choices"][0]["message"]["content"]
-        return AnalysisNarrative.model_validate(json.loads(content))
+        narrative_data = json.loads(content)
+        if not isinstance(narrative_data, dict):
+            raise ValueError("Model narrative must be a JSON object")
+        required_keys = {"summary", "insights", "risks", "actions"}
+        missing_keys = required_keys - narrative_data.keys()
+        if missing_keys:
+            raise ValueError(f"Model narrative is missing required fields: {sorted(missing_keys)}")
+        return AnalysisNarrative.model_validate(narrative_data)
