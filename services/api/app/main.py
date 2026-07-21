@@ -1,5 +1,6 @@
 ﻿from __future__ import annotations
 
+import logging
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, status
@@ -13,6 +14,9 @@ from app.analysis_service import (
 from app.config import ApiSettings, load_settings
 from app.dependencies import build_analysis_service
 from app.repository import RealtimeMetricsRepository
+
+
+logger = logging.getLogger(__name__)
 
 
 def create_app(
@@ -40,6 +44,15 @@ def create_app(
                 detail="realtime metrics are temporarily unavailable",
             ) from None
         except AnalysisUnavailableError:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="analysis is temporarily unavailable",
+            ) from None
+        except Exception as exc:
+            logger.error(
+                "analysis_route_failed",
+                extra={"stage": "analysis_route", "error_type": type(exc).__name__},
+            )
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail="analysis is temporarily unavailable",

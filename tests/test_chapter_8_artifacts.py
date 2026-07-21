@@ -76,21 +76,62 @@ class Chapter8ArtifactsTest(unittest.TestCase):
         ):
             self.assertIn(marker, text)
 
-    def test_verification_requires_fresh_realtime_evidence_from_run_specific_events(self):
+    def test_verification_requires_stable_baseline_and_exact_realtime_delta(self):
         text = (ROOT / "scripts/verify_chapter_8_analysis.ps1").read_text(encoding="utf-8")
         for marker in (
+            "[switch]$FunctionsOnly",
+            "$stableSampleCount",
             "$baselineResponse",
             "$baselinePv",
+            "$baselineUv",
             "$baselineUpdatedAt",
             'user_id = "chapter8-$runId-user-view"',
             'user_id = "chapter8-$runId-user-click"',
-            "$candidate.evidence.realtime.pv -gt $baselinePv",
-            "$candidateUpdatedAt -gt $baselineUpdatedAt",
             "baseline_pv=",
+            "baseline_uv=",
             "baseline_updated_at=",
             "post_updated_at=",
         ):
             self.assertIn(marker, text)
+
+        command = r'''
+$ErrorActionPreference = "Stop"
+$tokens = $null
+$errors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile(
+    (Resolve-Path "scripts/verify_chapter_8_analysis.ps1"),
+    [ref]$tokens,
+    [ref]$errors
+)
+if ($errors) { throw $errors[0] }
+$ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true) |
+    ForEach-Object { Invoke-Expression $_.Extent.Text }
+$baselineTime = [DateTimeOffset]::Parse("2026-07-22T00:00:00Z")
+$newTime = [DateTimeOffset]::Parse("2026-07-22T00:00:01Z")
+[ordered]@{
+    backlog_is_stable = Test-SameRealtimeSnapshot -PreviousPv 100 -PreviousUv 50 -PreviousUpdatedAt $baselineTime -CurrentPv 103 -CurrentUv 53 -CurrentUpdatedAt $newTime
+    backlog_overshoot = Test-ExpectedRealtimeDelta -BaselinePv 100 -BaselineUv 50 -BaselineUpdatedAt $baselineTime -CurrentPv 103 -CurrentUv 53 -CurrentUpdatedAt $newTime
+    pv_only = Test-ExpectedRealtimeDelta -BaselinePv 100 -BaselineUv 50 -BaselineUpdatedAt $baselineTime -CurrentPv 102 -CurrentUv 50 -CurrentUpdatedAt $newTime
+    non_two = Test-ExpectedRealtimeDelta -BaselinePv 100 -BaselineUv 50 -BaselineUpdatedAt $baselineTime -CurrentPv 101 -CurrentUv 51 -CurrentUpdatedAt $newTime
+    stale_time = Test-ExpectedRealtimeDelta -BaselinePv 100 -BaselineUv 50 -BaselineUpdatedAt $baselineTime -CurrentPv 102 -CurrentUv 52 -CurrentUpdatedAt $baselineTime
+    exact_run = Test-ExpectedRealtimeDelta -BaselinePv 100 -BaselineUv 50 -BaselineUpdatedAt $baselineTime -CurrentPv 102 -CurrentUv 52 -CurrentUpdatedAt $newTime
+} | ConvertTo-Json -Compress
+'''
+        result = self._run_powershell(command)
+        self.assertEqual(0, result.returncode, result.stderr or result.stdout)
+        payload = json.loads(result.stdout.strip().splitlines()[-1])
+        self.assertFalse(payload["backlog_is_stable"])
+        self.assertFalse(payload["backlog_overshoot"])
+        self.assertFalse(payload["pv_only"])
+        self.assertFalse(payload["non_two"])
+        self.assertFalse(payload["stale_time"])
+        self.assertTrue(payload["exact_run"])
+
+        functions_only = self._run_powershell(
+            '. (Resolve-Path "scripts/verify_chapter_8_analysis.ps1") -FunctionsOnly; "loaded"'
+        )
+        self.assertEqual(0, functions_only.returncode, functions_only.stderr or functions_only.stdout)
+        self.assertIn("loaded", functions_only.stdout)
 
     def test_connector_downloads_are_hash_pinned_partial_and_atomic(self):
         text = (ROOT / "scripts/verify_chapter_8_analysis.ps1").read_text(encoding="utf-8")
@@ -206,6 +247,28 @@ $waitResult = @(Wait-ForIcebergDataCommit -BaselineMetadataNames $empty -Baselin
                 ):
                     self.assertIn(marker, text)
                 self.assertNotIn("递归覆盖 `__cause__` 与 `__context__`", text)
+
+    def test_docs_describe_final_hardening_and_isolated_verification_boundary(self):
+        paths = (
+            ROOT / "README.md",
+            ROOT / "docs/superpowers/specs/2026-07-18-chapter-8-grounded-ai-analysis-design.md",
+            ROOT / "docs/superpowers/plans/2026-07-18-chapter-8-grounded-ai-analysis-implementation.md",
+        )
+        markers = (
+            "SQL/代码输出守卫",
+            "Cc/Cf",
+            "单条 Trino statement",
+            "try(from_iso8601_timestamp(event_time))",
+            "标识符白名单",
+            "连续 3 次稳定",
+            "PV/UV 精确增长 2",
+            "不是按 runId 从 Doris 做明细审计",
+        )
+        for path in paths:
+            with self.subTest(path=path.name):
+                text = path.read_text(encoding="utf-8")
+                for marker in markers:
+                    self.assertIn(marker, text)
 
 
 if __name__ == "__main__":

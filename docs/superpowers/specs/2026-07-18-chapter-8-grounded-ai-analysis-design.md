@@ -430,3 +430,11 @@ class MetricAnalyzer(Protocol):
 ## 16. 面试表达
 
 “前面的章节已经把 Kafka、Flink、Doris、Iceberg 和 Trino 链路跑通了。第 8 章我没有直接让大模型自由生成 SQL，因为那样很容易出现幻觉、越权和高成本查询。我先由后端执行受控查询，把 Doris 实时指标和 Trino 历史聚合组装成统一证据上下文，再让模型只负责解释。接口会同时返回分析结论和原始 evidence，而且没有模型凭证时可以使用规则分析器，模型超时或结构错误也会自动降级。后续再从预定义工具调用演进到带 SQL 白名单、解析和审计的 NL2SQL，这样 AI 能力是逐步增强的，而不是一开始就把数据库权限交给模型。”
+
+## 最终审查加固
+
+- 主分析器与回退分析器共用 SQL/代码输出守卫：拒绝代码围栏及结构化识别到的 SELECT、DDL、DML 语句；模型路径违规时安全降级，回退路径违规时返回固定安全失败。模型仍不得生成或执行 SQL，系统也没有引入 NL2SQL。
+- 输入和叙事在 NFKC 后全局拒绝 Cc/Cf 控制或格式字符；数字 token 只接受 ASCII 0-9 的明确格式，并拒绝残留 Unicode 数字、中英文数字词或数量词及无穷等数值符号。
+- 历史 evidence 由单条 Trino statement 返回总数、事件类型计数和最新时间；`try(from_iso8601_timestamp(event_time))` 使无效时间变为 NULL 后不参与 MAX。构造 evidence 前校验计数非负且分组和等于总数，否则按 Trino 不可用降级。
+- `TRINO_CATALOG` 与 `TRINO_SCHEMA` 只接受严格 ASCII 标识符白名单，查询表名逐段安全双引号，statement 与 Trino header 使用同一配置。
+- 真实脚本是隔离验证：先要求 PV、UV、updated_at 连续 3 次稳定，再发布两个唯一用户，并只接受 PV/UV 精确增长 2 且 updated_at 推进；并发或 backlog 导致 overshoot 会失败。该验证不是按 runId 从 Doris 做明细审计，不能据此宣称完成了事件级归因。

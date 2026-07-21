@@ -1,5 +1,7 @@
 [CmdletBinding()]
-param()
+param(
+    [switch]$FunctionsOnly
+)
 
 $ErrorActionPreference = "Stop"
 $repoRoot = Split-Path -Parent $PSScriptRoot
@@ -97,6 +99,44 @@ function Get-AnalysisTimeoutDetail {
     return ""
 }
 
+function Test-SameRealtimeSnapshot {
+    param(
+        [long]$PreviousPv,
+        [long]$PreviousUv,
+        [DateTimeOffset]$PreviousUpdatedAt,
+        [long]$CurrentPv,
+        [long]$CurrentUv,
+        [DateTimeOffset]$CurrentUpdatedAt
+    )
+
+    return (
+        $CurrentPv -eq $PreviousPv -and
+        $CurrentUv -eq $PreviousUv -and
+        $CurrentUpdatedAt -eq $PreviousUpdatedAt
+    )
+}
+
+function Test-ExpectedRealtimeDelta {
+    param(
+        [long]$BaselinePv,
+        [long]$BaselineUv,
+        [DateTimeOffset]$BaselineUpdatedAt,
+        [long]$CurrentPv,
+        [long]$CurrentUv,
+        [DateTimeOffset]$CurrentUpdatedAt
+    )
+
+    return (
+        $CurrentPv -eq ($BaselinePv + 2) -and
+        $CurrentUv -eq ($BaselineUv + 2) -and
+        $CurrentUpdatedAt -gt $BaselineUpdatedAt
+    )
+}
+
+if ($FunctionsOnly) {
+    return
+}
+
 Push-Location $repoRoot
 try {
     # Process variables override Compose interpolation and prevent accidental model calls.
@@ -116,6 +156,10 @@ try {
     $baselineResponse = $null
     $lastRequestError = $null
     $latestInvalidResponse = $null
+    $previousBaselinePv = $null
+    $previousBaselineUv = $null
+    $previousBaselineUpdatedAt = $null
+    $stableSampleCount = 0
     $baselineDeadline = (Get-Date).AddSeconds(120)
     do {
         try {
@@ -129,8 +173,32 @@ try {
                 $candidate.evidence.realtime.uv -gt 0 -and
                 $candidate.evidence.historical.event_count -gt 0
             ) {
-                $baselineResponse = $candidate
-                break
+                $candidatePv = [long]$candidate.evidence.realtime.pv
+                $candidateUv = [long]$candidate.evidence.realtime.uv
+                $candidateUpdatedAt = [DateTimeOffset]::Parse(
+                    [string]$candidate.evidence.realtime.updated_at
+                )
+                if (
+                    $null -ne $previousBaselinePv -and
+                    (Test-SameRealtimeSnapshot `
+                        -PreviousPv $previousBaselinePv `
+                        -PreviousUv $previousBaselineUv `
+                        -PreviousUpdatedAt $previousBaselineUpdatedAt `
+                        -CurrentPv $candidatePv `
+                        -CurrentUv $candidateUv `
+                        -CurrentUpdatedAt $candidateUpdatedAt)
+                ) {
+                    $stableSampleCount += 1
+                } else {
+                    $stableSampleCount = 1
+                }
+                $previousBaselinePv = $candidatePv
+                $previousBaselineUv = $candidateUv
+                $previousBaselineUpdatedAt = $candidateUpdatedAt
+                if ($stableSampleCount -ge 3) {
+                    $baselineResponse = $candidate
+                    break
+                }
             }
         } catch {
             $lastRequestError = $_.Exception.Message
@@ -145,8 +213,9 @@ try {
     }
 
     $baselinePv = [long]$baselineResponse.evidence.realtime.pv
+    $baselineUv = [long]$baselineResponse.evidence.realtime.uv
     $baselineUpdatedAt = [DateTimeOffset]::Parse([string]$baselineResponse.evidence.realtime.updated_at)
-    Write-Host "[chapter8-verify] baseline_pv=$baselinePv baseline_updated_at=$($baselineUpdatedAt.ToString('o'))"
+    Write-Host "[chapter8-verify] baseline_pv=$baselinePv baseline_uv=$baselineUv baseline_updated_at=$($baselineUpdatedAt.ToString('o'))"
 
     $runId = [Guid]::NewGuid().ToString("N")
     $eventTime = [DateTimeOffset]::UtcNow.ToString("o")
@@ -194,10 +263,14 @@ try {
             }
             if (
                 $candidate.analyzer -eq "rule_based" -and
-                $candidate.evidence.realtime.pv -gt $baselinePv -and
-                $candidateUpdatedAt -gt $baselineUpdatedAt -and
-                $candidate.evidence.realtime.uv -gt 0 -and
-                $candidate.evidence.historical.event_count -gt 0
+                $candidate.evidence.historical.event_count -gt 0 -and
+                (Test-ExpectedRealtimeDelta `
+                    -BaselinePv $baselinePv `
+                    -BaselineUv $baselineUv `
+                    -BaselineUpdatedAt $baselineUpdatedAt `
+                    -CurrentPv ([long]$candidate.evidence.realtime.pv) `
+                    -CurrentUv ([long]$candidate.evidence.realtime.uv) `
+                    -CurrentUpdatedAt $candidateUpdatedAt)
             ) {
                 $response = $candidate
                 break
@@ -211,7 +284,7 @@ try {
 
     if ($null -eq $response) {
         $detail = Get-AnalysisTimeoutDetail -LastRequestError $lastRequestError -LatestInvalidResponse $latestInvalidResponse
-        throw "Chapter 8 analysis endpoint did not return fresh positive rule-based evidence in time.$detail"
+        throw "Chapter 8 isolated verification did not observe an exact PV/UV +2 delta in time.$detail"
     }
 
     Write-Host "[chapter8-verify] analyzer=$($response.analyzer)"

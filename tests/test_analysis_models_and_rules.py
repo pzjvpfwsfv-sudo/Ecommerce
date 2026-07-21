@@ -19,6 +19,23 @@ class AnalysisModelsAndRulesTest(unittest.TestCase):
         with self.assertRaises(ValidationError):
             AnalysisRequest(question="   ")
 
+    def test_request_normalizes_nfkc_and_rejects_invisible_controls(self):
+        unsafe_questions = (
+            "\u200b",
+            "\u2060",
+            "\u202e",
+            "\x00",
+            "activity\u200b?",
+            "分析\u2060活跃度",
+        )
+        for question in unsafe_questions:
+            with self.subTest(question=repr(question)):
+                with self.assertRaises(ValidationError):
+                    AnalysisRequest(question=question)
+
+        self.assertEqual("Activity?", AnalysisRequest(question="  Ａｃｔｉｖｉｔｙ？  ").question)
+        self.assertEqual("分析活跃度?", AnalysisRequest(question="  分析活跃度？  ").question)
+
     def test_rule_analyzer_uses_only_evidence(self):
         context = AnalysisContext(
             question="\u5f53\u524d\u7528\u6237\u6d3b\u8dc3\u60c5\u51b5\u5982\u4f55\uff1f",

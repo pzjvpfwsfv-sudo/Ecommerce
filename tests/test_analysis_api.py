@@ -87,6 +87,22 @@ class AnalysisApiTest(unittest.TestCase):
             {"detail": "analysis is temporarily unavailable"}, response.json()
         )
 
+    def test_unknown_internal_error_returns_safe_503_without_escaping_test_client(self):
+        service = Mock()
+        service.analyze.side_effect = RuntimeError("sensitive internal payload")
+        client = TestClient(create_app(repository=Mock(), analysis_service=service))
+
+        with self.assertLogs("app.main", level="ERROR") as captured:
+            response = client.post("/analysis/realtime", json={"question": "分析活跃度"})
+
+        self.assertEqual(503, response.status_code)
+        self.assertEqual({"detail": "analysis is temporarily unavailable"}, response.json())
+        record = captured.records[0]
+        self.assertEqual("analysis_route", record.stage)
+        self.assertEqual("RuntimeError", record.error_type)
+        self.assertIsNone(record.exc_info)
+        self.assertNotIn("sensitive internal payload", record.getMessage())
+
 
 if __name__ == "__main__":
     unittest.main()

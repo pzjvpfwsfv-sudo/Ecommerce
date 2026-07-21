@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+import re
 from typing import Any
 
 import httpx
@@ -8,16 +9,44 @@ import httpx
 from app.analysis_models import HistoricalEvidence
 
 
-EVENT_COUNT_SQL = "SELECT COUNT(*) AS event_count FROM lakehouse.analytics.user_behavior_detail"
-EVENT_TYPE_COUNTS_SQL = (
-    "SELECT event_type, COUNT(*) AS event_count "
-    "FROM lakehouse.analytics.user_behavior_detail "
-    "GROUP BY event_type ORDER BY event_count DESC, event_type ASC"
+_IDENTIFIER_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
+
+
+def _quote_identifier(value: str, label: str) -> str:
+    if not _IDENTIFIER_PATTERN.fullmatch(value):
+        raise ValueError(f"Trino {label} must be a simple ASCII identifier")
+    return f'"{value}"'
+
+
+def _build_summary_sql(catalog: str, schema: str) -> str:
+    table = ".".join(
+        (
+            _quote_identifier(catalog, "catalog"),
+            _quote_identifier(schema, "schema"),
+            _quote_identifier("user_behavior_detail", "table"),
+        )
+    )
+    return f"""WITH parsed_events AS (
+    SELECT event_type, try(from_iso8601_timestamp(event_time)) AS parsed_event_time
+    FROM {table}
+),
+summary AS (
+    SELECT COUNT(*) AS event_count, MAX(parsed_event_time) AS latest_event_time
+    FROM parsed_events
+),
+event_type_counts AS (
+    SELECT event_type, COUNT(*) AS event_count
+    FROM parsed_events
+    GROUP BY event_type
 )
-LATEST_EVENT_TIME_SQL = (
-    "SELECT MAX(event_time) AS latest_event_time "
-    "FROM lakehouse.analytics.user_behavior_detail"
-)
+SELECT summary.event_count, event_type_counts.event_type,
+       event_type_counts.event_count, to_iso8601(summary.latest_event_time)
+FROM summary
+LEFT JOIN event_type_counts ON TRUE
+ORDER BY event_type_counts.event_count DESC, event_type_counts.event_type ASC"""
+
+
+SUMMARY_SQL = _build_summary_sql("lakehouse", "analytics")
 ClientFactory = Callable[[], httpx.Client]
 
 
@@ -31,6 +60,7 @@ class TrinoAnalyticsRepository:
         timeout_seconds: float = 10,
         client_factory: ClientFactory | None = None,
     ) -> None:
+        self._summary_sql = _build_summary_sql(catalog, schema)
         self._base_url = base_url.rstrip("/")
         self._headers = {
             "X-Trino-User": user,
@@ -42,12 +72,31 @@ class TrinoAnalyticsRepository:
         self._client_factory = client_factory or (lambda: httpx.Client())
 
     def fetch_summary(self) -> HistoricalEvidence:
-        count_rows = self._execute(EVENT_COUNT_SQL)
-        type_rows = self._execute(EVENT_TYPE_COUNTS_SQL)
-        latest_rows = self._execute(LATEST_EVENT_TIME_SQL)
-        event_count = int(count_rows[0][0]) if count_rows else 0
-        counts = {str(row[0]): int(row[1]) for row in type_rows}
-        latest_event_time = latest_rows[0][0] if latest_rows and latest_rows[0] else None
+        rows = self._execute(self._summary_sql)
+        if not rows:
+            raise ValueError("Trino summary returned no rows")
+
+        if any(len(row) != 4 for row in rows):
+            raise ValueError("Trino summary returned malformed rows")
+        event_count = int(rows[0][0])
+        latest_event_time = rows[0][3]
+        counts: dict[str, int] = {}
+        for row in rows:
+            if int(row[0]) != event_count or row[3] != latest_event_time:
+                raise ValueError("Trino summary rows are inconsistent")
+            if row[1] is None:
+                if row[2] is not None:
+                    raise ValueError("Trino summary contains an invalid event type")
+                continue
+            event_type = str(row[1])
+            if event_type in counts:
+                raise ValueError("Trino summary contains a duplicate event type")
+            counts[event_type] = int(row[2])
+
+        if event_count < 0 or any(count < 0 for count in counts.values()):
+            raise ValueError("Trino summary contains negative counts")
+        if sum(counts.values()) != event_count:
+            raise ValueError("Trino summary counts do not match the total")
         return HistoricalEvidence(
             event_count=event_count,
             event_type_counts=counts,

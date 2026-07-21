@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+import unicodedata
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -11,8 +12,14 @@ class AnalysisRequest(BaseModel):
     @field_validator("question")
     @classmethod
     def normalize_question(cls, value: str) -> str:
-        normalized = value.strip()
-        if not normalized:
+        normalized = unicodedata.normalize("NFKC", value)
+        if any(unicodedata.category(character).startswith("C") for character in normalized):
+            raise ValueError("question contains an invisible control character")
+        normalized = normalized.strip()
+        if not normalized or not any(
+            not character.isspace() and unicodedata.category(character) not in {"Mn", "Me"}
+            for character in normalized
+        ):
             raise ValueError("question must not be blank")
         return normalized
 

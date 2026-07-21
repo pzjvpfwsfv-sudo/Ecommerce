@@ -23,13 +23,36 @@ from app.analyzers import MetricAnalyzer
 
 logger = logging.getLogger(__name__)
 _NUMBER_PATTERN = re.compile(
-    r"(?<![\d.,])[-+]?(?:(?:(?:\d{1,3}(?:,\d{3})+)|\d+)(?:\.\d*)?|\.\d+)"
-    r"(?:[eE][-+]?\d+)?%?(?![\d.,])"
+    r"(?<![0-9.,])[-+]?(?:(?:(?:[0-9]{1,3}(?:,[0-9]{3})+)|[0-9]+)(?:\.[0-9]*)?|\.[0-9]+)"
+    r"(?:[eE][-+]?[0-9]+)?%?(?![0-9.,])"
 )
 _CHINESE_NUMBER_CHARACTERS = frozenset(
     "\u96f6\u3007\u4e00\u4e8c\u4e24\u4e09\u56db\u4e94\u516d\u4e03\u516b\u4e5d"
     "\u5341\u767e\u5343\u4e07\u4ebf\u5146\u58f9\u8d30\u53c1\u8086\u4f0d\u9646"
     "\u67d2\u634c\u7396\u62fe\u4f70\u4edf\u842c\u5104\u534a"
+)
+_ENGLISH_NUMBER_WORD_PATTERN = re.compile(
+    r"\b(?:zero|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|"
+    r"thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|"
+    r"thirty|forty|fifty|sixty|seventy|eighty|ninety|hundred|thousand|million|"
+    r"billion|trillion|dozen|score)\b",
+    re.IGNORECASE,
+)
+_CHINESE_QUANTITY_PATTERN = re.compile(r"(?:几|数|上|近|逾|超|过)(?:十|百|千|万|亿)")
+_UNSUPPORTED_NUMERIC_SYMBOLS = frozenset("∞≈≠≤≥±∓")
+_PROHIBITED_OUTPUT_PATTERNS = (
+    re.compile(r"```|~~~"),
+    re.compile(r"(?:^|[\r\n])\s*select\b", re.IGNORECASE),
+    re.compile(r"\bselect\b[\s\S]{0,200}\bfrom\b", re.IGNORECASE),
+    re.compile(r"\binsert\s+into\b", re.IGNORECASE),
+    re.compile(r"\bupdate\s+[A-Za-z_][\w.\"]*\s+set\b", re.IGNORECASE),
+    re.compile(r"\bdelete\s+from\b", re.IGNORECASE),
+    re.compile(
+        r"\b(?:create|alter|drop|truncate)\s+(?:table|view|schema|database|catalog)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(r"\bmerge\s+into\b", re.IGNORECASE),
+    re.compile(r"\b(?:grant|revoke)\b[\s\S]{0,100}\bon\b", re.IGNORECASE),
 )
 
 
@@ -78,10 +101,17 @@ def _numbers_in(value: Any, *, fail_closed: bool = False) -> set[Decimal]:
     text = value.isoformat() if isinstance(value, datetime) else str(value)
     normalized = unicodedata.normalize("NFKC", text)
     if fail_closed:
+        if any(unicodedata.category(character) in {"Cc", "Cf"} for character in normalized):
+            raise NarrativeProvenanceError("Narrative contains an invisible control character")
+        if any(character.isnumeric() and character not in "0123456789" for character in text):
+            raise NarrativeProvenanceError("Narrative contains an unsupported numeric form")
         if any(
             character in _CHINESE_NUMBER_CHARACTERS
-            or (character.isnumeric() and not character.isdecimal())
-            for character in text
+            or (character.isnumeric() and character not in "0123456789")
+            or character in _UNSUPPORTED_NUMERIC_SYMBOLS
+            for character in normalized
+        ) or _ENGLISH_NUMBER_WORD_PATTERN.search(normalized) or _CHINESE_QUANTITY_PATTERN.search(
+            normalized
         ):
             raise NarrativeProvenanceError("Narrative contains an unsupported numeric form")
 
@@ -120,12 +150,18 @@ def _allowed_narrative_numbers(context: AnalysisContext) -> set[Decimal]:
     return allowed
 
 
-def _validate_narrative_numbers(narrative: AnalysisNarrative, context: AnalysisContext) -> None:
+def _validate_narrative(narrative: AnalysisNarrative, context: AnalysisContext) -> None:
+    fields = [narrative.summary, *narrative.insights, *narrative.risks, *narrative.actions]
+    normalized_fields = [unicodedata.normalize("NFKC", value) for value in fields]
+    if any(
+        pattern.search(value)
+        for value in normalized_fields
+        for pattern in _PROHIBITED_OUTPUT_PATTERNS
+    ):
+        raise NarrativeProvenanceError("Narrative contains prohibited SQL or code output")
+
     allowed = _allowed_narrative_numbers(context)
-    narrative_numbers = _numbers_in(
-        [narrative.summary, *narrative.insights, *narrative.risks, *narrative.actions],
-        fail_closed=True,
-    )
+    narrative_numbers = _numbers_in(fields, fail_closed=True)
     if not narrative_numbers.issubset(allowed):
         raise NarrativeProvenanceError("Narrative contains an ungrounded number")
 
@@ -137,7 +173,7 @@ def _log_event(
     analyzer: str,
     degraded: bool,
     error_type: str | None,
-    **timings: float,
+    **details: Any,
 ) -> None:
     logger.log(
         level,
@@ -148,7 +184,7 @@ def _log_event(
             "analyzer": analyzer,
             "degraded": degraded,
             "error_type": error_type,
-            **timings,
+            **details,
         },
     )
 
@@ -190,6 +226,11 @@ class AnalysisService:
         started_at = perf_counter()
         try:
             raw_realtime = self._realtime.fetch_all_metrics()
+            realtime = RealtimeEvidence(
+                pv=self._optional_int(raw_realtime.get("pv")),
+                uv=self._optional_int(raw_realtime.get("uv")),
+                updated_at=raw_realtime.get("updated_at"),
+            )
         except Exception as exc:
             _log_event(
                 logging.ERROR,
@@ -198,16 +239,11 @@ class AnalysisService:
                 self._primary.name,
                 False,
                 type(exc).__name__,
+                stage="realtime_evidence",
                 doris_ms=(perf_counter() - started_at) * 1000,
             )
             raise RealtimeDataUnavailableError("Doris realtime metrics are unavailable") from None
         doris_ms = (perf_counter() - started_at) * 1000
-
-        realtime = RealtimeEvidence(
-            pv=self._optional_int(raw_realtime.get("pv")),
-            uv=self._optional_int(raw_realtime.get("uv")),
-            updated_at=raw_realtime.get("updated_at"),
-        )
 
         historical = None
         trino_started_at = perf_counter()
@@ -226,19 +262,31 @@ class AnalysisService:
             )
         trino_ms = (perf_counter() - trino_started_at) * 1000
 
-        generated_at = self._clock()
-        context = AnalysisContext(
-            question=question,
-            generated_at=generated_at,
-            evidence=AnalysisEvidence(realtime=realtime, historical=historical),
-            warnings=warnings,
-        )
+        try:
+            generated_at = self._clock()
+            context = AnalysisContext(
+                question=question,
+                generated_at=generated_at,
+                evidence=AnalysisEvidence(realtime=realtime, historical=historical),
+                warnings=warnings,
+            )
+        except Exception as exc:
+            _log_event(
+                logging.ERROR,
+                "analysis_internal_failed",
+                request_id,
+                self._primary.name,
+                bool(warnings),
+                type(exc).__name__,
+                stage="evidence_context",
+            )
+            raise AnalysisUnavailableError("Metric analysis is unavailable") from None
 
         analyzer = self._primary
         analyzer_started_at = perf_counter()
         try:
             narrative = analyzer.analyze(context)
-            _validate_narrative_numbers(narrative, context)
+            _validate_narrative(narrative, context)
         except Exception as exc:
             warnings.append("\u6a21\u578b\u5206\u6790\u6682\u4e0d\u53ef\u7528\uff0c\u5df2\u964d\u7ea7\u4e3a\u89c4\u5219\u5206\u6790\u3002")
             _log_event(
@@ -255,7 +303,7 @@ class AnalysisService:
             try:
                 fallback_context = context.model_copy(update={"warnings": warnings})
                 narrative = analyzer.analyze(fallback_context)
-                _validate_narrative_numbers(narrative, fallback_context)
+                _validate_narrative(narrative, fallback_context)
             except Exception as fallback_exc:
                 _log_event(
                     logging.ERROR,
@@ -281,13 +329,25 @@ class AnalysisService:
             analyzer_ms=analyzer_ms,
         )
 
-        return AnalysisResponse(
-            **narrative.model_dump(),
-            evidence=context.evidence,
-            warnings=warnings,
-            analyzer=analyzer.name,
-            generated_at=generated_at,
-        )
+        try:
+            return AnalysisResponse(
+                **narrative.model_dump(),
+                evidence=context.evidence,
+                warnings=warnings,
+                analyzer=analyzer.name,
+                generated_at=generated_at,
+            )
+        except Exception as exc:
+            _log_event(
+                logging.ERROR,
+                "analysis_internal_failed",
+                request_id,
+                analyzer.name,
+                bool(warnings),
+                type(exc).__name__,
+                stage="response",
+            )
+            raise AnalysisUnavailableError("Metric analysis is unavailable") from None
 
     @staticmethod
     def _optional_int(value: Any) -> int | None:
