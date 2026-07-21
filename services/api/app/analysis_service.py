@@ -26,7 +26,6 @@ _NUMBER_PATTERN = re.compile(
     r"(?<![\d.,])[-+]?(?:(?:(?:\d{1,3}(?:,\d{3})+)|\d+)(?:\.\d*)?|\.\d+)"
     r"(?:[eE][-+]?\d+)?%?(?![\d.,])"
 )
-_SPLIT_NUMBER_PATTERN = re.compile(r"\d(?:[\s_'\u2019\u02bc]+\d)")
 _CHINESE_NUMBER_CHARACTERS = frozenset(
     "\u96f6\u3007\u4e00\u4e8c\u4e24\u4e09\u56db\u4e94\u516d\u4e03\u516b\u4e5d"
     "\u5341\u767e\u5343\u4e07\u4ebf\u5146\u58f9\u8d30\u53c1\u8086\u4f0d\u9646"
@@ -65,11 +64,14 @@ def _numbers_in(value: Any, *, fail_closed: bool = False) -> set[Decimal]:
             for character in text
         ):
             raise NarrativeProvenanceError("Narrative contains an unsupported numeric form")
-        if _SPLIT_NUMBER_PATTERN.search(normalized):
-            raise NarrativeProvenanceError("Narrative contains a split number")
 
     matches = list(_NUMBER_PATTERN.finditer(normalized))
     if fail_closed:
+        for previous, current in zip(matches, matches[1:]):
+            separator = normalized[previous.end() : current.start()]
+            if not any(unicodedata.category(character).startswith("L") for character in separator):
+                raise NarrativeProvenanceError("Narrative contains a split number")
+
         residual = list(normalized)
         for match in matches:
             residual[match.start() : match.end()] = " " * (match.end() - match.start())

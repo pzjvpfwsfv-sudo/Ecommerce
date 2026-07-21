@@ -119,6 +119,9 @@ class AnalysisServiceTest(unittest.TestCase):
             "12'005",
             "12\u2019005",
             "\u216b",
+            "12\u200b005",
+            "12\u2060005",
+            "12\u066c005",
         )
         for untrusted_number in untrusted_numbers:
             with self.subTest(untrusted_number=untrusted_number):
@@ -141,6 +144,9 @@ class AnalysisServiceTest(unittest.TestCase):
             "12'005",
             "12\u2019005",
             "\u216b",
+            "12\u200b005",
+            "12\u2060005",
+            "12\u066c005",
         )
         for untrusted_number in untrusted_numbers:
             with self.subTest(untrusted_number=untrusted_number):
@@ -162,6 +168,17 @@ class AnalysisServiceTest(unittest.TestCase):
                     if getattr(record, "event", None) == "analysis_fallback_failed"
                 )
                 self.assertEqual("NarrativeProvenanceError", fallback_record.error_type)
+
+    def test_number_guard_allows_evidence_numbers_separated_by_words(self):
+        primary = Mock()
+        primary.name = "openai_compatible"
+        primary.analyze.return_value = AnalysisNarrative(summary="PV 12 and UV 5")
+        service = AnalysisService(self.realtime, self.trino, primary, RuleBasedAnalyzer(), self.clock)
+
+        response = service.analyze("\u5206\u6790\u6d3b\u8dc3\u5ea6")
+
+        self.assertEqual("openai_compatible", response.analyzer)
+        self.assertEqual("PV 12 and UV 5", response.summary)
 
     def test_untrusted_fallback_number_raises_safe_domain_error(self):
         primary = Mock()
