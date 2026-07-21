@@ -134,7 +134,7 @@ function Get-IcebergObjectNames {
         }
     }
 
-    return $names
+    return ,$names
 }
 
 function Wait-ForIcebergDataCommit {
