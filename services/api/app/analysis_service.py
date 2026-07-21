@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from datetime import datetime, timezone
+from decimal import Decimal
 import logging
+import re
 from time import perf_counter
 from typing import Any, Protocol
 from uuid import uuid4
@@ -10,6 +12,7 @@ from uuid import uuid4
 from app.analysis_models import (
     AnalysisContext,
     AnalysisEvidence,
+    AnalysisNarrative,
     AnalysisResponse,
     HistoricalEvidence,
     RealtimeEvidence,
@@ -18,6 +21,76 @@ from app.analyzers import MetricAnalyzer
 
 
 logger = logging.getLogger(__name__)
+_NUMBER_PATTERN = re.compile(
+    r"(?<![\d.,])[-+]?(?:(?:(?:\d{1,3}(?:,\d{3})+)|\d+)(?:\.\d*)?|\.\d+)"
+    r"(?:[eE][-+]?\d+)?%?(?![\d.,])"
+)
+
+
+class NarrativeProvenanceError(RuntimeError):
+    pass
+
+
+def _numbers_in(value: Any) -> set[Decimal]:
+    if isinstance(value, dict):
+        return set().union(*(_numbers_in(item) for item in value.values())) if value else set()
+    if isinstance(value, (list, tuple, set)):
+        return set().union(*(_numbers_in(item) for item in value)) if value else set()
+    if isinstance(value, bool) or value is None:
+        return set()
+    if isinstance(value, (int, float, Decimal)):
+        return {Decimal(str(value))}
+
+    text = value.isoformat() if isinstance(value, datetime) else str(value)
+    return {
+        Decimal(match.group().removesuffix("%").replace(",", ""))
+        for match in _NUMBER_PATTERN.finditer(text)
+    }
+
+
+def _allowed_narrative_numbers(context: AnalysisContext) -> set[Decimal]:
+    allowed = _numbers_in(context.evidence.model_dump())
+    realtime = context.evidence.realtime
+    if realtime.pv is not None and realtime.uv not in (None, 0):
+        allowed.add(Decimal(f"{realtime.pv / realtime.uv:.1f}"))
+
+    historical = context.evidence.historical
+    if historical and historical.event_count and historical.event_count > 0:
+        for count in historical.event_type_counts.values():
+            allowed.add(Decimal(f"{count / historical.event_count:.1%}".removesuffix("%")))
+    return allowed
+
+
+def _validate_narrative_numbers(narrative: AnalysisNarrative, context: AnalysisContext) -> None:
+    allowed = _allowed_narrative_numbers(context)
+    narrative_numbers = _numbers_in(
+        [narrative.summary, *narrative.insights, *narrative.risks, *narrative.actions]
+    )
+    if not narrative_numbers.issubset(allowed):
+        raise NarrativeProvenanceError("Narrative contains an ungrounded number")
+
+
+def _log_event(
+    level: int,
+    event: str,
+    request_id: str,
+    analyzer: str,
+    degraded: bool,
+    error_type: str | None,
+    **timings: float,
+) -> None:
+    logger.log(
+        level,
+        event,
+        extra={
+            "event": event,
+            "request_id": request_id,
+            "analyzer": analyzer,
+            "degraded": degraded,
+            "error_type": error_type,
+            **timings,
+        },
+    )
 
 
 class RealtimeRepository(Protocol):
@@ -29,6 +102,10 @@ class HistoricalRepository(Protocol):
 
 
 class RealtimeDataUnavailableError(RuntimeError):
+    pass
+
+
+class AnalysisUnavailableError(RuntimeError):
     pass
 
 
@@ -54,11 +131,14 @@ class AnalysisService:
         try:
             raw_realtime = self._realtime.fetch_all_metrics()
         except Exception as exc:
-            logger.exception(
-                "analysis_doris_failed request_id=%s doris_ms=%.2f error_type=%s",
+            _log_event(
+                logging.ERROR,
+                "analysis_doris_failed",
                 request_id,
-                (perf_counter() - started_at) * 1000,
+                self._primary.name,
+                False,
                 type(exc).__name__,
+                doris_ms=(perf_counter() - started_at) * 1000,
             )
             raise RealtimeDataUnavailableError("Doris realtime metrics are unavailable") from exc
         doris_ms = (perf_counter() - started_at) * 1000
@@ -75,11 +155,14 @@ class AnalysisService:
             historical = self._historical.fetch_summary()
         except Exception as exc:
             warnings.append("\u5386\u53f2\u6570\u636e\u6682\u4e0d\u53ef\u7528\uff0c\u672c\u6b21\u4ec5\u57fa\u4e8e Doris \u5b9e\u65f6\u6307\u6807\u5206\u6790\u3002")
-            logger.warning(
-                "analysis_trino_degraded request_id=%s trino_ms=%.2f error_type=%s",
+            _log_event(
+                logging.WARNING,
+                "analysis_trino_degraded",
                 request_id,
-                (perf_counter() - trino_started_at) * 1000,
+                self._primary.name,
+                True,
                 type(exc).__name__,
+                trino_ms=(perf_counter() - trino_started_at) * 1000,
             )
         trino_ms = (perf_counter() - trino_started_at) * 1000
 
@@ -95,26 +178,47 @@ class AnalysisService:
         analyzer_started_at = perf_counter()
         try:
             narrative = analyzer.analyze(context)
+            _validate_narrative_numbers(narrative, context)
         except Exception as exc:
             warnings.append("\u6a21\u578b\u5206\u6790\u6682\u4e0d\u53ef\u7528\uff0c\u5df2\u964d\u7ea7\u4e3a\u89c4\u5219\u5206\u6790\u3002")
-            logger.warning(
-                "analysis_model_degraded request_id=%s analyzer=%s error_type=%s",
+            _log_event(
+                logging.WARNING,
+                "analysis_model_degraded",
                 request_id,
                 analyzer.name,
+                True,
                 type(exc).__name__,
+                analyzer_ms=(perf_counter() - analyzer_started_at) * 1000,
             )
             analyzer = self._fallback
-            narrative = analyzer.analyze(context.model_copy(update={"warnings": warnings}))
+            fallback_started_at = perf_counter()
+            try:
+                fallback_context = context.model_copy(update={"warnings": warnings})
+                narrative = analyzer.analyze(fallback_context)
+                _validate_narrative_numbers(narrative, fallback_context)
+            except Exception as fallback_exc:
+                _log_event(
+                    logging.ERROR,
+                    "analysis_fallback_failed",
+                    request_id,
+                    analyzer.name,
+                    True,
+                    type(fallback_exc).__name__,
+                    analyzer_ms=(perf_counter() - fallback_started_at) * 1000,
+                )
+                raise AnalysisUnavailableError("Metric analysis is unavailable") from fallback_exc
         analyzer_ms = (perf_counter() - analyzer_started_at) * 1000
 
-        logger.info(
-            "analysis_complete request_id=%s analyzer=%s doris_ms=%.2f trino_ms=%.2f analyzer_ms=%.2f degraded=%s",
+        _log_event(
+            logging.INFO,
+            "analysis_complete",
             request_id,
             analyzer.name,
-            doris_ms,
-            trino_ms,
-            analyzer_ms,
             bool(warnings),
+            None,
+            doris_ms=doris_ms,
+            trino_ms=trino_ms,
+            analyzer_ms=analyzer_ms,
         )
 
         return AnalysisResponse(
