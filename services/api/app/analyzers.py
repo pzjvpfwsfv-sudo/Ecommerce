@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+from collections.abc import Callable
+import json
 from typing import Protocol
+
+import httpx
 
 from app.analysis_models import AnalysisContext, AnalysisNarrative
 
@@ -41,3 +45,52 @@ class RuleBasedAnalyzer:
         if pv is None or uv is None:
             return "\u5b9e\u65f6 PV/UV \u6307\u6807\u4e0d\u5b8c\u6574\uff0c\u6682\u65f6\u53ea\u80fd\u63d0\u4f9b\u6709\u9650\u5206\u6790\u3002"
         return f"\u5f53\u524d\u7d2f\u8ba1\u8bbf\u95ee {pv} \u6b21\uff0c\u8986\u76d6 {uv} \u540d\u7528\u6237\u3002"
+
+
+class OpenAICompatibleAnalyzer:
+    name = "openai_compatible"
+
+    def __init__(
+        self,
+        api_key: str,
+        base_url: str,
+        model: str,
+        timeout_seconds: float = 15,
+        client_factory: Callable[[], httpx.Client] | None = None,
+    ) -> None:
+        if not api_key or not base_url or not model:
+            raise ValueError("AI_API_KEY, AI_BASE_URL and AI_MODEL are required")
+        self._api_key = api_key
+        self._base_url = base_url.rstrip("/")
+        self._model = model
+        self._timeout_seconds = timeout_seconds
+        self._client_factory = client_factory or (lambda: httpx.Client())
+
+    def analyze(self, context: AnalysisContext) -> AnalysisNarrative:
+        payload = {
+            "model": self._model,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are an ecommerce metric analysis assistant. Use only facts and "
+                        "numbers in the provided evidence. Do not generate SQL or claim access "
+                        "to data outside this context. State when evidence is insufficient. "
+                        "Respond in Chinese or English. Return only JSON with summary, insights, "
+                        "risks, and actions fields."
+                    ),
+                },
+                {"role": "user", "content": context.model_dump_json()},
+            ],
+            "temperature": 0,
+        }
+        with self._client_factory() as client:
+            response = client.post(
+                f"{self._base_url}/chat/completions",
+                headers={"Authorization": f"Bearer {self._api_key}"},
+                json=payload,
+                timeout=self._timeout_seconds,
+            )
+        response.raise_for_status()
+        content = response.json()["choices"][0]["message"]["content"]
+        return AnalysisNarrative.model_validate(json.loads(content))
