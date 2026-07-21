@@ -122,6 +122,8 @@ class AnalysisServiceTest(unittest.TestCase):
             "12\u200b005",
             "12\u2060005",
             "12\u066c005",
+            "12\u3164005",
+            "12\u1160005",
         )
         for untrusted_number in untrusted_numbers:
             with self.subTest(untrusted_number=untrusted_number):
@@ -147,6 +149,8 @@ class AnalysisServiceTest(unittest.TestCase):
             "12\u200b005",
             "12\u2060005",
             "12\u066c005",
+            "12\u3164005",
+            "12\u1160005",
         )
         for untrusted_number in untrusted_numbers:
             with self.subTest(untrusted_number=untrusted_number):
@@ -170,15 +174,18 @@ class AnalysisServiceTest(unittest.TestCase):
                 self.assertEqual("NarrativeProvenanceError", fallback_record.error_type)
 
     def test_number_guard_allows_evidence_numbers_separated_by_words(self):
-        primary = Mock()
-        primary.name = "openai_compatible"
-        primary.analyze.return_value = AnalysisNarrative(summary="PV 12 and UV 5")
-        service = AnalysisService(self.realtime, self.trino, primary, RuleBasedAnalyzer(), self.clock)
+        summaries = ("PV 12 and UV 5", "\u5b9e\u65f6 12 \u6b21\uff0c\u8986\u76d6 5 \u4eba")
+        for summary in summaries:
+            with self.subTest(summary=summary):
+                primary = Mock()
+                primary.name = "openai_compatible"
+                primary.analyze.return_value = AnalysisNarrative(summary=summary)
+                service = AnalysisService(self.realtime, self.trino, primary, RuleBasedAnalyzer(), self.clock)
 
-        response = service.analyze("\u5206\u6790\u6d3b\u8dc3\u5ea6")
+                response = service.analyze("\u5206\u6790\u6d3b\u8dc3\u5ea6")
 
-        self.assertEqual("openai_compatible", response.analyzer)
-        self.assertEqual("PV 12 and UV 5", response.summary)
+                self.assertEqual("openai_compatible", response.analyzer)
+                self.assertEqual(summary, response.summary)
 
     def test_untrusted_fallback_number_raises_safe_domain_error(self):
         primary = Mock()

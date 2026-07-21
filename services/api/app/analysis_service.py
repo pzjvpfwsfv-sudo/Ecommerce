@@ -37,6 +37,26 @@ class NarrativeProvenanceError(RuntimeError):
     pass
 
 
+def _is_supported_natural_language_separator(separator: str) -> bool:
+    has_supported_letter = False
+    for character in separator:
+        category = unicodedata.category(character)
+        if category in {"Cc", "Cf"}:
+            return False
+
+        is_supported_codepoint = (
+            "A" <= character <= "Z"
+            or "a" <= character <= "z"
+            or "\u3400" <= character <= "\u4dbf"
+            or "\u4e00" <= character <= "\u9fff"
+        )
+        is_supported_letter = category.startswith("L") and is_supported_codepoint
+        if category.startswith("L") and not is_supported_letter:
+            return False
+        has_supported_letter = has_supported_letter or is_supported_letter
+    return has_supported_letter
+
+
 def _numbers_in(value: Any, *, fail_closed: bool = False) -> set[Decimal]:
     if isinstance(value, dict):
         return (
@@ -69,7 +89,7 @@ def _numbers_in(value: Any, *, fail_closed: bool = False) -> set[Decimal]:
     if fail_closed:
         for previous, current in zip(matches, matches[1:]):
             separator = normalized[previous.end() : current.start()]
-            if not any(unicodedata.category(character).startswith("L") for character in separator):
+            if not _is_supported_natural_language_separator(separator):
                 raise NarrativeProvenanceError("Narrative contains a split number")
 
         residual = list(normalized)
