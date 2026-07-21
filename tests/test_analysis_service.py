@@ -1,6 +1,7 @@
 from datetime import datetime, timezone
 from pathlib import Path
 import sys
+import traceback
 import unittest
 from unittest.mock import Mock
 
@@ -109,6 +110,59 @@ class AnalysisServiceTest(unittest.TestCase):
 
                 self.assertEqual("rule_based", response.analyzer)
 
+    def test_primary_number_guard_fails_closed_for_numeric_bypasses(self):
+        untrusted_numbers = (
+            "\u4e00\u4e07",
+            "\uff11\uff12\uff0c\uff10\uff10\uff15",
+            "12 005",
+            "12_005",
+            "12'005",
+            "12\u2019005",
+            "\u216b",
+        )
+        for untrusted_number in untrusted_numbers:
+            with self.subTest(untrusted_number=untrusted_number):
+                primary = Mock()
+                primary.name = "openai_compatible"
+                primary.analyze.return_value = AnalysisNarrative(summary=f"value {untrusted_number}")
+                service = AnalysisService(self.realtime, self.trino, primary, RuleBasedAnalyzer(), self.clock)
+
+                with self.assertLogs("app.analysis_service", level="WARNING"):
+                    response = service.analyze("\u5206\u6790\u6d3b\u8dc3\u5ea6")
+
+                self.assertEqual("rule_based", response.analyzer)
+
+    def test_fallback_number_guard_fails_closed_for_numeric_bypasses(self):
+        untrusted_numbers = (
+            "\u4e00\u4e07",
+            "\uff11\uff12\uff0c\uff10\uff10\uff15",
+            "12 005",
+            "12_005",
+            "12'005",
+            "12\u2019005",
+            "\u216b",
+        )
+        for untrusted_number in untrusted_numbers:
+            with self.subTest(untrusted_number=untrusted_number):
+                primary = Mock()
+                primary.name = "openai_compatible"
+                primary.analyze.side_effect = TimeoutError("sensitive primary detail")
+                fallback = Mock()
+                fallback.name = "rule_based"
+                fallback.analyze.return_value = AnalysisNarrative(summary=f"value {untrusted_number}")
+                service = AnalysisService(self.realtime, self.trino, primary, fallback, self.clock)
+
+                with self.assertLogs("app.analysis_service", level="WARNING") as captured:
+                    with self.assertRaises(AnalysisUnavailableError):
+                        service.analyze("\u5206\u6790\u6d3b\u8dc3\u5ea6")
+
+                fallback_record = next(
+                    record
+                    for record in captured.records
+                    if getattr(record, "event", None) == "analysis_fallback_failed"
+                )
+                self.assertEqual("NarrativeProvenanceError", fallback_record.error_type)
+
     def test_untrusted_fallback_number_raises_safe_domain_error(self):
         primary = Mock()
         primary.name = "openai_compatible"
@@ -144,6 +198,10 @@ class AnalysisServiceTest(unittest.TestCase):
                 service.analyze("\u5206\u6790\u6d3b\u8dc3\u5ea6")
 
         self.assertEqual("Metric analysis is unavailable", str(raised.exception))
+        formatted = "".join(traceback.format_exception(raised.exception))
+        self.assertNotIn("sensitive primary detail", formatted)
+        self.assertNotIn("sensitive fallback detail", formatted)
+        self.assertIsNone(raised.exception.__cause__)
         fallback_record = next(
             (record for record in captured.records if getattr(record, "event", None) == "analysis_fallback_failed"),
             None,
@@ -179,9 +237,12 @@ class AnalysisServiceTest(unittest.TestCase):
         service = AnalysisService(self.realtime, self.trino, RuleBasedAnalyzer(), RuleBasedAnalyzer(), self.clock)
 
         with self.assertLogs("app.analysis_service", level="ERROR") as captured:
-            with self.assertRaises(RealtimeDataUnavailableError):
+            with self.assertRaises(RealtimeDataUnavailableError) as raised:
                 service.analyze("\u5206\u6790\u6d3b\u8dc3\u5ea6")
 
+        formatted = "".join(traceback.format_exception(raised.exception))
+        self.assertNotIn("sensitive doris detail", formatted)
+        self.assertIsNone(raised.exception.__cause__)
         record = captured.records[0]
         self.assertEqual("analysis_doris_failed", getattr(record, "event", None))
         self.assertIsInstance(record.request_id, str)

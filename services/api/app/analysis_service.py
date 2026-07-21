@@ -7,6 +7,7 @@ import logging
 import re
 from time import perf_counter
 from typing import Any, Protocol
+import unicodedata
 from uuid import uuid4
 
 from app.analysis_models import (
@@ -25,26 +26,62 @@ _NUMBER_PATTERN = re.compile(
     r"(?<![\d.,])[-+]?(?:(?:(?:\d{1,3}(?:,\d{3})+)|\d+)(?:\.\d*)?|\.\d+)"
     r"(?:[eE][-+]?\d+)?%?(?![\d.,])"
 )
+_SPLIT_NUMBER_PATTERN = re.compile(r"\d(?:[\s_'\u2019\u02bc]+\d)")
+_CHINESE_NUMBER_CHARACTERS = frozenset(
+    "\u96f6\u3007\u4e00\u4e8c\u4e24\u4e09\u56db\u4e94\u516d\u4e03\u516b\u4e5d"
+    "\u5341\u767e\u5343\u4e07\u4ebf\u5146\u58f9\u8d30\u53c1\u8086\u4f0d\u9646"
+    "\u67d2\u634c\u7396\u62fe\u4f70\u4edf\u842c\u5104\u534a"
+)
 
 
 class NarrativeProvenanceError(RuntimeError):
     pass
 
 
-def _numbers_in(value: Any) -> set[Decimal]:
+def _numbers_in(value: Any, *, fail_closed: bool = False) -> set[Decimal]:
     if isinstance(value, dict):
-        return set().union(*(_numbers_in(item) for item in value.values())) if value else set()
+        return (
+            set().union(*(_numbers_in(item, fail_closed=fail_closed) for item in value.values()))
+            if value
+            else set()
+        )
     if isinstance(value, (list, tuple, set)):
-        return set().union(*(_numbers_in(item) for item in value)) if value else set()
+        return (
+            set().union(*(_numbers_in(item, fail_closed=fail_closed) for item in value))
+            if value
+            else set()
+        )
     if isinstance(value, bool) or value is None:
         return set()
     if isinstance(value, (int, float, Decimal)):
         return {Decimal(str(value))}
 
     text = value.isoformat() if isinstance(value, datetime) else str(value)
+    normalized = unicodedata.normalize("NFKC", text)
+    if fail_closed:
+        if any(
+            character in _CHINESE_NUMBER_CHARACTERS
+            or (character.isnumeric() and not character.isdecimal())
+            for character in text
+        ):
+            raise NarrativeProvenanceError("Narrative contains an unsupported numeric form")
+        if _SPLIT_NUMBER_PATTERN.search(normalized):
+            raise NarrativeProvenanceError("Narrative contains a split number")
+
+    matches = list(_NUMBER_PATTERN.finditer(normalized))
+    if fail_closed:
+        residual = list(normalized)
+        for match in matches:
+            residual[match.start() : match.end()] = " " * (match.end() - match.start())
+        if any(
+            character.isnumeric() or character in _CHINESE_NUMBER_CHARACTERS
+            for character in residual
+        ):
+            raise NarrativeProvenanceError("Narrative contains an unsupported numeric form")
+
     return {
         Decimal(match.group().removesuffix("%").replace(",", ""))
-        for match in _NUMBER_PATTERN.finditer(text)
+        for match in matches
     }
 
 
@@ -64,7 +101,8 @@ def _allowed_narrative_numbers(context: AnalysisContext) -> set[Decimal]:
 def _validate_narrative_numbers(narrative: AnalysisNarrative, context: AnalysisContext) -> None:
     allowed = _allowed_narrative_numbers(context)
     narrative_numbers = _numbers_in(
-        [narrative.summary, *narrative.insights, *narrative.risks, *narrative.actions]
+        [narrative.summary, *narrative.insights, *narrative.risks, *narrative.actions],
+        fail_closed=True,
     )
     if not narrative_numbers.issubset(allowed):
         raise NarrativeProvenanceError("Narrative contains an ungrounded number")
@@ -140,7 +178,7 @@ class AnalysisService:
                 type(exc).__name__,
                 doris_ms=(perf_counter() - started_at) * 1000,
             )
-            raise RealtimeDataUnavailableError("Doris realtime metrics are unavailable") from exc
+            raise RealtimeDataUnavailableError("Doris realtime metrics are unavailable") from None
         doris_ms = (perf_counter() - started_at) * 1000
 
         realtime = RealtimeEvidence(
@@ -206,7 +244,7 @@ class AnalysisService:
                     type(fallback_exc).__name__,
                     analyzer_ms=(perf_counter() - fallback_started_at) * 1000,
                 )
-                raise AnalysisUnavailableError("Metric analysis is unavailable") from fallback_exc
+                raise AnalysisUnavailableError("Metric analysis is unavailable") from None
         analyzer_ms = (perf_counter() - analyzer_started_at) * 1000
 
         _log_event(
