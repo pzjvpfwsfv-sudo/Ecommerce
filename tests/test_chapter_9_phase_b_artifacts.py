@@ -815,7 +815,8 @@ $manifest = [pscustomobject]@{
 $jobs = [pscustomobject]@{ jobs = @(
     [pscustomobject]@{ jid = $manifest.production_job_id; name = "chapter-9-datastream-quality-production"; state = "RUNNING" },
     [pscustomobject]@{ jid = $manifest.doris_job_id; name = "chapter-9-doris-clean"; state = "RUNNING" },
-    [pscustomobject]@{ jid = $manifest.iceberg_job_id; name = "chapter-9-iceberg-clean"; state = "RUNNING" }
+    [pscustomobject]@{ jid = $manifest.iceberg_job_id; name = "chapter-9-iceberg-clean"; state = "RUNNING" },
+    [pscustomobject]@{ jid = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"; name = "chapter-9-doris-clean"; state = "CANCELED" }
 ) }
 $overview = [pscustomobject]@{ taskmanagers = 1; "slots-total" = 4; "slots-available" = 1; "jobs-running" = 3 }
 $validatedJobs = Assert-ProductionJobsAndCapacity -Manifest $manifest -Jobs $jobs -Overview $overview

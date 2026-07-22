@@ -363,7 +363,9 @@ function Assert-ProductionJobsAndCapacity {
             throw "Manifest Job ID is invalid for $($expected.Name): $($expected.Id)"
         }
         $byId = @($Jobs.jobs | Where-Object { [string]$_.jid -eq $expected.Id })
-        $byName = @($Jobs.jobs | Where-Object { [string]$_.name -eq $expected.Name })
+        $byName = @($Jobs.jobs | Where-Object {
+            [string]$_.name -eq $expected.Name -and [string]$_.state -eq "RUNNING"
+        })
         if ($byId.Count -ne 1 -or $byName.Count -ne 1 -or
             [string]$byId[0].name -ne $expected.Name -or
             [string]$byId[0].state -ne "RUNNING" -or
