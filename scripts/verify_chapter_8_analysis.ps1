@@ -201,7 +201,7 @@ function Invoke-Chapter8TrinoStatement {
             }
         }
         if (-not $response.nextUri) {
-            return ,$rows.ToArray()
+            return $rows.ToArray()
         }
         $response = Invoke-RestMethod -Method Get -Uri $response.nextUri
     }

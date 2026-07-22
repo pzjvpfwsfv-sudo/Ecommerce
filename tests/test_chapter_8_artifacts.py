@@ -204,6 +204,24 @@ $audit = Invoke-Chapter8RunAudit -eventIds @("chapter8-run-view", "chapter8-run-
         self.assertTrue(audit_payload["exact_click"])
         self.assertTrue(audit_payload["no_prefix_like"])
 
+        real_shape_command = r'''
+$ErrorActionPreference = "Stop"
+. (Resolve-Path "scripts/verify_chapter_8_analysis.ps1") -FunctionsOnly
+function Invoke-RestMethod {
+    param([string]$Method, [string]$Uri, $Headers, $Body, [string]$ContentType)
+    return '{"data":[[2,2,2]]}' | ConvertFrom-Json
+}
+$audit = Invoke-Chapter8RunAudit -eventIds @("chapter8-run-view", "chapter8-run-click")
+"$($audit.EventCount),$($audit.DistinctEventId),$($audit.DistinctUserId)"
+'''
+        real_shape_result = self._run_powershell(real_shape_command)
+        self.assertEqual(
+            0,
+            real_shape_result.returncode,
+            real_shape_result.stderr or real_shape_result.stdout,
+        )
+        self.assertIn("2,2,2", real_shape_result.stdout)
+
     def test_functions_only_dot_source_does_not_pollute_caller_state(self):
         command = r'''
 $ErrorActionPreference = "Continue"
