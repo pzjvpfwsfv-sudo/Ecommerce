@@ -701,6 +701,12 @@ try {
             "StatePartialPath",
             "AS duplicate_event_count",
             'assertion = "measured_sql"',
+            "ResumeRunId",
+            "logical_run_resumed",
+            "pre_resume_counts",
+            'send_action = "late_only"',
+            "initial_events_resent",
+            "derived_recovered",
         ):
             self.assertIn(marker, text)
         watermark_gate = text.index("$watermarkEvidence = Wait-ProductionWatermarkPast")
@@ -1158,3 +1164,212 @@ try {
         self.assertTrue(payload["interrupted_job_rejected"])
         self.assertEqual(1, payload["send_calls"])
         self.assertTrue(payload["repeat_rejected"])
+
+    def test_production_verifier_resume_requires_one_matching_failed_run(self):
+        command = r'''
+$ErrorActionPreference = "Stop"
+. (Resolve-Path "scripts/verify_chapter_9_production.ps1") -FunctionsOnly
+$root = Join-Path ([IO.Path]::GetTempPath()) ("chapter9-resume-" + [guid]::NewGuid())
+New-Item -ItemType Directory -Path $root | Out-Null
+try {
+    $runId = "chapter9-production-0123456789abcdef0123456789abcdef"
+    $final = Join-Path $root "production-verification.json"
+    $failed = Join-Path $root "production-verification.$runId.failed.json"
+    [IO.File]::WriteAllText($failed, (@{
+        status = "failed"; run_id = $runId; doris_job_id = "doris-job"; events_sent = $true
+    } | ConvertTo-Json))
+    $allowed = Assert-ProductionResumeAllowed -Directory $root -FinalPath $final `
+        -RunId $runId -DorisJobId "doris-job"
+
+    $unknownRejected = $false
+    try {
+        Assert-ProductionResumeAllowed -Directory $root -FinalPath $final `
+            -RunId "chapter9-production-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" `
+            -DorisJobId "doris-job" | Out-Null
+    } catch { $unknownRejected = $true }
+    $mismatchRejected = $false
+    try {
+        Assert-ProductionResumeAllowed -Directory $root -FinalPath $final `
+            -RunId $runId -DorisJobId "other-job" | Out-Null
+    } catch { $mismatchRejected = $true }
+
+    $record = Get-Content -Raw $failed | ConvertFrom-Json
+    $record.events_sent = $false
+    [IO.File]::WriteAllText($failed, ($record | ConvertTo-Json))
+    $unsentRejected = $false
+    try {
+        Assert-ProductionResumeAllowed -Directory $root -FinalPath $final `
+            -RunId $runId -DorisJobId "doris-job" | Out-Null
+    } catch { $unsentRejected = $true }
+    $record.events_sent = $true
+    [IO.File]::WriteAllText($failed, ($record | ConvertTo-Json))
+
+    $inProgress = Join-Path $root "production-verification.$runId.resume-test.in-progress.json"
+    [IO.File]::WriteAllText($inProgress, (@{ status = "resume_in_progress"; run_id = $runId } | ConvertTo-Json))
+    $inProgressRejected = $false
+    try {
+        Assert-ProductionResumeAllowed -Directory $root -FinalPath $final `
+            -RunId $runId -DorisJobId "doris-job" | Out-Null
+    } catch { $inProgressRejected = $true }
+    Remove-Item -LiteralPath $inProgress
+
+    [IO.File]::WriteAllText($final, (@{ status = "success"; run_id = $runId } | ConvertTo-Json))
+    $successRejected = $false
+    try {
+        Assert-ProductionResumeAllowed -Directory $root -FinalPath $final `
+            -RunId $runId -DorisJobId "doris-job" | Out-Null
+    } catch { $successRejected = $true }
+    Remove-Item -LiteralPath $final
+
+    $lock = Enter-ProductionRunLock -Path (Join-Path $root "production-verification.lock")
+    $concurrentRejected = $false
+    try {
+        Enter-ProductionRunLock -Path (Join-Path $root "production-verification.lock") | Out-Null
+    } catch { $concurrentRejected = $true }
+    $lock.Dispose()
+
+    [ordered]@{
+        source = $allowed.SourceFailedPath
+        unknown_rejected = $unknownRejected
+        mismatch_rejected = $mismatchRejected
+        unsent_rejected = $unsentRejected
+        in_progress_rejected = $inProgressRejected
+        success_rejected = $successRejected
+        concurrent_rejected = $concurrentRejected
+    } | ConvertTo-Json -Compress
+} finally {
+    Remove-Item -LiteralPath $root -Recurse -Force
+}
+'''
+        result = self._run_powershell(command)
+        self.assertEqual(0, result.returncode, result.stderr or result.stdout)
+        payload = json.loads(result.stdout.strip().splitlines()[-1])
+        self.assertTrue(payload["source"].endswith(".failed.json"))
+        self.assertTrue(payload["unknown_rejected"])
+        self.assertTrue(payload["mismatch_rejected"])
+        self.assertTrue(payload["unsent_rejected"])
+        self.assertTrue(payload["in_progress_rejected"])
+        self.assertTrue(payload["success_rejected"])
+        self.assertTrue(payload["concurrent_rejected"])
+
+    def test_production_verifier_resume_reconstructs_exact_partial_run_and_sends_only_late(self):
+        command = r'''
+$ErrorActionPreference = "Stop"
+. (Resolve-Path "scripts/verify_chapter_9_production.ps1") -FunctionsOnly
+$runId = "chapter9-production-0123456789abcdef0123456789abcdef"
+$userOne = "$runId-user-1"
+$userTwo = "$runId-user-2"
+$duplicate = New-ProductionEventJson -EventId "$runId-duplicate" -UserId $userOne `
+    -EventTime "2026-07-22T10:00:00Z" -RunId $runId
+$advancer = New-ProductionEventJson -EventId "$runId-advancer" -UserId $userTwo `
+    -EventTime "2026-07-22T10:00:30Z" -RunId $runId
+$missing = New-ProductionEventJson -EventId "$runId-missing" -UserId $userOne `
+    -EventTime "2026-07-22T10:00:00Z" -RunId $runId | ConvertFrom-Json
+$missing.PSObject.Properties.Remove("user_id")
+$raw = @(
+    $duplicate, $duplicate, ('{"event_id":"' + $runId + '-malformed"'),
+    ($missing | ConvertTo-Json -Compress),
+    (New-ProductionEventJson -EventId "$runId-invalid-time" -UserId $userOne `
+        -EventTime "2026-07-22 10:00:00" -RunId $runId),
+    (New-ProductionEventJson -EventId "$runId-future" -UserId $userOne `
+        -EventTime "2026-07-22T10:10:00Z" -RunId $runId),
+    $advancer
+)
+$clean = @(
+    [pscustomobject]@{ event_id = "$runId-duplicate"; user_id = $userOne },
+    [pscustomobject]@{ event_id = "$runId-advancer"; user_id = $userTwo }
+)
+$dlq = @(
+    [pscustomobject]@{ event_id = "$runId-duplicate"; reason_code = "DUPLICATE_EVENT" },
+    [pscustomobject]@{ event_id = "$runId-malformed"; reason_code = "MALFORMED_JSON" },
+    [pscustomobject]@{ event_id = "$runId-missing"; reason_code = "MISSING_REQUIRED_FIELD" },
+    [pscustomobject]@{ event_id = "$runId-invalid-time"; reason_code = "INVALID_EVENT_TIME" },
+    [pscustomobject]@{ event_id = "$runId-future"; reason_code = "FUTURE_EVENT_TIME" }
+)
+$resume = Assert-ProductionResumeMatrix -RunId $runId -RawValues $raw `
+    -CleanRecords $clean -DlqRecords $dlq -LateRecords @()
+$missingRejected = $false
+try {
+    Assert-ProductionResumeMatrix -RunId $runId -RawValues @($raw | Select-Object -Skip 1) `
+        -CleanRecords $clean -DlqRecords $dlq -LateRecords @() | Out-Null
+} catch { $missingRejected = $true }
+
+$root = Join-Path ([IO.Path]::GetTempPath()) ("chapter9-resume-send-" + [guid]::NewGuid())
+New-Item -ItemType Directory -Path $root | Out-Null
+try {
+    $source = Join-Path $root "source.failed.json"
+    [IO.File]::WriteAllText($source, '{}')
+    $paths = Initialize-ProductionResumeEvidenceRun `
+        -FinalPath (Join-Path $root "production-verification.json") `
+        -RunId $runId -DorisJobId "doris-job" -SourceFailedPath $source
+    $state = [pscustomobject]@{
+        InitialSent = $true; LateSent = $false; RunId = $runId
+        DorisJobId = "doris-job"; RunPaths = $paths; LogicalRunResumed = $true
+        SourceFailedEvidence = $source
+    }
+    $script:initialCalls = 0
+    $initialRejected = $false
+    try {
+        Invoke-ProductionSendOnce -RunState $state -Stage Initial -Action { $script:initialCalls++ }
+    } catch { $initialRejected = $true }
+    $script:lateCalls = 0
+    Invoke-ProductionSendOnce -RunState $state -Stage Late -Action { $script:lateCalls++ }
+    $sourcePreserved = Test-Path $source
+} finally {
+    Remove-Item -LiteralPath $root -Recurse -Force
+}
+[ordered]@{
+    raw = $resume.Raw
+    clean = $resume.Clean
+    dlq = $resume.Dlq
+    late = $resume.Late
+    batch_start = $resume.BatchStart.ToString("o")
+    late_time = $resume.LateEventTime.ToString("o")
+    late_id = ($resume.LateJson | ConvertFrom-Json).event_id
+    missing_rejected = $missingRejected
+    initial_rejected = $initialRejected
+    initial_calls = $script:initialCalls
+    late_calls = $script:lateCalls
+    source_preserved = $sourcePreserved
+} | ConvertTo-Json -Compress
+'''
+        result = self._run_powershell(command)
+        self.assertEqual(0, result.returncode, result.stderr or result.stdout)
+        payload = json.loads(result.stdout.strip().splitlines()[-1])
+        self.assertEqual((7, 2, 5, 0), tuple(payload[key] for key in ("raw", "clean", "dlq", "late")))
+        self.assertTrue(payload["batch_start"].startswith("2026-07-22T10:00:00"))
+        self.assertTrue(payload["late_time"].startswith("2026-07-22T09:59:30"))
+        self.assertTrue(payload["late_id"].endswith("-late"))
+        self.assertTrue(payload["missing_rejected"])
+        self.assertTrue(payload["initial_rejected"])
+        self.assertEqual(0, payload["initial_calls"])
+        self.assertEqual(1, payload["late_calls"])
+        self.assertTrue(payload["source_preserved"])
+
+    def test_production_verifier_resume_derives_trino_baseline_with_explicit_basis(self):
+        command = r'''
+$ErrorActionPreference = "Stop"
+. (Resolve-Path "scripts/verify_chapter_9_production.ps1") -FunctionsOnly
+$baseline = Get-ProductionRecoveredTrinoBaseline -CurrentEventCount 817 `
+    -CurrentDistinctEventId 67 -RunEventCount 2 -RunDistinctEventId 2
+$wrongRunRejected = $false
+try {
+    Get-ProductionRecoveredTrinoBaseline -CurrentEventCount 817 `
+        -CurrentDistinctEventId 67 -RunEventCount 1 -RunDistinctEventId 1 | Out-Null
+} catch { $wrongRunRejected = $true }
+[ordered]@{
+    event_count = $baseline.EventCount
+    distinct_event_id = $baseline.DistinctEventId
+    sample_type = $baseline.SampleType
+    basis = $baseline.Basis
+    wrong_run_rejected = $wrongRunRejected
+} | ConvertTo-Json -Compress
+'''
+        result = self._run_powershell(command)
+        self.assertEqual(0, result.returncode, result.stderr or result.stdout)
+        payload = json.loads(result.stdout.strip().splitlines()[-1])
+        self.assertEqual(815, payload["event_count"])
+        self.assertEqual(65, payload["distinct_event_id"])
+        self.assertEqual("derived_recovered", payload["sample_type"])
+        self.assertIn("current total minus exact run", payload["basis"])
+        self.assertTrue(payload["wrong_run_rejected"])

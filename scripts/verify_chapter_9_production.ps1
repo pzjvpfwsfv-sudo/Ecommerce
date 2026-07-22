@@ -1,6 +1,7 @@
 [CmdletBinding()]
 param(
     [switch]$FunctionsOnly,
+    [string]$ResumeRunId,
     [int]$TimeoutSeconds = 180
 )
 
@@ -598,6 +599,104 @@ function Assert-ProductionOutputMatrix {
     }
 }
 
+function Assert-ProductionResumeMatrix {
+    param(
+        [Parameter(Mandatory = $true)][string]$RunId,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$RawValues,
+        [Parameter(Mandatory = $true)][object[]]$CleanRecords,
+        [Parameter(Mandatory = $true)][object[]]$DlqRecords,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$LateRecords
+    )
+
+    if ($RawValues.Count -ne 7 -or $CleanRecords.Count -ne 2 -or
+        $DlqRecords.Count -ne 5 -or $LateRecords.Count -ne 0) {
+        throw "Resume counts must be exactly raw=7 clean=2 dlq=5 late=0."
+    }
+    $expectedRawIds = [ordered]@{
+        "$RunId-duplicate" = 2
+        "$RunId-malformed" = 1
+        "$RunId-missing" = 1
+        "$RunId-invalid-time" = 1
+        "$RunId-future" = 1
+        "$RunId-advancer" = 1
+    }
+    $rawById = @{}
+    foreach ($value in $RawValues) {
+        if ([string]$value -notmatch '"event_id"\s*:\s*"([^"]+)"') {
+            throw "Resume raw record has no auditable event_id."
+        }
+        $id = $Matches[1]
+        if (-not $expectedRawIds.Contains($id)) {
+            throw "Resume raw record has an unexpected event_id: $id."
+        }
+        if (-not $rawById.ContainsKey($id)) { $rawById[$id] = @() }
+        $rawById[$id] = @($rawById[$id]) + [string]$value
+    }
+    foreach ($entry in $expectedRawIds.GetEnumerator()) {
+        if (@($rawById[$entry.Key]).Count -ne [int]$entry.Value) {
+            throw "Resume raw event cardinality mismatch for $($entry.Key)."
+        }
+    }
+    $duplicateValues = @($rawById["$RunId-duplicate"])
+    if ($duplicateValues[0] -cne $duplicateValues[1]) {
+        throw "Resume duplicate raw payloads must be byte-identical."
+    }
+    try {
+        $duplicateEvent = $duplicateValues[0] | ConvertFrom-Json
+        $advancerEvent = @($rawById["$RunId-advancer"])[0] | ConvertFrom-Json
+        $batchStart = [DateTimeOffset]::Parse([string]$duplicateEvent.event_time)
+        $advancerTime = [DateTimeOffset]::Parse([string]$advancerEvent.event_time)
+    } catch {
+        throw "Resume could not parse duplicate/advancer event_time."
+    }
+    if ([string]$duplicateEvent.user_id -eq "" -or [string]$advancerEvent.user_id -eq "" -or
+        [string]$duplicateEvent.user_id -eq [string]$advancerEvent.user_id -or
+        ($advancerTime - $batchStart).TotalSeconds -ne 30) {
+        throw "Resume duplicate/advancer events do not match the original matrix."
+    }
+    $lateEventTime = $advancerTime.AddSeconds(-60)
+    $lateJson = New-ProductionEventJson -EventId "$RunId-late" `
+        -UserId ([string]$duplicateEvent.user_id) -EventTime $lateEventTime.ToString("o") `
+        -RunId $RunId
+    $syntheticLate = $lateJson | ConvertFrom-Json
+    Assert-ProductionOutputMatrix -RunId $RunId -RawValues @($RawValues + $lateJson) `
+        -CleanRecords $CleanRecords -DlqRecords $DlqRecords `
+        -LateRecords @($syntheticLate) | Out-Null
+    return [pscustomobject]@{
+        Raw = 7
+        Clean = 2
+        Dlq = 5
+        Late = 0
+        BatchStart = $batchStart
+        BatchStartBasis = "duplicate_raw_event_time_upper_bound"
+        AdvancerEventTime = $advancerTime
+        LateEventTime = $lateEventTime
+        LateEventTimeBasis = "advancer_raw_event_time_minus_60_seconds"
+        LateJson = $lateJson
+    }
+}
+
+function Get-ProductionResumeTopicState {
+    param(
+        [Parameter(Mandatory = $true)][string]$RunId,
+        [string]$KafkaContainer = "ecom-kafka"
+    )
+
+    $rawValues = @(Read-ProductionCommittedTopic -Topic "user_behavior_events" `
+        -KafkaContainer $KafkaContainer | Where-Object { $_ -like "*$RunId*" })
+    $cleanRecords = @(Read-ProductionCommittedTopic -Topic "user_behavior_clean" `
+        -KafkaContainer $KafkaContainer | Where-Object { $_ -like "*$RunId*" } |
+        ForEach-Object { $_ | ConvertFrom-Json })
+    $dlqRecords = @(Read-ProductionCommittedTopic -Topic "user_behavior_dlq" `
+        -KafkaContainer $KafkaContainer | Where-Object { $_ -like "*$RunId*" } |
+        ForEach-Object { $_ | ConvertFrom-Json })
+    $lateRecords = @(Read-ProductionCommittedTopic -Topic "user_behavior_late" `
+        -KafkaContainer $KafkaContainer | Where-Object { $_ -like "*$RunId*" } |
+        ForEach-Object { $_ | ConvertFrom-Json })
+    return Assert-ProductionResumeMatrix -RunId $RunId -RawValues $rawValues `
+        -CleanRecords $cleanRecords -DlqRecords $dlqRecords -LateRecords $lateRecords
+}
+
 function Wait-ProductionOutputMatrix {
     param(
         [Parameter(Mandatory = $true)][string]$RunId,
@@ -753,6 +852,30 @@ FROM lakehouse.analytics.user_behavior_detail
     return [pscustomobject]@{
         EventCount = [int64]$row[0]
         DistinctEventId = [int64]$row[1]
+    }
+}
+
+function Get-ProductionRecoveredTrinoBaseline {
+    param(
+        [Parameter(Mandatory = $true)][int64]$CurrentEventCount,
+        [Parameter(Mandatory = $true)][int64]$CurrentDistinctEventId,
+        [Parameter(Mandatory = $true)][int64]$RunEventCount,
+        [Parameter(Mandatory = $true)][int64]$RunDistinctEventId
+    )
+
+    if ($RunEventCount -ne 2 -or $RunDistinctEventId -ne 2 -or
+        $CurrentEventCount -lt 2 -or $CurrentDistinctEventId -lt 2) {
+        throw "Recovered Trino baseline requires an exact existing run count of 2/2."
+    }
+    return [pscustomobject]@{
+        EventCount = $CurrentEventCount - $RunEventCount
+        DistinctEventId = $CurrentDistinctEventId - $RunDistinctEventId
+        SampleType = "derived_recovered"
+        Basis = "current total minus exact run 2 rows and 2 distinct event IDs"
+        CurrentEventCount = $CurrentEventCount
+        CurrentDistinctEventId = $CurrentDistinctEventId
+        SubtractedRunEventCount = $RunEventCount
+        SubtractedRunDistinctEventId = $RunDistinctEventId
     }
 }
 
@@ -997,10 +1120,99 @@ function Initialize-ProductionEvidenceRun {
     return $paths
 }
 
+function Assert-ProductionResumeAllowed {
+    param(
+        [Parameter(Mandatory = $true)][string]$Directory,
+        [Parameter(Mandatory = $true)][string]$FinalPath,
+        [Parameter(Mandatory = $true)][string]$RunId,
+        [Parameter(Mandatory = $true)][string]$DorisJobId
+    )
+
+    if ($RunId -notmatch '^chapter9-production-[0-9a-f]{32}$') {
+        throw "Resume run ID is invalid."
+    }
+    if (Test-Path -LiteralPath $FinalPath -PathType Leaf) {
+        throw "Resume is forbidden while fixed success evidence exists."
+    }
+    $inProgress = @(Get-ChildItem -LiteralPath $Directory `
+        -Filter "production-verification.$RunId*.in-progress.json" -File `
+        -ErrorAction SilentlyContinue)
+    if ($inProgress.Count -ne 0) {
+        throw "Resume run already has an in-progress attempt."
+    }
+    $failedPaths = @(Get-ChildItem -LiteralPath $Directory `
+        -Filter "production-verification.$RunId*.failed.json" -File `
+        -ErrorAction SilentlyContinue)
+    if ($failedPaths.Count -ne 1) {
+        throw "Resume requires exactly one matching failed evidence file."
+    }
+    try {
+        $failed = Get-Content -Raw -LiteralPath $failedPaths[0].FullName | ConvertFrom-Json
+    } catch {
+        throw "Resume failed evidence is unreadable."
+    }
+    if ([string]$failed.status -ne "failed" -or [string]$failed.run_id -ne $RunId -or
+        $failed.events_sent -ne $true -or [string]$failed.doris_job_id -ne $DorisJobId) {
+        throw "Resume failed evidence status/run/events/Doris identity mismatch."
+    }
+    foreach ($path in @(Get-ChildItem -LiteralPath $Directory `
+        -Filter "production-verification*.json" -File -ErrorAction SilentlyContinue)) {
+        try { $record = Get-Content -Raw -LiteralPath $path.FullName | ConvertFrom-Json } catch { continue }
+        if ([string]$record.run_id -eq $RunId -and [string]$record.status -eq "success") {
+            throw "Resume is forbidden for a successful logical run."
+        }
+    }
+    return [pscustomobject]@{
+        SourceFailedPath = $failedPaths[0].FullName
+        SourceFailedEvidence = $failed
+    }
+}
+
+function Initialize-ProductionResumeEvidenceRun {
+    param(
+        [Parameter(Mandatory = $true)][string]$FinalPath,
+        [Parameter(Mandatory = $true)][string]$RunId,
+        [Parameter(Mandatory = $true)][string]$DorisJobId,
+        [Parameter(Mandatory = $true)][string]$SourceFailedPath
+    )
+
+    if (Test-Path -LiteralPath $FinalPath) {
+        throw "Resume cannot initialize while fixed success evidence exists."
+    }
+    if (-not (Test-Path -LiteralPath $SourceFailedPath -PathType Leaf)) {
+        throw "Resume source failed evidence is missing."
+    }
+    $directory = Split-Path -Parent $FinalPath
+    $attemptId = [Guid]::NewGuid().ToString("N")
+    $prefix = Join-Path $directory "production-verification.$RunId.resume-$attemptId"
+    $paths = [pscustomobject]@{
+        FinalPath = $FinalPath
+        ArchivedPath = $null
+        PartialPath = "$prefix.partial"
+        InProgressPath = "$prefix.in-progress.json"
+        FailedPath = "$prefix.failed.json"
+        StatePartialPath = "$prefix.state.partial"
+        SourceFailedPath = $SourceFailedPath
+        ResumeAttemptId = $attemptId
+    }
+    Write-ProductionJsonAtomic -Value ([ordered]@{
+        status = "resume_in_progress"
+        run_id = $RunId
+        logical_run_resumed = $true
+        source_failed_evidence = $SourceFailedPath
+        doris_job_id = $DorisJobId
+        events_sent = $true
+        initial_sent = $true
+        late_sent = $false
+        started_at_utc = [DateTimeOffset]::UtcNow.ToString("o")
+    }) -Path $paths.InProgressPath -PartialPath $paths.StatePartialPath
+    return $paths
+}
+
 function Write-ProductionInProgressState {
     param([Parameter(Mandatory = $true)][object]$RunState)
 
-    Write-ProductionJsonAtomic -Value ([ordered]@{
+    $state = [ordered]@{
         status = "in_progress"
         run_id = [string]$RunState.RunId
         doris_job_id = [string]$RunState.DorisJobId
@@ -1008,7 +1220,13 @@ function Write-ProductionInProgressState {
         initial_sent = [bool]$RunState.InitialSent
         late_sent = [bool]$RunState.LateSent
         updated_at_utc = [DateTimeOffset]::UtcNow.ToString("o")
-    }) -Path $RunState.RunPaths.InProgressPath `
+    }
+    if ([bool]$RunState.LogicalRunResumed) {
+        $state.status = "resume_in_progress"
+        $state.logical_run_resumed = $true
+        $state.source_failed_evidence = [string]$RunState.SourceFailedEvidence
+    }
+    Write-ProductionJsonAtomic -Value $state -Path $RunState.RunPaths.InProgressPath `
         -PartialPath $RunState.RunPaths.StatePartialPath
 }
 
@@ -1086,17 +1304,27 @@ $evidencePath = Join-Path $repoRoot "tmp/chapter-9/production-verification.json"
 $evidenceDirectory = Split-Path -Parent $evidencePath
 $lockPath = Join-Path $evidenceDirectory "production-verification.lock"
 $rawTopic = "user_behavior_events"
-$runId = "chapter9-production-" + [Guid]::NewGuid().ToString("N")
+$logicalRunResumed = -not [string]::IsNullOrWhiteSpace($ResumeRunId)
+$runId = if ($logicalRunResumed) {
+    $ResumeRunId
+} else {
+    "chapter9-production-" + [Guid]::NewGuid().ToString("N")
+}
 $runState = [pscustomobject]@{
-    InitialSent = $false
+    InitialSent = $logicalRunResumed
     LateSent = $false
     RunId = $runId
     DorisJobId = $null
     RunPaths = $null
+    LogicalRunResumed = $logicalRunResumed
+    SourceFailedEvidence = $null
 }
 $runPaths = $null
 $runLock = $null
 $manifest = $null
+$resumeAuthorization = $null
+$resumeState = $null
+$resumeTrinoPre = $null
 
 Push-Location $repoRoot
 try {
@@ -1105,10 +1333,20 @@ try {
         throw "Cutover manifest is missing: $manifestPath"
     }
     $manifest = Get-Content -Raw -LiteralPath $manifestPath | ConvertFrom-Json
-    Assert-ProductionRunAllowed -Directory $evidenceDirectory `
-        -DorisJobId ([string]$manifest.doris_job_id)
-    $runPaths = Initialize-ProductionEvidenceRun -FinalPath $evidencePath -RunId $runId `
-        -DorisJobId ([string]$manifest.doris_job_id)
+    if ($logicalRunResumed) {
+        $resumeAuthorization = Assert-ProductionResumeAllowed -Directory $evidenceDirectory `
+            -FinalPath $evidencePath -RunId $runId `
+            -DorisJobId ([string]$manifest.doris_job_id)
+        $runPaths = Initialize-ProductionResumeEvidenceRun -FinalPath $evidencePath `
+            -RunId $runId -DorisJobId ([string]$manifest.doris_job_id) `
+            -SourceFailedPath $resumeAuthorization.SourceFailedPath
+        $runState.SourceFailedEvidence = $resumeAuthorization.SourceFailedPath
+    } else {
+        Assert-ProductionRunAllowed -Directory $evidenceDirectory `
+            -DorisJobId ([string]$manifest.doris_job_id)
+        $runPaths = Initialize-ProductionEvidenceRun -FinalPath $evidencePath -RunId $runId `
+            -DorisJobId ([string]$manifest.doris_job_id)
+    }
     $runState.DorisJobId = [string]$manifest.doris_job_id
     $runState.RunPaths = $runPaths
     $initialFlink = Wait-ProductionJobsAndCapacity -Manifest $manifest -TimeoutSeconds $TimeoutSeconds
@@ -1119,9 +1357,6 @@ try {
             -JobId $expected.Id -ExpectedName $expected.Name
     }
     $dorisBaseline = Get-ProductionDorisMetrics
-    $trinoBaseline = Get-ProductionTrinoBaseline
-    $batchStart = [DateTimeOffset]::UtcNow
-
     $eventIds = [ordered]@{
         duplicate = "$runId-duplicate"
         malformed = "$runId-malformed"
@@ -1131,35 +1366,68 @@ try {
         advancer = "$runId-advancer"
         late = "$runId-late"
     }
-    $now = [DateTimeOffset]::UtcNow
-    $userOne = "$runId-user-1"
-    $userTwo = "$runId-user-2"
-    $duplicate = New-ProductionEventJson -EventId $eventIds.duplicate -UserId $userOne `
-        -EventTime $now.ToString("o") -RunId $runId
-    $advancer = New-ProductionEventJson -EventId $eventIds.advancer -UserId $userTwo `
-        -EventTime $now.AddSeconds(30).ToString("o") -RunId $runId
-    $missing = New-ProductionEventJson -EventId $eventIds.missing_required -UserId $userOne `
-        -EventTime $now.ToString("o") -RunId $runId | ConvertFrom-Json
-    $missing.PSObject.Properties.Remove("user_id")
-    $missingJson = $missing | ConvertTo-Json -Compress
-    $invalidTime = New-ProductionEventJson -EventId $eventIds.invalid_time -UserId $userOne `
-        -EventTime "2026-07-22 10:00:00" -RunId $runId
-    $future = New-ProductionEventJson -EventId $eventIds.future -UserId $userOne `
-        -EventTime $now.AddMinutes(10).ToString("o") -RunId $runId
-    $malformed = '{"event_id":"' + $eventIds.malformed + '"'
-    $lateEventTime = $now.AddSeconds(-30)
-    $late = New-ProductionEventJson -EventId $eventIds.late -UserId $userOne `
-        -EventTime $lateEventTime.ToString("o") -RunId $runId
-
-    Write-Host "[chapter9-production-verify] sending unique run $runId"
-    Invoke-ProductionSendOnce -RunState $runState -Stage Initial -Action {
-        Send-ProductionKafkaValue -Topic $rawTopic -Value $duplicate
-        Send-ProductionKafkaValue -Topic $rawTopic -Value $duplicate
-        Send-ProductionKafkaValue -Topic $rawTopic -Value $malformed
-        Send-ProductionKafkaValue -Topic $rawTopic -Value $missingJson
-        Send-ProductionKafkaValue -Topic $rawTopic -Value $invalidTime
-        Send-ProductionKafkaValue -Topic $rawTopic -Value $future
-        Send-ProductionKafkaValue -Topic $rawTopic -Value $advancer
+    if ($logicalRunResumed) {
+        $resumeState = Get-ProductionResumeTopicState -RunId $runId
+        $batchStart = $resumeState.BatchStart
+        $lateEventTime = $resumeState.LateEventTime
+        $late = $resumeState.LateJson
+        $failedAt = [DateTimeOffset]::Parse(
+            [string]$resumeAuthorization.SourceFailedEvidence.failed_at_utc
+        )
+        if ($failedAt -le $batchStart) {
+            throw "Resume failed evidence timestamp does not follow reconstructed batch start."
+        }
+        $trinoCurrent = Get-ProductionTrinoBaseline
+        $resumeTrinoPre = Get-ProductionTrinoRunEvidence `
+            -CleanEventIds @($eventIds.duplicate, $eventIds.advancer) `
+            -ExcludedEventIds @(
+                $eventIds.malformed, $eventIds.missing_required, $eventIds.invalid_time,
+                $eventIds.future, $eventIds.late
+            ) -DuplicateEventId $eventIds.duplicate
+        if ($resumeTrinoPre.EventCount -ne 2 -or $resumeTrinoPre.DistinctEventId -ne 2 -or
+            $resumeTrinoPre.DistinctUserId -ne 2 -or
+            $resumeTrinoPre.ExcludedEventCount -ne 0 -or
+            $resumeTrinoPre.DuplicateEventCount -ne 1) {
+            throw "Resume Trino preflight does not prove the exact existing two clean rows."
+        }
+        $trinoBaseline = Get-ProductionRecoveredTrinoBaseline `
+            -CurrentEventCount $trinoCurrent.EventCount `
+            -CurrentDistinctEventId $trinoCurrent.DistinctEventId `
+            -RunEventCount $resumeTrinoPre.EventCount `
+            -RunDistinctEventId $resumeTrinoPre.DistinctEventId
+        Write-Host "[chapter9-production-verify] resuming logical run $runId; sending late only"
+    } else {
+        $trinoBaseline = Get-ProductionTrinoBaseline
+        $batchStart = [DateTimeOffset]::UtcNow
+        $now = [DateTimeOffset]::UtcNow
+        $userOne = "$runId-user-1"
+        $userTwo = "$runId-user-2"
+        $duplicate = New-ProductionEventJson -EventId $eventIds.duplicate -UserId $userOne `
+            -EventTime $now.ToString("o") -RunId $runId
+        $advancer = New-ProductionEventJson -EventId $eventIds.advancer -UserId $userTwo `
+            -EventTime $now.AddSeconds(30).ToString("o") -RunId $runId
+        $missing = New-ProductionEventJson -EventId $eventIds.missing_required -UserId $userOne `
+            -EventTime $now.ToString("o") -RunId $runId | ConvertFrom-Json
+        $missing.PSObject.Properties.Remove("user_id")
+        $missingJson = $missing | ConvertTo-Json -Compress
+        $invalidTime = New-ProductionEventJson -EventId $eventIds.invalid_time -UserId $userOne `
+            -EventTime "2026-07-22 10:00:00" -RunId $runId
+        $future = New-ProductionEventJson -EventId $eventIds.future -UserId $userOne `
+            -EventTime $now.AddMinutes(10).ToString("o") -RunId $runId
+        $malformed = '{"event_id":"' + $eventIds.malformed + '"'
+        $lateEventTime = $now.AddSeconds(-30)
+        $late = New-ProductionEventJson -EventId $eventIds.late -UserId $userOne `
+            -EventTime $lateEventTime.ToString("o") -RunId $runId
+        Write-Host "[chapter9-production-verify] sending unique run $runId"
+        Invoke-ProductionSendOnce -RunState $runState -Stage Initial -Action {
+            Send-ProductionKafkaValue -Topic $rawTopic -Value $duplicate
+            Send-ProductionKafkaValue -Topic $rawTopic -Value $duplicate
+            Send-ProductionKafkaValue -Topic $rawTopic -Value $malformed
+            Send-ProductionKafkaValue -Topic $rawTopic -Value $missingJson
+            Send-ProductionKafkaValue -Topic $rawTopic -Value $invalidTime
+            Send-ProductionKafkaValue -Topic $rawTopic -Value $future
+            Send-ProductionKafkaValue -Topic $rawTopic -Value $advancer
+        }
     }
 
     $productionJob = @($expectedJobs | Where-Object { $_.Key -eq "production" })[0]
@@ -1260,6 +1528,10 @@ try {
     $evidence = [ordered]@{
         status = "success"
         run_id = $runId
+        logical_run_resumed = $logicalRunResumed
+        source_failed_evidence = if ($logicalRunResumed) {
+            [string]$resumeAuthorization.SourceFailedPath
+        } else { $null }
         doris_job_id = [string]$manifest.doris_job_id
         events_sent = $true
         cutover_id = [string]$manifest.cutover_id
@@ -1274,6 +1546,30 @@ try {
             duplicate_clean = $output.Matrix.DuplicateClean
         }
         dlq_reason_counts = $output.Matrix.ReasonCounts
+        resume = if ($logicalRunResumed) {
+            [ordered]@{
+                source_failed_status = [string]$resumeAuthorization.SourceFailedEvidence.status
+                source_failed_events_sent = [bool]$resumeAuthorization.SourceFailedEvidence.events_sent
+                pre_resume_counts = [ordered]@{
+                    raw = $resumeState.Raw
+                    clean = $resumeState.Clean
+                    dlq = $resumeState.Dlq
+                    late = $resumeState.Late
+                }
+                send_action = "late_only"
+                initial_events_resent = $false
+                reconstructed_fields = [ordered]@{
+                    batch_start_utc = $batchStart.ToString("o")
+                    batch_start_basis = $resumeState.BatchStartBasis
+                    advancer_event_time = $resumeState.AdvancerEventTime.ToString("o")
+                    late_event_time = $lateEventTime.ToString("o")
+                    late_event_time_basis = $resumeState.LateEventTimeBasis
+                    trino_baseline_sample_type = $trinoBaseline.SampleType
+                    trino_baseline_basis = $trinoBaseline.Basis
+                }
+                trino_preexisting_exact = $resumeTrinoPre
+            }
+        } else { $null }
         flink = [ordered]@{
             overview = [ordered]@{
                 taskmanagers = [int]$finalFlink.Overview.taskmanagers
