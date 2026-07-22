@@ -1,0 +1,4 @@
+/workspace/jobs/datastream-quality/src/main/java/com/ecommerce/quality/model/LateEvent.java
+/workspace/jobs/datastream-quality/src/main/java/com/ecommerce/quality/model/RejectedEvent.java
+/workspace/jobs/datastream-quality/src/main/java/com/ecommerce/quality/model/UserBehaviorEvent.java
+/workspace/jobs/datastream-quality/src/main/java/com/ecommerce/quality/model/ValidationResult.java
