@@ -695,9 +695,21 @@ try {
             "chapter9-iceberg-clean-v1",
             "isolation.level=read_committed",
             "--timeout-ms 5000",
-            "production-verification.json.partial",
+            "kafka-dump-log",
+            "route-late-events",
+            "currentInputWatermark",
+            "StatePartialPath",
+            "AS duplicate_event_count",
+            'assertion = "measured_sql"',
         ):
             self.assertIn(marker, text)
+        watermark_gate = text.index("$watermarkEvidence = Wait-ProductionWatermarkPast")
+        late_send = text.index("Invoke-ProductionSendOnce -RunState $runState -Stage Late")
+        post_late_checkpoint = text.index(
+            "$productionFinalCheckpoint = Wait-NewProductionCheckpoint"
+        )
+        self.assertLess(watermark_gate, late_send)
+        self.assertLess(late_send, post_late_checkpoint)
         self.assertNotIn("force-recreate", text)
         self.assertNotIn("docker compose down", text)
 
@@ -813,8 +825,12 @@ $api = [pscustomobject]@{
     analyzer = "rule_based"
     warnings = @()
     evidence = [pscustomobject]@{
-        realtime = [pscustomobject]@{ pv = 2; uv = 2 }
-        historical = [pscustomobject]@{ event_count = 815 }
+        realtime = [pscustomobject]@{
+            pv = 2; uv = 2; updated_at = "2026-07-22T10:00:01Z"
+        }
+        historical = [pscustomobject]@{
+            event_count = 815; latest_event_time = "2026-07-22T09:59:00Z"
+        }
     }
 }
 $validatedApi = Assert-ProductionApiEvidence -Response $api -BatchStart $batchStart -TrinoBaseline 813
@@ -836,3 +852,301 @@ try {
         self.assertEqual(3, payload["job_count"])
         self.assertEqual("rule_based", payload["analyzer"])
         self.assertTrue(payload["old_response_rejected"])
+
+    def test_production_verifier_classifies_control_only_lag_and_rejects_data(self):
+        command = r'''
+$ErrorActionPreference = "Stop"
+. (Resolve-Path "scripts/verify_chapter_9_production.ps1") -FunctionsOnly
+$description = [pscustomobject]@{
+    Group = "chapter9-doris-clean-v1"
+    Topic = "user_behavior_clean"
+    TotalLag = 1
+    Rows = @([pscustomobject]@{
+        Group = "chapter9-doris-clean-v1"
+        Topic = "user_behavior_clean"
+        Partition = 0
+        CurrentOffset = 3
+        LogEndOffset = 4
+        Lag = 1
+    })
+}
+$controlDump = @(
+    "baseOffset: 3 lastOffset: 3 count: 1 isTransactional: true isControl: true",
+    "| offset: 3 endTxnMarker: COMMIT coordinatorEpoch: 0"
+)
+$control = ConvertFrom-ProductionKafkaDumpLog -Lines $controlDump `
+    -Partition 0 -StartOffset 3 -EndOffsetExclusive 4
+$accepted = Assert-StableProductionKafkaLag -Before $description -After $description `
+    -Classifications $control
+$dataRejected = $false
+try {
+    $data = ConvertFrom-ProductionKafkaDumpLog `
+        -Lines @("baseOffset: 3 lastOffset: 3 count: 1 isTransactional: true isControl: false") `
+        -Partition 0 -StartOffset 3 -EndOffsetExclusive 4
+    Assert-StableProductionKafkaLag -Before $description -After $description `
+        -Classifications $data | Out-Null
+} catch { $dataRejected = $_.Exception.Message -match "readable data" }
+[ordered]@{
+    cli_lag = $accepted.CliLag
+    readable_lag = $accepted.ReadableDataLag
+    offset = $accepted.Classifications[0].Offset
+    kind = $accepted.Classifications[0].Kind
+    marker = $accepted.Classifications[0].ControlType
+    data_rejected = $dataRejected
+} | ConvertTo-Json -Compress
+'''
+        result = self._run_powershell(command)
+        self.assertEqual(0, result.returncode, result.stderr or result.stdout)
+        payload = json.loads(result.stdout.strip().splitlines()[-1])
+        self.assertEqual(1, payload["cli_lag"])
+        self.assertEqual(0, payload["readable_lag"])
+        self.assertEqual(3, payload["offset"])
+        self.assertEqual("transaction_control", payload["kind"])
+        self.assertEqual("COMMIT", payload["marker"])
+        self.assertTrue(payload["data_rejected"])
+
+    def test_production_verifier_requires_stable_complete_lag_classification(self):
+        command = r'''
+$ErrorActionPreference = "Stop"
+. (Resolve-Path "scripts/verify_chapter_9_production.ps1") -FunctionsOnly
+function New-Description([long]$End) {
+    [pscustomobject]@{
+        Group = "g"; Topic = "t"; TotalLag = $End - 3
+        Rows = @([pscustomobject]@{
+            Group = "g"; Topic = "t"; Partition = 0
+            CurrentOffset = 3; LogEndOffset = $End; Lag = $End - 3
+        })
+    }
+}
+$classification = @([pscustomobject]@{
+    Partition = 0; Offset = 3; Kind = "transaction_control"; ControlType = "COMMIT"
+})
+$unstableRejected = $false
+try {
+    Assert-StableProductionKafkaLag -Before (New-Description 4) -After (New-Description 5) `
+        -Classifications $classification | Out-Null
+} catch { $unstableRejected = $_.Exception.Message -match "changed during classification" }
+$missingRejected = $false
+try {
+    Assert-StableProductionKafkaLag -Before (New-Description 5) -After (New-Description 5) `
+        -Classifications $classification | Out-Null
+} catch { $missingRejected = $_.Exception.Message -match "every lagged offset" }
+$badArithmetic = New-Description 4
+$badArithmetic.Rows[0].Lag = 0
+$badArithmeticRejected = $false
+try {
+    Assert-StableProductionKafkaLag -Before $badArithmetic -After $badArithmetic `
+        -Classifications $classification | Out-Null
+} catch { $badArithmeticRejected = $_.Exception.Message -match "offset arithmetic" }
+[ordered]@{
+    unstable_rejected = $unstableRejected
+    missing_rejected = $missingRejected
+    bad_arithmetic_rejected = $badArithmeticRejected
+} |
+    ConvertTo-Json -Compress
+'''
+        result = self._run_powershell(command)
+        self.assertEqual(0, result.returncode, result.stderr or result.stdout)
+        payload = json.loads(result.stdout.strip().splitlines()[-1])
+        self.assertTrue(payload["unstable_rejected"])
+        self.assertTrue(payload["missing_rejected"])
+        self.assertTrue(payload["bad_arithmetic_rejected"])
+
+    def test_production_verifier_waits_for_late_operator_watermark_strictly_past_event(self):
+        command = r'''
+$ErrorActionPreference = "Stop"
+. (Resolve-Path "scripts/verify_chapter_9_production.ps1") -FunctionsOnly
+$script:valueCalls = 0
+function Invoke-RestMethod {
+    param([string]$Uri, [int]$TimeoutSec)
+    if ($Uri -match "/metrics\?get=") {
+        $script:valueCalls++
+        $value = if ($script:valueCalls -eq 1) { "100" } else { "101" }
+        return @([pscustomobject]@{
+            id = "0.route-late-events.currentInputWatermark"
+            value = $value
+        })
+    }
+    if ($Uri -match "/vertices/.+/metrics$") {
+        return @([pscustomobject]@{ id = "0.route-late-events.currentInputWatermark" })
+    }
+    return [pscustomobject]@{
+        jid = "0123456789abcdef0123456789abcdef"
+        name = "chapter-9-datastream-quality-production"
+        state = "RUNNING"
+        vertices = @([pscustomobject]@{
+            id = "vertex-1"
+            name = "source -> route-late-events -> late-sink"
+        })
+    }
+}
+$result = Wait-ProductionWatermarkPast `
+    -JobId "0123456789abcdef0123456789abcdef" `
+    -ExpectedName "chapter-9-datastream-quality-production" `
+    -ThresholdEpochMs 100 -Attempts 2 -SleepSeconds 0
+[ordered]@{
+    calls = $script:valueCalls
+    watermark = $result.Watermark
+    metric = $result.MetricId
+} | ConvertTo-Json -Compress
+'''
+        result = self._run_powershell(command)
+        self.assertEqual(0, result.returncode, result.stderr or result.stdout)
+        payload = json.loads(result.stdout.strip().splitlines()[-1])
+        self.assertEqual(2, payload["calls"])
+        self.assertEqual(101, payload["watermark"])
+        self.assertEqual("0.route-late-events.currentInputWatermark", payload["metric"])
+
+    def test_production_verifier_requires_doris_and_api_strict_freshness(self):
+        command = r'''
+$ErrorActionPreference = "Stop"
+. (Resolve-Path "scripts/verify_chapter_9_production.ps1") -FunctionsOnly
+$batchStart = [DateTimeOffset]::Parse("2026-07-22T10:00:00Z")
+$freshTime = [DateTimeOffset]::Parse("2026-07-22T10:00:01Z")
+$freshDoris = Assert-ProductionDorisFreshness -Metrics ([pscustomobject]@{
+    Pv = 2; Uv = 2; PvUpdatedAt = $freshTime; UvUpdatedAt = $freshTime
+}) -BatchStart $batchStart
+$staleDorisRejected = $false
+try {
+    Assert-ProductionDorisFreshness -Metrics ([pscustomobject]@{
+        Pv = 2; Uv = 2; PvUpdatedAt = $batchStart; UvUpdatedAt = $batchStart
+    }) -BatchStart $batchStart | Out-Null
+} catch { $staleDorisRejected = $true }
+$apiResponse = [pscustomobject]@{
+    generated_at = "2026-07-22T10:00:01Z"; analyzer = "rule_based"; warnings = @()
+    evidence = [pscustomobject]@{
+        realtime = [pscustomobject]@{ pv = 2; uv = 2; updated_at = "2026-07-22T10:00:01Z" }
+        historical = [pscustomobject]@{ event_count = 815; latest_event_time = "2026-07-22T09:59:00Z" }
+    }
+}
+$freshApi = Assert-ProductionApiEvidence -Response $apiResponse `
+    -BatchStart $batchStart -TrinoBaseline 813
+$equalGeneratedRejected = $false
+try {
+    $apiResponse.generated_at = "2026-07-22T10:00:00Z"
+    Assert-ProductionApiEvidence -Response $apiResponse `
+        -BatchStart $batchStart -TrinoBaseline 813 | Out-Null
+} catch { $equalGeneratedRejected = $true }
+$apiResponse.generated_at = "2026-07-22T10:00:01Z"
+$staleApiRejected = $false
+try {
+    $apiResponse.evidence.realtime.updated_at = "2026-07-22T10:00:00Z"
+    Assert-ProductionApiEvidence -Response $apiResponse `
+        -BatchStart $batchStart -TrinoBaseline 813 | Out-Null
+} catch { $staleApiRejected = $true }
+[ordered]@{
+    doris_pv = $freshDoris.Pv
+    stale_doris_rejected = $staleDorisRejected
+    realtime_updated_at = $freshApi.RealtimeUpdatedAt.ToString("o")
+    historical_latest_event_time = $freshApi.HistoricalLatestEventTime.ToString("o")
+    equal_generated_rejected = $equalGeneratedRejected
+    stale_api_rejected = $staleApiRejected
+} | ConvertTo-Json -Compress
+'''
+        result = self._run_powershell(command)
+        self.assertEqual(0, result.returncode, result.stderr or result.stdout)
+        payload = json.loads(result.stdout.strip().splitlines()[-1])
+        self.assertEqual(2, payload["doris_pv"])
+        self.assertTrue(payload["stale_doris_rejected"])
+        self.assertTrue(payload["realtime_updated_at"].startswith("2026-07-22T10:00:01"))
+        self.assertTrue(payload["historical_latest_event_time"].startswith("2026-07-22T09:59:00"))
+        self.assertTrue(payload["equal_generated_rejected"])
+        self.assertTrue(payload["stale_api_rejected"])
+
+    def test_production_verifier_run_lock_and_evidence_lifecycle_are_safe(self):
+        command = r'''
+$ErrorActionPreference = "Stop"
+. (Resolve-Path "scripts/verify_chapter_9_production.ps1") -FunctionsOnly
+$tempRoot = Join-Path ([IO.Path]::GetTempPath()) ("chapter9-run-" + [guid]::NewGuid())
+New-Item -ItemType Directory -Path $tempRoot | Out-Null
+try {
+    $lockPath = Join-Path $tempRoot "production-verification.lock"
+    $firstLock = Enter-ProductionRunLock -Path $lockPath
+    $concurrentRejected = $false
+    try { Enter-ProductionRunLock -Path $lockPath | Out-Null } catch { $concurrentRejected = $true }
+    $firstLock.Dispose()
+
+    $finalPath = Join-Path $tempRoot "production-verification.json"
+    [IO.File]::WriteAllText($finalPath, '{"status":"success","run_id":"old-run"}')
+    $run = Initialize-ProductionEvidenceRun -FinalPath $finalPath -RunId "new-run" `
+        -DorisJobId "doris-job"
+    $oldArchived = Test-Path $run.ArchivedPath
+    $fixedRemoved = -not (Test-Path $finalPath)
+    $inProgress = Get-Content -Raw $run.InProgressPath | ConvertFrom-Json
+    Write-ProductionRunFailure -RunPaths $run -RunId "new-run" `
+        -ErrorMessage "simulated" -EventsSent $true -DorisJobId "doris-job"
+    $failed = Get-Content -Raw $run.FailedPath | ConvertFrom-Json
+    $repeatJobRejected = $false
+    try {
+        Assert-ProductionRunAllowed -Directory $tempRoot -DorisJobId "doris-job"
+    } catch { $repeatJobRejected = $true }
+
+    $successRun = Initialize-ProductionEvidenceRun -FinalPath $finalPath -RunId "success-run" `
+        -DorisJobId "success-job"
+    Write-ProductionEvidenceAtomic -Evidence ([ordered]@{
+        status = "success"; run_id = "success-run"
+    }) -RunPaths $successRun
+    $success = Get-Content -Raw $finalPath | ConvertFrom-Json
+
+    $crashRun = Initialize-ProductionEvidenceRun -FinalPath $finalPath -RunId "crash-run" `
+        -DorisJobId "crash-job"
+    $state = [pscustomobject]@{
+        InitialSent = $false; LateSent = $false
+        RunId = "crash-run"; DorisJobId = "crash-job"; RunPaths = $crashRun
+    }
+    $script:sendCalls = 0
+    try {
+        Invoke-ProductionSendOnce -RunState $state -Stage Initial -Action {
+            $script:sendCalls++
+            throw "simulated process interruption"
+        }
+    } catch {}
+    $interrupted = Get-Content -Raw $crashRun.InProgressPath | ConvertFrom-Json
+    $interruptedJobRejected = $false
+    try {
+        Assert-ProductionRunAllowed -Directory $tempRoot -DorisJobId "crash-job"
+    } catch { $interruptedJobRejected = $true }
+    $repeatRejected = $false
+    try {
+        Invoke-ProductionSendOnce -RunState $state -Stage Initial -Action { $script:sendCalls++ }
+    } catch { $repeatRejected = $true }
+
+    [ordered]@{
+        concurrent_rejected = $concurrentRejected
+        old_archived = $oldArchived
+        fixed_removed = $fixedRemoved
+        in_progress_run = $inProgress.run_id
+        failed_run = $failed.run_id
+        failed_sent = $failed.events_sent
+        repeat_job_rejected = $repeatJobRejected
+        partial_is_per_run = $run.PartialPath -like "*new-run*"
+        success_run = $success.run_id
+        success_partial_removed = -not (Test-Path $successRun.PartialPath)
+        success_in_progress_removed = -not (Test-Path $successRun.InProgressPath)
+        interrupted_sent = $interrupted.events_sent
+        interrupted_job_rejected = $interruptedJobRejected
+        send_calls = $script:sendCalls
+        repeat_rejected = $repeatRejected
+    } | ConvertTo-Json -Compress
+} finally {
+    Remove-Item -LiteralPath $tempRoot -Recurse -Force
+}
+'''
+        result = self._run_powershell(command)
+        self.assertEqual(0, result.returncode, result.stderr or result.stdout)
+        payload = json.loads(result.stdout.strip().splitlines()[-1])
+        self.assertTrue(payload["concurrent_rejected"])
+        self.assertTrue(payload["old_archived"])
+        self.assertTrue(payload["fixed_removed"])
+        self.assertEqual("new-run", payload["in_progress_run"])
+        self.assertEqual("new-run", payload["failed_run"])
+        self.assertTrue(payload["failed_sent"])
+        self.assertTrue(payload["repeat_job_rejected"])
+        self.assertTrue(payload["partial_is_per_run"])
+        self.assertEqual("success-run", payload["success_run"])
+        self.assertTrue(payload["success_partial_removed"])
+        self.assertTrue(payload["success_in_progress_removed"])
+        self.assertTrue(payload["interrupted_sent"])
+        self.assertTrue(payload["interrupted_job_rejected"])
+        self.assertEqual(1, payload["send_calls"])
+        self.assertTrue(payload["repeat_rejected"])
