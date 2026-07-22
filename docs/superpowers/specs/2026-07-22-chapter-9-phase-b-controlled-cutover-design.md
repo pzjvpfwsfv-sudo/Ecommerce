@@ -157,7 +157,10 @@ Phase B 提供以下独立脚本：
 - 端到端验收脚本；
 - 回滚脚本。
 
-脚本默认采用 fail-fast，并在每个破坏性边界前验证容器、作业和 Topic 身份。脚本不得自动清空 Topic、删除表、删除状态目录或强制忽略 Savepoint 不兼容。
+脚本默认采用 fail-fast，并在每个破坏性边界前验证容器、作业和 Topic 身份。切流和回滚分别使用
+阶段化 partial/progress manifest，在 mutation 前写 intent、mutation 后写结果；恢复时只允许领养唯一
+exact-name RUNNING Job，并拒绝歧义或 ID 冲突。验收脚本持久化发送前 baseline 和逐阶段证据，禁止用
+恢复时的当前值重构原始因果证据。脚本不得自动清空 Topic、删除表、删除状态目录或强制忽略 Savepoint 不兼容。
 
 ## 9. 面试表达
 

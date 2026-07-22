@@ -334,4 +334,4 @@ git commit -m "docs: close chapter 9 shadow quality phase"
 - 实际排障包括 Jackson 版本对齐、PowerShell 编码、容器状态去换行、指标延迟发现、Savepoint 权限和重启窗口调整。
 - 详细证据见 `docs/chapter-9-datastream-quality-runbook.md`。
 
-**执行边界实录：Phase A 影子与恢复已完成；随后经人工确认完成 Phase B 正式切流。最终 production、Doris clean、Iceberg clean 均保持 RUNNING，验收逻辑 run `ab626...` 通过分阶段恢复，最终 `read_only_finalize` 零发送；Doris/Iceberg 端到端 Exactly-Once 不超出 connector 实际语义。**
+**执行边界实录：Phase A 影子与恢复已完成；随后经人工确认完成 Phase B 正式切流。最终 production、Doris clean、Iceberg clean 均保持 RUNNING，验收逻辑 run `ab626...` 通过分阶段恢复，最终 `read_only_finalize` 零发送；合并前又补齐 cutover/rollback 阶段恢复与 verifier durable evidence，最终 Python 165/165、JUnit 15/15，P0/P1/P2 为 0；Doris/Iceberg 端到端 Exactly-Once 不超出 connector 实际语义。**

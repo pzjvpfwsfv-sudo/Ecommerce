@@ -490,7 +490,7 @@ git commit -m "ops: add chapter 9 manifest rollback"
 
 Run: `python -m unittest discover -s tests -v`
 
-实际结果：全量 Python 回归最终为 149/149 PASS；Java 17 Maven JUnit 为 15/15 PASS。
+实际结果：全量 Python 回归最终为 165/165 PASS；Java 17 Maven JUnit 为 15/15 PASS。
 
 Run:
 
@@ -560,14 +560,15 @@ git diff --check
 git status --short
 ```
 
-实际结果：149/149 Python 测试、`git diff --check` 通过；变更范围审计只允许本任务五份文档，另有
+实际结果：165/165 Python 测试、`git diff --check` 通过；变更范围审计只允许本任务五份文档，另有
 `.superpowers/sdd/chapter9-phase-b-task-6-report.md` 作为忽略文件，不进入提交。
 
 - [x] **Step 6: 请求代码审查并修复 P0/P1/P2 问题**
 
 重点审查：Compose 重建范围、挂载路径一致性、Consumer Group 隔离、Savepoint UID 兼容、offset manifest、回滚幂等性、SQL 重复写入和验收证据真实性。
 实际结果：Task 3/4/5 review 与 rereview 已完成；Task 5 I1-I4 已修复并以 0 Critical/Important
-复审通过。
+复审通过。合并前全分支审查进一步补齐 cutover partial、rollback progress/`-Resume`、verifier
+durable stage evidence 和历史同名 Job 过滤；最终定点复审为 P0/P1/P2 全部 0。
 
 - [x] **Step 7: 提交五份文档**
 

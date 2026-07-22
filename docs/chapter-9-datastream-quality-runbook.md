@@ -166,6 +166,22 @@ Savepoint；I2 严格校验 manifest schema、ISO 时间、Job ID、路径和 of
 rollback group；没有调用 stop、cancel 或 submit。dry-run 前后 production
 `0d8edd...`、Doris `bf10b3...`、Iceberg `ce7ec8...` 均保持 RUNNING，说明回滚入口可审查但未执行真实回滚。
 
+### 6.4 合并前恢复性加固
+
+- cutover partial manifest 升级为阶段化状态：每个 Stop-with-Savepoint 和 SQL Job submission 都先
+  原子写 intent，再写结果；`-ResumePartial` 可从 savepoint-only、production-only、Doris-only 和
+  提交结果丢失窗口继续，并且只能领养唯一 exact-name RUNNING Job。历史 terminal 同名作业不再阻塞，
+  多个 RUNNING 候选或顶层 ID 冲突仍 fail closed。
+- rollback 使用 `tmp/chapter-9/rollback-progress.json` 持久化 stop、cancel、submit 阶段，真实回滚中断后
+  必须显式 `-Resume`；已完成阶段不会重复提交，缺失阶段会先写 intent 再执行。dry-run 不创建 progress，
+  也不调用 stop、cancel 或 submit。
+- verifier 在发送前持久化原始 batch start、Doris/Trino/Checkpoint baseline，并逐阶段保存 output、group、
+  checkpoint、Doris、Trino 和 API 证据。read-only finalize 必须复用同一 run 的 durable evidence，
+  Doris/API 必须与直接查询完全一致，Trino 总量和 distinct event ID 必须严格为 baseline `+2`。
+- 合并前最终回归为 Phase B `55/55`、全量 Python `165/165`、Java JUnit `15/15`；四个 PowerShell
+  脚本 Parser/ASCII 与 `git diff --check` 均通过，最终审查 P0/P1/P2 为 0。加固阶段没有再次执行
+  resize、cutover、verifier、真实 rollback 或事件发送。
+
 ## 7. 运行边界与回滚
 
 - 任何真实回滚先暂停流量，按 manifest 精确核验 Job ID/name/state，再执行 production
