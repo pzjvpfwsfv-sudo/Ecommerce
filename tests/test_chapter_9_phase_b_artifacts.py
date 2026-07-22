@@ -31,3 +31,17 @@ class Chapter9PhaseBArtifactsTest(unittest.TestCase):
         self.assertIn("'scan.startup.mode' = 'specific-offsets'", text)
         self.assertIn("__ROLLBACK_GROUP_ID__", text)
         self.assertIn("__SPECIFIC_OFFSETS__", text)
+
+    def test_resize_script_recreates_only_taskmanager_and_checks_recovery(self):
+        text = (ROOT / "scripts/resize_chapter_9_flink_slots.ps1").read_text(encoding="utf-8")
+        for marker in (
+            "Get-WorkspaceMountSource",
+            "Assert-FlinkCapacity",
+            "--no-deps",
+            "--force-recreate",
+            "flink-taskmanager",
+            '"slots-total" -ne 4',
+            "/checkpoints",
+        ):
+            self.assertIn(marker, text)
+        self.assertNotIn("docker compose down", text)
