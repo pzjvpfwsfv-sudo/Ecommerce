@@ -669,3 +669,170 @@ try {
         permanent_payload = json.loads(permanent_result.stdout.strip().splitlines()[-1])
         self.assertEqual(2, permanent_payload["calls"])
         self.assertIn("Last error: permanent checkpoint REST failure", permanent_payload["message"])
+
+    def test_production_verifier_checks_quality_and_all_downstreams(self):
+        path = ROOT / "scripts/verify_chapter_9_production.ps1"
+        raw = path.read_bytes()
+        text = raw.decode("ascii")
+        for marker in (
+            "cutover-manifest.json",
+            "user_behavior_clean",
+            "user_behavior_dlq",
+            "user_behavior_late",
+            "raw = clean + dlq + late",
+            "DUPLICATE_EVENT",
+            "MALFORMED_JSON",
+            "MISSING_REQUIRED_FIELD",
+            "INVALID_EVENT_TIME",
+            "FUTURE_EVENT_TIME",
+            "analytics.realtime_metrics",
+            "lakehouse.analytics.user_behavior_detail",
+            "/analysis/realtime",
+            "/checkpoints",
+            "slots-total",
+            "chapter9-quality-production",
+            "chapter9-doris-clean-v1",
+            "chapter9-iceberg-clean-v1",
+            "isolation.level=read_committed",
+            "--timeout-ms 5000",
+            "production-verification.json.partial",
+        ):
+            self.assertIn(marker, text)
+        self.assertNotIn("force-recreate", text)
+        self.assertNotIn("docker compose down", text)
+
+    def test_production_verifier_validates_the_exact_event_matrix(self):
+        command = r'''
+$ErrorActionPreference = "Stop"
+. (Resolve-Path "scripts/verify_chapter_9_production.ps1") -FunctionsOnly
+$runId = "chapter9-production-0123456789abcdef0123456789abcdef"
+$clean = @(
+    [pscustomobject]@{ event_id = "$runId-duplicate"; user_id = "$runId-user-1" },
+    [pscustomobject]@{ event_id = "$runId-advancer"; user_id = "$runId-user-2" }
+)
+$dlq = @(
+    [pscustomobject]@{ event_id = "$runId-duplicate"; reason_code = "DUPLICATE_EVENT" },
+    [pscustomobject]@{ event_id = "$runId-malformed"; reason_code = "MALFORMED_JSON" },
+    [pscustomobject]@{ event_id = "$runId-missing"; reason_code = "MISSING_REQUIRED_FIELD" },
+    [pscustomobject]@{ event_id = "$runId-invalid-time"; reason_code = "INVALID_EVENT_TIME" },
+    [pscustomobject]@{ event_id = "$runId-future"; reason_code = "FUTURE_EVENT_TIME" }
+)
+$late = @([pscustomobject]@{ event_id = "$runId-late" })
+$rawValues = @(
+    "duplicate-1-$runId", "duplicate-2-$runId", "malformed-$runId", "missing-$runId",
+    "invalid-$runId", "future-$runId", "advancer-$runId", "late-$runId"
+)
+$valid = Assert-ProductionOutputMatrix -RunId $runId -RawValues $rawValues `
+    -CleanRecords $clean -DlqRecords $dlq -LateRecords $late
+$wrongUsersRejected = $false
+try {
+    $clean[1].user_id = $clean[0].user_id
+    Assert-ProductionOutputMatrix -RunId $runId -RawValues $rawValues `
+        -CleanRecords $clean -DlqRecords $dlq -LateRecords $late | Out-Null
+} catch { $wrongUsersRejected = $true }
+$emptyRawMessage = $null
+try {
+    Assert-ProductionOutputMatrix -RunId $runId -RawValues @() `
+        -CleanRecords $clean -DlqRecords $dlq -LateRecords $late | Out-Null
+} catch { $emptyRawMessage = $_.Exception.Message }
+[ordered]@{
+    raw = $valid.Raw
+    clean = $valid.Clean
+    dlq = $valid.Dlq
+    late = $valid.Late
+    duplicate_clean = $valid.DuplicateClean
+    reasons = $valid.Reasons -join ","
+    wrong_users_rejected = $wrongUsersRejected
+    empty_raw_message = $emptyRawMessage
+} | ConvertTo-Json -Compress
+'''
+        result = self._run_powershell(command)
+        self.assertEqual(0, result.returncode, result.stderr or result.stdout)
+        payload = json.loads(result.stdout.strip().splitlines()[-1])
+        self.assertEqual((8, 2, 5, 1, 1), tuple(payload[key] for key in (
+            "raw", "clean", "dlq", "late", "duplicate_clean"
+        )))
+        self.assertEqual(
+            "DUPLICATE_EVENT,MALFORMED_JSON,MISSING_REQUIRED_FIELD,INVALID_EVENT_TIME,FUTURE_EVENT_TIME",
+            payload["reasons"],
+        )
+        self.assertTrue(payload["wrong_users_rejected"])
+        self.assertIn("raw=0", payload["empty_raw_message"])
+
+    def test_production_verifier_parses_only_exact_kafka_group_rows(self):
+        command = r'''
+$ErrorActionPreference = "Stop"
+. (Resolve-Path "scripts/verify_chapter_9_production.ps1") -FunctionsOnly
+$lines = @(
+    "",
+    "GROUP TOPIC PARTITION CURRENT-OFFSET LOG-END-OFFSET LAG CONSUMER-ID HOST CLIENT-ID",
+    "chapter9-quality-production user_behavior_events 0 220 220 0 - - -"
+)
+$parsed = ConvertFrom-ProductionKafkaGroupDescription -Lines $lines `
+    -ExpectedGroup "chapter9-quality-production" -ExpectedTopic "user_behavior_events" `
+    -ExpectedPartitions @(0)
+$wrongTopicRejected = $false
+try {
+    ConvertFrom-ProductionKafkaGroupDescription `
+        -Lines @("chapter9-quality-production wrong-topic 0 220 220 0 - - -") `
+        -ExpectedGroup "chapter9-quality-production" -ExpectedTopic "user_behavior_events" `
+        -ExpectedPartitions @(0) | Out-Null
+} catch { $wrongTopicRejected = $true }
+[ordered]@{
+    lag = $parsed.TotalLag
+    partition = $parsed.Rows[0].Partition
+    wrong_topic_rejected = $wrongTopicRejected
+} | ConvertTo-Json -Compress
+'''
+        result = self._run_powershell(command)
+        self.assertEqual(0, result.returncode, result.stderr or result.stdout)
+        payload = json.loads(result.stdout.strip().splitlines()[-1])
+        self.assertEqual(0, payload["lag"])
+        self.assertEqual(0, payload["partition"])
+        self.assertTrue(payload["wrong_topic_rejected"])
+
+    def test_production_verifier_validates_jobs_overview_and_api_evidence(self):
+        command = r'''
+$ErrorActionPreference = "Stop"
+. (Resolve-Path "scripts/verify_chapter_9_production.ps1") -FunctionsOnly
+$manifest = [pscustomobject]@{
+    production_job_id = "0123456789abcdef0123456789abcdef"
+    doris_job_id = "fedcba9876543210fedcba9876543210"
+    iceberg_job_id = "33333333333333333333333333333333"
+}
+$jobs = [pscustomobject]@{ jobs = @(
+    [pscustomobject]@{ jid = $manifest.production_job_id; name = "chapter-9-datastream-quality-production"; state = "RUNNING" },
+    [pscustomobject]@{ jid = $manifest.doris_job_id; name = "chapter-9-doris-clean"; state = "RUNNING" },
+    [pscustomobject]@{ jid = $manifest.iceberg_job_id; name = "chapter-9-iceberg-clean"; state = "RUNNING" }
+) }
+$overview = [pscustomobject]@{ taskmanagers = 1; "slots-total" = 4; "slots-available" = 1; "jobs-running" = 3 }
+$validatedJobs = Assert-ProductionJobsAndCapacity -Manifest $manifest -Jobs $jobs -Overview $overview
+$batchStart = [DateTimeOffset]::Parse("2026-07-22T10:00:00Z")
+$api = [pscustomobject]@{
+    generated_at = "2026-07-22T10:00:01Z"
+    analyzer = "rule_based"
+    warnings = @()
+    evidence = [pscustomobject]@{
+        realtime = [pscustomobject]@{ pv = 2; uv = 2 }
+        historical = [pscustomobject]@{ event_count = 815 }
+    }
+}
+$validatedApi = Assert-ProductionApiEvidence -Response $api -BatchStart $batchStart -TrinoBaseline 813
+$oldResponseRejected = $false
+try {
+    $api.generated_at = "2026-07-22T09:59:59Z"
+    Assert-ProductionApiEvidence -Response $api -BatchStart $batchStart -TrinoBaseline 813 | Out-Null
+} catch { $oldResponseRejected = $true }
+[ordered]@{
+    job_count = @($validatedJobs).Count
+    generated_at = $validatedApi.GeneratedAt.ToString("o")
+    analyzer = $validatedApi.Analyzer
+    old_response_rejected = $oldResponseRejected
+} | ConvertTo-Json -Compress
+'''
+        result = self._run_powershell(command)
+        self.assertEqual(0, result.returncode, result.stderr or result.stdout)
+        payload = json.loads(result.stdout.strip().splitlines()[-1])
+        self.assertEqual(3, payload["job_count"])
+        self.assertEqual("rule_based", payload["analyzer"])
+        self.assertTrue(payload["old_response_rejected"])
