@@ -35,6 +35,14 @@ class JobConfigTest {
                 () -> JobConfig.fromArgs(new String[] {"--bootstrap-servers", "", "--checkpoint-uri", "file:///tmp/cp"}));
         assertThrows(IllegalArgumentException.class,
                 () -> JobConfig.fromArgs(concat(requiredArgs(), "--dlq-topic", "user_behavior_clean_shadow")));
+        assertThrows(IllegalArgumentException.class,
+                () -> JobConfig.fromArgs(concat(requiredArgs(), "--input-topic", "")));
+        assertThrows(IllegalArgumentException.class,
+                () -> JobConfig.fromArgs(concat(requiredArgs(), "--consumer-group", "")));
+        assertThrows(IllegalArgumentException.class,
+                () -> JobConfig.fromArgs(concat(requiredArgs(), "--transaction-prefix", "")));
+        assertThrows(IllegalArgumentException.class,
+                () -> JobConfig.fromArgs(concat(requiredArgs(), "--job-version", "")));
     }
 
     private static String[] requiredArgs() {

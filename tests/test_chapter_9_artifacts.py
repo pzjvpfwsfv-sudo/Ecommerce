@@ -8,6 +8,8 @@ POM = MODULE / "pom.xml"
 BUILD_SCRIPT = ROOT / "scripts" / "build_chapter_9_datastream.ps1"
 RUN_SCRIPT = ROOT / "scripts" / "run_chapter_9_shadow.ps1"
 VERIFY_SCRIPT = ROOT / "scripts" / "verify_chapter_9_shadow.ps1"
+RECOVERY_SCRIPT = ROOT / "scripts" / "verify_chapter_9_recovery.ps1"
+RUNBOOK = ROOT / "docs" / "chapter-9-datastream-quality-runbook.md"
 ENV_FILE = ROOT / "infra" / ".env.example"
 
 
@@ -34,6 +36,7 @@ class Chapter9ArtifactsTest(unittest.TestCase):
         self.assertIn("--mode shadow", run)
         self.assertIn("docker cp", run)
         self.assertIn("flink run -d", run)
+        self.assertIn("--no-recreate", run)
         self.assertNotIn("--delete", run)
         self.assertNotIn("force-recreate", run)
 
@@ -61,6 +64,22 @@ class Chapter9ArtifactsTest(unittest.TestCase):
         self.assertIn("CHAPTER9_CLEAN_SHADOW_TOPIC=user_behavior_clean_shadow", text)
         self.assertIn("CHAPTER9_DLQ_TOPIC=user_behavior_dlq", text)
         self.assertIn("CHAPTER9_LATE_TOPIC=user_behavior_late", text)
+
+    def test_recovery_and_runbook_preserve_phase_a_boundary(self):
+        self.assertTrue(RECOVERY_SCRIPT.exists())
+        self.assertTrue(RUNBOOK.exists())
+        recovery = RECOVERY_SCRIPT.read_text(encoding="utf-8")
+        runbook = RUNBOOK.read_text(encoding="utf-8")
+
+        self.assertIn("docker restart ecom-flink-taskmanager", recovery)
+        self.assertIn("/checkpoints", recovery)
+        self.assertIn("--savepointPath", recovery)
+        self.assertIn(" -s ", recovery)
+        self.assertNotIn("kafka-topics --delete", recovery)
+        self.assertNotIn("Remove-Item", recovery)
+        self.assertIn("影子链路已完成、主链路尚未切换", runbook)
+        self.assertIn("TaskManager", runbook)
+        self.assertIn("Savepoint", runbook)
 
 
 if __name__ == "__main__":

@@ -318,10 +318,20 @@ git commit -m "docs: close chapter 9 shadow quality phase"
 
 ## Phase A 完成门禁
 
-- [ ] Java 与仓库自动化测试全部通过，Fat JAR 可重复构建。
-- [ ] 真实 Kafka 三路分流矩阵、去重、Watermark 和数量对账通过。
-- [ ] Flink REST 证明作业 RUNNING、Checkpoint 成功、六个 Counter 可读取。
-- [ ] TaskManager 重启和 Savepoint 恢复均有真实证据。
-- [ ] 现有 SQL Source 与 Doris/Iceberg/Trino/第 8 章 API 未切流。
-- [ ] 文档明确记录“影子链路已完成、主链路尚未切换”。
+- [x] Java 与仓库自动化测试全部通过，Fat JAR 可重复构建。
+- [x] 真实 Kafka 三路分流矩阵、去重、Watermark 和数量对账通过。
+- [x] Flink REST 证明作业 RUNNING、Checkpoint 成功、六个 Counter 可读取。
+- [x] TaskManager 重启和 Savepoint 恢复均有真实证据。
+- [x] 现有 SQL Source 与 Doris/Iceberg/Trino/第 8 章 API 未切流。
+- [x] 文档明确记录“影子链路已完成、主链路尚未切换”。
 - [ ] 等待用户再次确认后，才可另行编写和执行 Phase B 切流计划。
+
+## Phase A 执行记录（2026-07-22）
+
+- Maven Java 17 测试、Fat JAR 检查和 110 项仓库测试通过。
+- Kafka 三路输出与五种 DLQ 原因码通过，`raw=8, clean=2, dlq=5, late=1`。
+- Checkpoint、六个 Counter、TaskManager 重启和 Savepoint 状态恢复通过。
+- 实际排障包括 Jackson 版本对齐、PowerShell 编码、容器状态去换行、指标延迟发现、Savepoint 权限和重启窗口调整。
+- 详细证据见 `docs/chapter-9-datastream-quality-runbook.md`。
+
+**执行边界：影子链路已完成、主链路尚未切换；Phase B 未执行。**

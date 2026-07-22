@@ -24,6 +24,8 @@ class DataQualityJobTest {
         assertEquals(60_000L, env.getCheckpointConfig().getCheckpointTimeout());
         assertEquals(5_000L, env.getCheckpointConfig().getMinPauseBetweenCheckpoints());
         assertEquals(1, env.getCheckpointConfig().getMaxConcurrentCheckpoints());
+        assertTrue(env.getConfig().getRestartStrategy().toString().contains("PT15S"),
+                () -> "restart delay must tolerate TaskManager startup: " + env.getConfig().getRestartStrategy());
         Set<String> names = env.getStreamGraph().getStreamNodes().stream()
                 .map(node -> node.getOperatorName()).collect(Collectors.toSet());
         assertContains(names, "kafka-raw-source");

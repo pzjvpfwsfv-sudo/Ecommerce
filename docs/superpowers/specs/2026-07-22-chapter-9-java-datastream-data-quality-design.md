@@ -363,3 +363,17 @@ Phase A 完成需同时满足：
 ## 15. 面试表达
 
 “项目早期我先用 Flink SQL 跑通 Kafka、Doris 和 Iceberg，因为标准聚合用 SQL 表达更清晰。链路稳定后，我没有为了展示 API 而把所有 SQL 重写成 Java，而是针对 SQL 不擅长的数据质量场景新增 DataStream 作业：原始事件先经过解析、校验、Watermark、状态 TTL 去重和 Side Output 分流，再进入 clean Topic。迁移不是直接替换，我先做影子对账，确认 raw 等于 clean、DLQ 和 late 的总和，再暂停流量、保存状态并切换 SQL Source。这样既保留了 SQL 的开发效率，也展示了 DataStream 的状态管理、Exactly-Once、故障恢复和可回滚切流能力。”
+
+## 16. Phase A 实施结果（2026-07-22）
+
+- 110 项仓库测试与 15 项 Java 测试通过。
+- 真实 Kafka 对账：`raw=8, clean=2, dlq=5, late=1`。
+- 六个 Flink Counter 和成功 Checkpoint 已通过 REST 验证。
+- TaskManager 重启后作业恢复并产生新 Checkpoint。
+- Savepoint 恢复后，去重状态继续识别恢复前的 `event_id`。
+- 固定延迟重启从 5 秒调整为 15 秒，最大尝试次数仍为 3 次。
+- PowerShell 脚本保持 ASCII，避免 PowerShell 5 对 UTF-8 无 BOM 中文字符串的解析问题。
+
+详细 Job ID、Savepoint 路径和排障证据见 `docs/chapter-9-datastream-quality-runbook.md`。
+
+**影子链路已完成、主链路尚未切换。Phase B 仍需用户二次确认。**

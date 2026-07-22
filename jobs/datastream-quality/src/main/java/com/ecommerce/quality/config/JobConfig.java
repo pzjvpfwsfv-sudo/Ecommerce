@@ -46,17 +46,20 @@ public record JobConfig(
             throw new IllegalArgumentException("clean, dlq and late topics must be nonblank and different");
         }
 
-        String namespace = parameters.get("transaction-prefix", "chapter9-" + mode).trim();
+        String input = nonBlank(parameters.get("input-topic", "user_behavior_events"), "input-topic");
+        String group = nonBlank(parameters.get("consumer-group", "chapter9-quality-" + mode), "consumer-group");
+        String namespace = nonBlank(parameters.get("transaction-prefix", "chapter9-" + mode), "transaction-prefix");
+        String version = nonBlank(parameters.get("job-version", "chapter-9-v1"), "job-version");
         Duration watermark = positiveSeconds(parameters, "watermark-seconds", 10);
         Duration idleness = positiveSeconds(parameters, "idleness-seconds", 30);
         Duration ttl = Duration.ofHours(positiveLong(parameters, "state-ttl-hours", 24));
         return new JobConfig(
                 bootstrap,
-                parameters.get("input-topic", "user_behavior_events").trim(),
+                input,
                 clean,
                 dlq,
                 late,
-                parameters.get("consumer-group", "chapter9-quality-" + mode).trim(),
+                group,
                 mode,
                 checkpoint,
                 watermark,
@@ -65,7 +68,15 @@ public record JobConfig(
                 namespace + "-clean-",
                 namespace + "-dlq-",
                 namespace + "-late-",
-                parameters.get("job-version", "chapter-9-v1").trim());
+                version);
+    }
+
+    private static String nonBlank(String value, String name) {
+        String trimmed = value.trim();
+        if (trimmed.isEmpty()) {
+            throw new IllegalArgumentException("--" + name + " must not be blank");
+        }
+        return trimmed;
     }
 
     private static Duration positiveSeconds(ParameterTool parameters, String name, long defaultValue) {

@@ -19,7 +19,7 @@ foreach ($container in $requiredContainers) {
 }
 if ($missing.Count -gt 0) {
     Write-Host "Starting missing Kafka/Flink containers..."
-    docker compose --env-file $envFile -f $compose --profile flink up -d
+    docker compose --env-file $envFile -f $compose --profile flink up -d --no-recreate
     if ($LASTEXITCODE -ne 0) { throw "Kafka/Flink startup failed." }
 }
 

@@ -96,6 +96,6 @@ public final class DataQualityJob {
         env.getCheckpointConfig().setMaxConcurrentCheckpoints(1);
         env.getCheckpointConfig().setExternalizedCheckpointCleanup(ExternalizedCheckpointCleanup.RETAIN_ON_CANCELLATION);
         env.getCheckpointConfig().setCheckpointStorage(config.checkpointUri());
-        env.setRestartStrategy(RestartStrategies.fixedDelayRestart(3, Time.seconds(5)));
+        env.setRestartStrategy(RestartStrategies.fixedDelayRestart(3, Time.seconds(15)));
     }
 }

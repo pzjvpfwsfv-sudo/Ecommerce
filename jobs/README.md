@@ -198,3 +198,21 @@ docker compose --env-file infra/.env.example -f infra/docker-compose.yml --profi
 - 第 5 章最初使用 `HadoopCatalog` 跑通 Flink 单引擎写入，但 `Trino 458` 不能直接共享这套元数据
 - 项目已经升级到 `Hive Metastore`，Flink 与 Trino 共用 `thrift://hive-metastore:9083`
 - 第 6 章验证脚本现已能查询同一张 Iceberg 表，并校验非零 `event_count` 和 `event_type` 聚合结果
+
+## 第 9 章：Java DataStream 数据质量影子链路
+
+- Java 17 + Flink 1.19.2 DataStream API
+- JSON 校验、Watermark、迟到分流
+- `event_id` 状态去重与 24 小时 TTL
+- clean、DLQ、late 三路 EXACTLY_ONCE Kafka Sink
+- TaskManager 重启和 Savepoint 恢复验证
+
+```powershell
+./scripts/build_chapter_9_datastream.ps1
+./scripts/verify_chapter_9_shadow.ps1
+./scripts/verify_chapter_9_recovery.ps1
+```
+
+详细证据与排障过程见 `docs/chapter-9-datastream-quality-runbook.md`。
+
+当前边界：**影子链路已完成、主链路尚未切换。**
