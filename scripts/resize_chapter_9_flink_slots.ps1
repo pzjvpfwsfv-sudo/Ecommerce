@@ -24,6 +24,28 @@ function Assert-FlinkCapacity([object]$Overview) {
     }
 }
 
+function Wait-NewCompletedCheckpoint(
+    [string]$JobId,
+    [int64]$Baseline,
+    [int]$Attempts = 60,
+    [int]$SleepSeconds = 2
+) {
+    $lastRequestError = $null
+    for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
+        try {
+            $checkpoints = Invoke-RestMethod -Uri "http://localhost:8081/jobs/$JobId/checkpoints"
+            if ([int64]$checkpoints.counts.completed -gt $Baseline) { return $checkpoints }
+        } catch {
+            $lastRequestError = $_.Exception.Message
+        }
+        if ($attempt -lt $Attempts -and $SleepSeconds -gt 0) { Start-Sleep -Seconds $SleepSeconds }
+    }
+
+    $message = "No new completed checkpoint appeared for shadow job $JobId after $Attempts attempts."
+    if ($null -ne $lastRequestError) { throw "$message Last error: $lastRequestError" }
+    throw $message
+}
+
 if ($FunctionsOnly) { return }
 
 $root = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
@@ -78,14 +100,6 @@ for ($attempt = 1; $attempt -le 60; $attempt++) {
 }
 if ($null -eq $recoveredJob) { throw "Shadow job $jobId did not recover to RUNNING." }
 
-$checkpointsAfter = $null
-for ($attempt = 1; $attempt -le 60; $attempt++) {
-    $checkpointsAfter = Invoke-RestMethod -Uri "http://localhost:8081/jobs/$jobId/checkpoints"
-    if ([int64]$checkpointsAfter.counts.completed -gt $completedBefore) { break }
-    Start-Sleep -Seconds 2
-}
-if ([int64]$checkpointsAfter.counts.completed -le $completedBefore) {
-    throw "No new completed checkpoint appeared for shadow job $jobId."
-}
+$checkpointsAfter = Wait-NewCompletedCheckpoint -JobId $jobId -Baseline $completedBefore
 
 Write-Host "After resize: job_id=$jobId taskmanagers=$($overviewAfter.taskmanagers) slots_total=$($overviewAfter.'slots-total') completed_checkpoints=$($checkpointsAfter.counts.completed)"

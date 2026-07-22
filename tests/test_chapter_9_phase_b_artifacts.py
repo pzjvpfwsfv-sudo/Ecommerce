@@ -1,4 +1,7 @@
+import json
 from pathlib import Path
+import shutil
+import subprocess
 import unittest
 
 
@@ -6,6 +9,21 @@ ROOT = Path(__file__).resolve().parent.parent
 
 
 class Chapter9PhaseBArtifactsTest(unittest.TestCase):
+    def _run_powershell(self, command: str) -> subprocess.CompletedProcess[str]:
+        executable = shutil.which("pwsh") or shutil.which("powershell")
+        if executable is None:
+            self.skipTest("PowerShell is required for Chapter 9 behavior coverage")
+        return subprocess.run(
+            [executable, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=15,
+            check=False,
+        )
+
     def test_env_enables_four_slots_and_production_namespace(self):
         text = (ROOT / "infra/.env.example").read_text(encoding="utf-8")
         for marker in (
@@ -45,3 +63,51 @@ class Chapter9PhaseBArtifactsTest(unittest.TestCase):
         ):
             self.assertIn(marker, text)
         self.assertNotIn("docker compose down", text)
+
+    def test_resize_script_retries_checkpoint_rest_failures(self):
+        transient_command = r'''
+$ErrorActionPreference = "Stop"
+. (Resolve-Path "scripts/resize_chapter_9_flink_slots.ps1") -FunctionsOnly
+$script:checkpointCalls = 0
+function Invoke-RestMethod {
+    param([string]$Uri)
+    $script:checkpointCalls++
+    if ($script:checkpointCalls -eq 1) { throw "transient checkpoint REST failure" }
+    return [pscustomobject]@{ counts = [pscustomobject]@{ completed = 11 } }
+}
+$checkpoints = Wait-NewCompletedCheckpoint -JobId "shadow-job" -Baseline 10 -Attempts 2 -SleepSeconds 0
+[ordered]@{
+    calls = $script:checkpointCalls
+    completed = $checkpoints.counts.completed
+} | ConvertTo-Json -Compress
+'''
+        transient_result = self._run_powershell(transient_command)
+        self.assertEqual(0, transient_result.returncode, transient_result.stderr or transient_result.stdout)
+        transient_payload = json.loads(transient_result.stdout.strip().splitlines()[-1])
+        self.assertEqual(2, transient_payload["calls"])
+        self.assertEqual(11, transient_payload["completed"])
+
+        permanent_command = r'''
+$ErrorActionPreference = "Stop"
+. (Resolve-Path "scripts/resize_chapter_9_flink_slots.ps1") -FunctionsOnly
+$script:checkpointCalls = 0
+function Invoke-RestMethod {
+    param([string]$Uri)
+    $script:checkpointCalls++
+    throw "permanent checkpoint REST failure"
+}
+try {
+    Wait-NewCompletedCheckpoint -JobId "shadow-job" -Baseline 10 -Attempts 2 -SleepSeconds 0
+    throw "Checkpoint wait unexpectedly succeeded."
+} catch {
+    [ordered]@{
+        calls = $script:checkpointCalls
+        message = $_.Exception.Message
+    } | ConvertTo-Json -Compress
+}
+'''
+        permanent_result = self._run_powershell(permanent_command)
+        self.assertEqual(0, permanent_result.returncode, permanent_result.stderr or permanent_result.stdout)
+        permanent_payload = json.loads(permanent_result.stdout.strip().splitlines()[-1])
+        self.assertEqual(2, permanent_payload["calls"])
+        self.assertIn("Last error: permanent checkpoint REST failure", permanent_payload["message"])
