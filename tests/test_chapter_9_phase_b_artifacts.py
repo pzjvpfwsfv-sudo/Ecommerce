@@ -50,6 +50,22 @@ class Chapter9PhaseBArtifactsTest(unittest.TestCase):
         self.assertIn("__ROLLBACK_GROUP_ID__", text)
         self.assertIn("__SPECIFIC_OFFSETS__", text)
 
+    def test_rollback_is_manifest_driven_and_non_destructive(self):
+        text = (ROOT / "scripts/rollback_chapter_9_production.ps1").read_text(encoding="utf-8")
+        for marker in (
+            "[switch]$TrafficPaused",
+            "[switch]$DryRun",
+            "cutover-manifest.json",
+            "15_source_user_behavior_raw_rollback.sql.template",
+            "__SPECIFIC_OFFSETS__",
+            "chapter9-doris-raw-rollback",
+            "chapter9-iceberg-raw-rollback",
+            "--savepointPath",
+        ):
+            self.assertIn(marker, text)
+        for forbidden in ("kafka-topics --delete", "docker compose down", "DROP TABLE", "Remove-Item"):
+            self.assertNotIn(forbidden, text)
+
     def test_cutover_requires_traffic_gate_savepoint_manifest_and_three_jobs(self):
         text = (ROOT / "scripts/run_chapter_9_production_cutover.ps1").read_text(encoding="utf-8")
         for marker in (
