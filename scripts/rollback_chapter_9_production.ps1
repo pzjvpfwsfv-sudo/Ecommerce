@@ -176,7 +176,9 @@ function Assert-RollbackLiveJobs([object]$Manifest, [object]$Jobs) {
     $validated = @()
     foreach ($item in $expected) {
         $byId = @($Jobs.jobs | Where-Object { [string]$_.jid -eq $item.Id })
-        $byName = @($Jobs.jobs | Where-Object { [string]$_.name -eq $item.Name })
+        $byName = @($Jobs.jobs | Where-Object {
+            [string]$_.name -eq $item.Name -and [string]$_.state -eq "RUNNING"
+        })
         if ($byId.Count -ne 1 -or $byName.Count -ne 1 -or
             [string]$byId[0].name -ne $item.Name -or [string]$byId[0].state -ne "RUNNING" -or
             [string]$byName[0].jid -ne $item.Id) {
@@ -188,6 +190,18 @@ function Assert-RollbackLiveJobs([object]$Manifest, [object]$Jobs) {
         throw "Manifest production Job IDs are not unique."
     }
     return @($validated)
+}
+
+function Select-RollbackEvidenceJobs([object]$Manifest, [object]$Jobs) {
+    if ($null -eq $Jobs -or $null -eq $Jobs.jobs) { throw "Flink jobs overview is empty." }
+    $manifestIds = @(
+        [string]$Manifest.production_job_id,
+        [string]$Manifest.doris_job_id,
+        [string]$Manifest.iceberg_job_id
+    )
+    return @($Jobs.jobs | Where-Object {
+        [string]$_.jid -in $manifestIds -or [string]$_.state -eq "RUNNING"
+    } | Group-Object { [string]$_.jid } | ForEach-Object { $_.Group[0] })
 }
 
 function ConvertTo-RollbackOffsetsLiteral([string[]]$RawOffsets) {
@@ -592,7 +606,9 @@ function Resolve-RollbackSubmittedJob {
         }
         return $jobId
     }
-    $namedJobs = @($Jobs.jobs | Where-Object { [string]$_.name -eq $ExpectedName })
+    $namedJobs = @($Jobs.jobs | Where-Object {
+        [string]$_.name -eq $ExpectedName -and [string]$_.state -eq "RUNNING"
+    })
     if ($namedJobs.Count -ne 1) { throw "Cannot adopt ${ExpectedName}: expected one exact-name RUNNING job." }
     if ([string]$namedJobs[0].state -ne "RUNNING" -or [string]$namedJobs[0].jid -notmatch "^[0-9a-f]{32}$") {
         throw "Cannot adopt ${ExpectedName}: job is terminal or malformed."
@@ -602,6 +618,37 @@ function Resolve-RollbackSubmittedJob {
     $state.result = [pscustomobject]@{ status = "result"; job_id = $jobId; adopted = $true; completed_at_utc = [DateTimeOffset]::UtcNow.ToString("o") }
     Write-RollbackProgressAtomic -Progress $Progress -Path $Path
     return [string]$jobId
+}
+
+function Invoke-RollbackSubmissionStage {
+    param(
+        [Parameter(Mandatory = $true)][object]$Progress,
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][ValidateSet("doris_submit", "iceberg_submit")][string]$Stage,
+        [Parameter(Mandatory = $true)][string]$ExpectedName,
+        [Parameter(Mandatory = $true)][string]$Operation,
+        [Parameter(Mandatory = $true)][object]$Jobs,
+        [Parameter(Mandatory = $true)][scriptblock]$SubmitAction
+    )
+
+    $stageState = $Progress.stages.$Stage
+    if ($null -eq $stageState) { throw "Unknown rollback submission stage: $Stage" }
+    if ($null -eq $stageState.intent) {
+        $submitted = Invoke-RollbackMutation -Progress $Progress -Path $Path -Stage $Stage `
+            -Operation $Operation -Details @{ name = $ExpectedName } -Action $SubmitAction
+        $jobId = [string]$submitted.job_id
+        if ($jobId -notmatch '^[0-9a-f]{32}$') {
+            throw "Rollback submission returned an invalid Job ID for $ExpectedName."
+        }
+    } else {
+        $jobId = Resolve-RollbackSubmittedJob -Progress $Progress -Stage $Stage `
+            -ExpectedName $ExpectedName -Jobs $Jobs -Path $Path
+        $submitted = [pscustomobject]@{ output = @(); job_id = $jobId }
+    }
+    $key = if ($Stage -eq "doris_submit") { "doris" } else { "iceberg" }
+    $Progress.rollback_jobs.$key = $jobId
+    Write-RollbackProgressAtomic -Progress $Progress -Path $Path
+    return $submitted
 }
 
 function Invoke-RollbackRealMode {
@@ -717,56 +764,40 @@ function Invoke-RollbackRealMode {
     Write-Host "[rollback] Iceberg canceled requested_job_id=$($icebergResult.RequestedJobId) returned_job_id=$($icebergResult.ReturnedJobId) state=$($icebergResult.State)"
 
     Write-Host "[rollback] submitting raw Doris rollback SQL"
-    if ($Resume -and $null -ne $Progress) {
-        $dorisId = Resolve-RollbackSubmittedJob -Progress $Progress -Stage "doris_submit" -ExpectedName $DorisJobName `
-            -Jobs (Get-FlinkJobs) -Path $ProgressPath
-        $dorisSubmitted = [pscustomobject]@{ output = @(); job_id = $dorisId }
-        $dorisOutput = @()
-    } else {
-        $dorisSubmit = {
-            $output = @(Submit-RollbackSqlJob -SqlClient $SqlClient -ContainerSqlPath $DorisSqlPath -ConnectorPaths $DorisConnectors)
-            [pscustomobject]@{ output = $output; job_id = (Get-SubmittedRollbackJobId -Lines $output) }
-        }
-        if ($null -ne $Progress) {
-            $dorisSubmitted = Invoke-RollbackMutation -Progress $Progress -Path $ProgressPath -Stage "doris_submit" `
-                -Operation "submit_doris_raw_rollback" -Details @{ name = $DorisJobName } -Action $dorisSubmit
-            $dorisOutput = @($dorisSubmitted.output)
-            $Progress.stages.doris_submit.result | Add-Member -Force -NotePropertyName job_id -NotePropertyValue ([string]$dorisSubmitted.job_id)
-            $Progress.rollback_jobs.doris = [string]$dorisSubmitted.job_id
-            Write-RollbackProgressAtomic -Progress $Progress -Path $ProgressPath
-        } else { $dorisSubmitted = & $dorisSubmit; $dorisOutput = @($dorisSubmitted.output) }
+    $dorisSubmit = {
+        $output = @(Submit-RollbackSqlJob -SqlClient $SqlClient -ContainerSqlPath $DorisSqlPath -ConnectorPaths $DorisConnectors)
+        [pscustomobject]@{ output = $output; job_id = (Get-SubmittedRollbackJobId -Lines $output) }
     }
+    if ($null -ne $Progress) {
+        $dorisJobs = if ($Progress.stages.doris_submit.intent) {
+            Get-FlinkJobs
+        } else { [pscustomobject]@{ jobs = @() } }
+        $dorisSubmitted = Invoke-RollbackSubmissionStage -Progress $Progress -Path $ProgressPath `
+            -Stage "doris_submit" -ExpectedName $DorisJobName -Operation "submit_doris_raw_rollback" `
+            -Jobs $dorisJobs -SubmitAction $dorisSubmit
+    } else { $dorisSubmitted = & $dorisSubmit }
+    $dorisOutput = @($dorisSubmitted.output)
     $dorisOutput | ForEach-Object { Write-Host $_ }
 
     Write-Host "[rollback] submitting raw Iceberg rollback SQL"
-    if ($Resume -and $null -ne $Progress) {
-        $icebergId = Resolve-RollbackSubmittedJob -Progress $Progress -Stage "iceberg_submit" -ExpectedName $IcebergJobName `
-            -Jobs (Get-FlinkJobs) -Path $ProgressPath
-        $icebergSubmitted = [pscustomobject]@{ output = @(); job_id = $icebergId }
-        $icebergOutput = @()
-    } else {
-        $icebergSubmit = {
-            $output = @(Submit-RollbackSqlJob -SqlClient $SqlClient -ContainerSqlPath $IcebergSqlPath `
-                -ConnectorPaths $IcebergConnectors -ParentClasspath $IcebergClasspath)
-            [pscustomobject]@{ output = $output; job_id = (Get-SubmittedRollbackJobId -Lines $output) }
-        }
-        if ($null -ne $Progress) {
-            $icebergSubmitted = Invoke-RollbackMutation -Progress $Progress -Path $ProgressPath -Stage "iceberg_submit" `
-                -Operation "submit_iceberg_raw_rollback" -Details @{ name = $IcebergJobName } -Action $icebergSubmit
-            $icebergOutput = @($icebergSubmitted.output)
-            $Progress.stages.iceberg_submit.result | Add-Member -Force -NotePropertyName job_id -NotePropertyValue ([string]$icebergSubmitted.job_id)
-            $Progress.rollback_jobs.iceberg = [string]$icebergSubmitted.job_id
-            Write-RollbackProgressAtomic -Progress $Progress -Path $ProgressPath
-        } else { $icebergSubmitted = & $icebergSubmit; $icebergOutput = @($icebergSubmitted.output) }
+    $icebergSubmit = {
+        $output = @(Submit-RollbackSqlJob -SqlClient $SqlClient -ContainerSqlPath $IcebergSqlPath `
+            -ConnectorPaths $IcebergConnectors -ParentClasspath $IcebergClasspath)
+        [pscustomobject]@{ output = $output; job_id = (Get-SubmittedRollbackJobId -Lines $output) }
     }
+    if ($null -ne $Progress) {
+        $icebergJobs = if ($Progress.stages.iceberg_submit.intent) {
+            Get-FlinkJobs
+        } else { [pscustomobject]@{ jobs = @() } }
+        $icebergSubmitted = Invoke-RollbackSubmissionStage -Progress $Progress -Path $ProgressPath `
+            -Stage "iceberg_submit" -ExpectedName $IcebergJobName -Operation "submit_iceberg_raw_rollback" `
+            -Jobs $icebergJobs -SubmitAction $icebergSubmit
+    } else { $icebergSubmitted = & $icebergSubmit }
+    $icebergOutput = @($icebergSubmitted.output)
     $icebergOutput | ForEach-Object { Write-Host $_ }
 
-    $dorisRollbackJobId = if ($Resume -and $null -ne $Progress) {
-        [string]$dorisSubmitted.job_id
-    } else { Get-SubmittedRollbackJobId -Lines $dorisOutput }
-    $icebergRollbackJobId = if ($Resume -and $null -ne $Progress) {
-        [string]$icebergSubmitted.job_id
-    } else { Get-SubmittedRollbackJobId -Lines $icebergOutput }
+    $dorisRollbackJobId = [string]$dorisSubmitted.job_id
+    $icebergRollbackJobId = [string]$icebergSubmitted.job_id
     $rollbackDoris = Wait-RollbackJobRunning -JobId $dorisRollbackJobId `
         -ExpectedName $DorisJobName -Attempts $Attempts -SleepSeconds $SleepSeconds
     $rollbackIceberg = Wait-RollbackJobRunning -JobId $icebergRollbackJobId `
@@ -827,7 +858,9 @@ if (-not $DryRun -and $Resume -and -not (Test-Path -LiteralPath $progressPath -P
 }
 
 $jobs = Get-FlinkJobs
-$liveJobs = if ($Resume) { @($jobs.jobs) } else { @(Assert-RollbackLiveJobs -Manifest $manifest -Jobs $jobs) }
+$liveJobs = if ($Resume) {
+    @(Select-RollbackEvidenceJobs -Manifest $manifest -Jobs $jobs)
+} else { @(Assert-RollbackLiveJobs -Manifest $manifest -Jobs $jobs) }
 Write-Host "[rollback] cutover_id=$($validated.CutoverId) raw_offsets=$($validated.RawOffsets -join ';')"
 Write-RollbackJobEvidence -Jobs $liveJobs
 

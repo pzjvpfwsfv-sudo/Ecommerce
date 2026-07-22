@@ -187,6 +187,122 @@ function Assert-CutoverSavepointPath([string]$Path) {
     return $Path
 }
 
+function Get-CutoverSavepointDirectorySnapshot([string]$JobManager = "ecom-flink-jobmanager") {
+    $output = Invoke-DockerCommand -Arguments @(
+        "exec", $JobManager, "sh", "-lc",
+        "find /workspace/tmp/savepoints/chapter-9 -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null | sort"
+    ) -FailureMessage "Unable to snapshot the cutover savepoint directory."
+    return @($output | ForEach-Object {
+        $value = ([string]$_).Trim()
+        if ($value -and $value -match '^[A-Za-z0-9._-]+$') { $value }
+    } | Sort-Object -Unique)
+}
+
+function Get-CutoverShadowStopResumePlan {
+    param(
+        [Parameter(Mandatory = $true)][object]$State,
+        [Parameter(Mandatory = $true)][object]$Jobs,
+        [string[]]$SavepointCandidates = @()
+    )
+
+    $expectedName = "chapter-9-datastream-quality-shadow"
+    $shadowId = [string]$State.shadow_job_id
+    if ($shadowId -notmatch '^[0-9a-f]{32}$') { throw "Cutover shadow Job ID is invalid." }
+    $byId = @($Jobs.jobs | Where-Object { [string]$_.jid -eq $shadowId })
+    if ($byId.Count -ne 1 -or [string]$byId[0].name -ne $expectedName) {
+        throw "Cutover shadow Job ID/name does not match the exact manifest job."
+    }
+    $jobState = [string]$byId[0].state
+    $mutation = $State.mutations.shadow_stop
+    $resultPath = [string]$State.savepoint_path
+    if (-not $resultPath) { $resultPath = [string]$mutation.result.savepoint_path }
+    if (-not $resultPath) { $resultPath = [string]$mutation.result.details.savepoint_path }
+    if ($resultPath) {
+        Assert-CutoverSavepointPath -Path $resultPath | Out-Null
+        if ($jobState -ne "FINISHED") {
+            throw "Persisted shadow Savepoint requires the exact shadow job to be FINISHED, got $jobState."
+        }
+        return [pscustomobject]@{ Action = "complete"; SavepointPath = $resultPath }
+    }
+    if ($null -eq $mutation.intent) {
+        if ($jobState -eq "RUNNING") { return [pscustomobject]@{ Action = "stop" } }
+        throw "Shadow stop has no intent and the exact shadow job is $jobState."
+    }
+    if ($jobState -eq "RUNNING") { return [pscustomobject]@{ Action = "retry_stop" } }
+    if ($jobState -eq "FINISHED") {
+        $before = @($mutation.intent.details.savepoint_directory_snapshot)
+        $newCandidates = @($SavepointCandidates | Where-Object { $_ -notin $before })
+        if ($newCandidates.Count -eq 1) {
+            $recoveredPath = Assert-CutoverSavepointPath `
+                -Path "file:/workspace/tmp/savepoints/chapter-9/$($newCandidates[0])"
+            return [pscustomobject]@{ Action = "recover_savepoint"; SavepointPath = $recoveredPath }
+        }
+        throw "Shadow stop Savepoint recovery expected one unique new directory, found $($newCandidates.Count)."
+    }
+    throw "Shadow stop recovery is fail-closed for exact job state $jobState."
+}
+
+function Set-CutoverShadowStopResult {
+    param(
+        [Parameter(Mandatory = $true)][object]$State,
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$SavepointPath,
+        [switch]$Recovered
+    )
+
+    $validatedPath = Assert-CutoverSavepointPath -Path $SavepointPath
+    $mutation = $State.mutations.shadow_stop
+    if ($null -eq $mutation.intent) { throw "Shadow stop result requires a persisted intent." }
+    $mutation.status = "result"
+    $mutation.result = [pscustomobject]@{
+        status = "result"
+        savepoint_path = $validatedPath
+        recovered_from_directory_snapshot = [bool]$Recovered
+        completed_at_utc = [DateTimeOffset]::UtcNow.ToString("o")
+    }
+    if ($State -is [System.Collections.IDictionary]) {
+        $State["savepoint_path"] = $validatedPath
+    } elseif ($State.PSObject.Properties.Name -contains "savepoint_path") {
+        $State.savepoint_path = $validatedPath
+    } else {
+        $State | Add-Member -NotePropertyName savepoint_path -NotePropertyValue $validatedPath
+    }
+    Write-CutoverStateAtomic -State $State -Path $Path
+    return $validatedPath
+}
+
+function Invoke-CutoverShadowStopStage {
+    param(
+        [Parameter(Mandatory = $true)][object]$State,
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][object]$Jobs,
+        [Parameter(Mandatory = $true)][string[]]$SavepointCandidates,
+        [Parameter(Mandatory = $true)][scriptblock]$StopAction
+    )
+
+    $plan = Get-CutoverShadowStopResumePlan -State $State -Jobs $Jobs `
+        -SavepointCandidates $SavepointCandidates
+    if ($plan.Action -eq "complete") {
+        $savepointPath = Set-CutoverShadowStopResult -State $State -Path $Path `
+            -SavepointPath $plan.SavepointPath
+        return [pscustomobject]@{ savepoint_path = $savepointPath; action = "complete" }
+    }
+    if ($plan.Action -eq "recover_savepoint") {
+        $savepointPath = Set-CutoverShadowStopResult -State $State -Path $Path `
+            -SavepointPath $plan.SavepointPath -Recovered
+        return [pscustomobject]@{ savepoint_path = $savepointPath; action = "recover_savepoint" }
+    }
+    $stopResult = Invoke-CutoverMutation -State $State -Path $Path -Stage "shadow_stop" `
+        -Operation "stop_shadow_with_savepoint" -Details @{
+            job_id = [string]$State.shadow_job_id
+            name = "chapter-9-datastream-quality-shadow"
+            savepoint_directory_snapshot = @($SavepointCandidates)
+        } -Action $StopAction
+    $savepointPath = Set-CutoverShadowStopResult -State $State -Path $Path `
+        -SavepointPath ([string]$stopResult.savepoint_path)
+    return [pscustomobject]@{ savepoint_path = $savepointPath; action = $plan.Action }
+}
+
 function Assert-FileHash([string]$Path, [string]$ExpectedHash) {
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
         throw "Connector is not a file: $Path"
@@ -454,7 +570,9 @@ function Resolve-CutoverJobReference {
         }
         return [string]$jobId
     }
-    $namedJobs = @($Jobs.jobs | Where-Object { [string]$_.name -eq $ExpectedName })
+    $namedJobs = @($Jobs.jobs | Where-Object {
+        [string]$_.name -eq $ExpectedName -and [string]$_.state -eq "RUNNING"
+    })
     if ($namedJobs.Count -ne 1) {
         throw "Cannot adopt ${ExpectedName}: expected one exact-name job, found $($namedJobs.Count)."
     }
@@ -535,7 +653,7 @@ function Get-FlinkJobs {
 function Assert-JobNamesAbsent([string[]]$Names) {
     $jobs = Get-FlinkJobs
     foreach ($name in $Names) {
-        $matches = @($jobs.jobs | Where-Object { $_.name -eq $name })
+        $matches = @($jobs.jobs | Where-Object { $_.name -eq $name -and $_.state -eq "RUNNING" })
         if ($matches.Count -gt 0) { throw "Flink job name already exists: $name." }
     }
 }
@@ -558,14 +676,18 @@ function Assert-ResumeManifest([object]$Manifest, [object]$Jobs) {
         @{ Id = [string]$Manifest.doris_job_id; Name = "chapter-9-doris-clean" }
     )) {
         $byId = @($Jobs.jobs | Where-Object { $_.jid -eq $expected.Id })
-        $byName = @($Jobs.jobs | Where-Object { $_.name -eq $expected.Name })
+        $byName = @($Jobs.jobs | Where-Object {
+            $_.name -eq $expected.Name -and $_.state -eq "RUNNING"
+        })
         if ($byId.Count -ne 1 -or $byName.Count -ne 1 -or
             $byId[0].name -ne $expected.Name -or $byId[0].state -ne "RUNNING" -or
             $byName[0].jid -ne $expected.Id) {
             throw "Partial manifest does not match the exact RUNNING job $($expected.Name)."
         }
     }
-    $icebergJobs = @($Jobs.jobs | Where-Object { $_.name -eq "chapter-9-iceberg-clean" })
+    $icebergJobs = @($Jobs.jobs | Where-Object {
+        $_.name -eq "chapter-9-iceberg-clean" -and $_.state -eq "RUNNING"
+    })
     if ($icebergJobs.Count -gt 1) { throw "Multiple Iceberg jobs exist before partial recovery." }
     if ($icebergJobs.Count -eq 1) {
         if ($icebergJobs[0].state -ne "RUNNING" -or
@@ -579,9 +701,8 @@ function Assert-ResumeManifest([object]$Manifest, [object]$Jobs) {
 
 function Get-OnlyRunningShadowJob([string]$Name) {
     $jobs = Get-FlinkJobs
-    $named = @($jobs.jobs | Where-Object { $_.name -eq $Name })
-    $running = @($named | Where-Object { $_.state -eq "RUNNING" })
-    if ($named.Count -ne 1 -or $running.Count -ne 1) {
+    $running = @($jobs.jobs | Where-Object { $_.name -eq $Name -and $_.state -eq "RUNNING" })
+    if ($running.Count -ne 1) {
         throw "Expected exactly one RUNNING shadow job named $Name."
     }
     return $running[0]
@@ -915,9 +1036,9 @@ Write-Host "[preflight] validating Doris and Iceberg SQL connectors"
 if (-not $ResumePartial) {
     Submit-SqlJob -SqlClient $sqlClient -ContainerSqlPath "/workspace/tmp/chapter-9/doris-preflight.sql" `
         -Connectors $dorisConnectors | Out-Null
+    Submit-SqlJob -SqlClient $sqlClient -ContainerSqlPath "/workspace/tmp/chapter-9/iceberg-preflight.sql" `
+        -Connectors $icebergConnectors -ParentClasspath $icebergParentClasspath | Out-Null
 }
-Submit-SqlJob -SqlClient $sqlClient -ContainerSqlPath "/workspace/tmp/chapter-9/iceberg-preflight.sql" `
-    -Connectors $icebergConnectors -ParentClasspath $icebergParentClasspath | Out-Null
 
 Write-SqlFile -Path (Join-Path $tmpRoot "doris-clean.sql") -Parts @(
     "SET 'pipeline.name' = '$dorisJobName';", $checkpointSql,
@@ -932,15 +1053,21 @@ if ($ResumePartial) {
     $savedManifest = Get-Content -Raw -Encoding UTF8 $manifestPartialPath | ConvertFrom-Json
     $recoveryState = Ensure-CutoverRecoveryState -State $savedManifest -Path $manifestPartialPath
     $resumeJobs = Get-FlinkJobs
+    $savepointCandidates = @(Get-CutoverSavepointDirectorySnapshot -JobManager $jobManager)
+    $stopResult = Invoke-CutoverShadowStopStage -State $recoveryState -Path $manifestPartialPath `
+        -Jobs $resumeJobs -SavepointCandidates $savepointCandidates -StopAction {
+            $output = Invoke-DockerCommand -Arguments @(
+                "exec", $jobManager, "/opt/flink/bin/flink", "stop",
+                "--savepointPath", "file:///workspace/tmp/savepoints/chapter-9",
+                [string]$recoveryState.shadow_job_id
+            ) -FailureMessage "Shadow Stop-with-Savepoint resume failed."
+            $output | ForEach-Object { Write-Host $_ }
+            [pscustomobject]@{ savepoint_path = (Get-SavepointPath $output) }
+        }
+    $savepointPath = [string]$stopResult.savepoint_path
     if ($savedManifest.production_job_id -and $savedManifest.doris_job_id) {
         Assert-ResumeManifest -Manifest $savedManifest -Jobs $resumeJobs | Out-Null
     }
-    $savepointPath = [string]$savedManifest.savepoint_path
-    if (-not $savepointPath) { $savepointPath = [string]$recoveryState.mutations.shadow_stop.result.savepoint_path }
-    if ([string]::IsNullOrWhiteSpace($savepointPath)) {
-        throw "Resume requires a verified shadow Stop-with-Savepoint result."
-    }
-    Assert-CutoverSavepointPath -Path $savepointPath | Out-Null
     $productionJobId = $null
     $dorisJobId = $null
     $icebergJobId = $null
@@ -1078,9 +1205,9 @@ Write-ManifestPartial -Manifest $manifest -PartialPath $manifestPartialPath
 Write-Host "[cutover] manifest_partial=$manifestPartialPath raw_offsets=$($rawOffsets -join ';') shadow_lag=$($shadowGroup.TotalLag) shadow_job_id=$shadowJobId"
 
 Write-Host "[cutover] stopping shadow job with Savepoint"
-$stopResult = Invoke-CutoverMutation -State $manifest -Path $manifestPartialPath `
-    -Stage "shadow_stop" -Operation "stop_shadow_with_savepoint" `
-    -Details @{ job_id = $shadowJobId; name = $shadowJobName } -Action {
+$savepointCandidates = @(Get-CutoverSavepointDirectorySnapshot -JobManager $jobManager)
+$stopResult = Invoke-CutoverShadowStopStage -State $manifest -Path $manifestPartialPath `
+    -Jobs (Get-FlinkJobs) -SavepointCandidates $savepointCandidates -StopAction {
         $output = Invoke-DockerCommand -Arguments @(
             "exec", $jobManager, "/opt/flink/bin/flink", "stop",
             "--savepointPath", "file:///workspace/tmp/savepoints/chapter-9", $shadowJobId
@@ -1089,8 +1216,6 @@ $stopResult = Invoke-CutoverMutation -State $manifest -Path $manifestPartialPath
         [pscustomobject]@{ savepoint_path = (Get-SavepointPath $output) }
     }
 $savepointPath = [string]$stopResult.savepoint_path
-$manifest["savepoint_path"] = $savepointPath
-Write-ManifestPartial -Manifest $manifest -PartialPath $manifestPartialPath
 
 Write-Host "[cutover] starting production DataStream from Savepoint"
 # Restore contract: flink run -d -s $savepointPath.

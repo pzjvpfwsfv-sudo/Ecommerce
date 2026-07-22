@@ -1077,6 +1077,7 @@ function Wait-ProductionTrinoEvidence {
         [Parameter(Mandatory = $true)][string[]]$ExcludedEventIds,
         [Parameter(Mandatory = $true)][string]$DuplicateEventId,
         [Parameter(Mandatory = $true)][int64]$BaselineEventCount,
+        [Parameter(Mandatory = $true)][int64]$BaselineDistinctEventId,
         [int]$TimeoutSeconds = 180
     )
 
@@ -1087,19 +1088,62 @@ function Wait-ProductionTrinoEvidence {
             $run = Get-ProductionTrinoRunEvidence -CleanEventIds $CleanEventIds `
                 -ExcludedEventIds $ExcludedEventIds -DuplicateEventId $DuplicateEventId
             $total = Get-ProductionTrinoBaseline
-            if ($run.EventCount -eq 2 -and $run.DistinctEventId -eq 2 -and
-                $run.DistinctUserId -eq 2 -and $run.ExcludedEventCount -eq 0 -and
-                $run.DuplicateEventCount -eq 1 -and
-                $total.EventCount -ge ($BaselineEventCount + 2)) {
-                return [pscustomobject]@{ Run = $run; Total = $total }
-            }
-            $lastError = "exact=$($run.EventCount)/$($run.DistinctEventId)/$($run.DistinctUserId), excluded=$($run.ExcludedEventCount), total=$($total.EventCount)"
+            return Assert-ProductionTrinoExactFinal -Run $run -Total $total `
+                -BaselineEventCount $BaselineEventCount `
+                -BaselineDistinctEventId $BaselineDistinctEventId
         } catch {
             $lastError = $_.Exception.Message
         }
         if ([DateTimeOffset]::UtcNow -lt $deadline) { Start-Sleep -Seconds 2 }
     } while ([DateTimeOffset]::UtcNow -lt $deadline)
     throw "Trino production evidence did not converge. Last error: $lastError"
+}
+
+function Assert-ProductionTrinoExactFinal {
+    param(
+        [Parameter(Mandatory = $true)][object]$Run,
+        [Parameter(Mandatory = $true)][object]$Total,
+        [Parameter(Mandatory = $true)][int64]$BaselineEventCount,
+        [Parameter(Mandatory = $true)][int64]$BaselineDistinctEventId
+    )
+
+    if ([int64]$Run.EventCount -ne 2 -or [int64]$Run.DistinctEventId -ne 2 -or
+        [int64]$Run.DistinctUserId -ne 2 -or [int64]$Run.ExcludedEventCount -ne 0 -or
+        [int64]$Run.DuplicateEventCount -ne 1) {
+        throw "Trino exact run evidence must be 2/2/2 with excluded=0 and duplicate=1."
+    }
+    if ([int64]$Total.EventCount -ne ($BaselineEventCount + 2) -or
+        [int64]$Total.DistinctEventId -ne ($BaselineDistinctEventId + 2)) {
+        throw "Trino totals must equal the durable baseline plus exactly two rows and IDs."
+    }
+    if ($null -eq $Total.LatestEventTime) {
+        throw "Trino final latest_event_time is missing."
+    }
+    return [pscustomobject]@{ Run = $Run; Total = $Total }
+}
+
+function Assert-ProductionTrinoMatchesDurableFinal {
+    param(
+        [Parameter(Mandatory = $true)][object]$Current,
+        [Parameter(Mandatory = $true)][object]$PriorFinal
+    )
+
+    foreach ($property in @(
+        "EventCount", "DistinctEventId", "DistinctUserId",
+        "ExcludedEventCount", "DuplicateEventCount"
+    )) {
+        if ([int64]$Current.Run.$property -ne [int64]$PriorFinal.Run.$property) {
+            throw "Current Trino run evidence does not match durable prior final evidence."
+        }
+    }
+    if ([int64]$Current.Total.EventCount -ne [int64]$PriorFinal.Total.EventCount -or
+        [int64]$Current.Total.DistinctEventId -ne [int64]$PriorFinal.Total.DistinctEventId -or
+        $null -eq $Current.Total.LatestEventTime -or $null -eq $PriorFinal.Total.LatestEventTime -or
+        [DateTimeOffset]$Current.Total.LatestEventTime -ne
+            [DateTimeOffset]$PriorFinal.Total.LatestEventTime) {
+        throw "Current Trino totals do not exactly match durable prior final evidence."
+    }
+    return $Current
 }
 
 function Assert-ProductionApiEvidence {
@@ -1156,11 +1200,13 @@ function Assert-ProductionApiEvidence {
         }
     }
     if ($null -eq $Response.evidence.historical -or
-        [int64]$Response.evidence.historical.event_count -lt ($TrinoBaseline + 2)) {
-        throw "API historical event_count is below Trino baseline plus two."
+        [int64]$Response.evidence.historical.event_count -ne ($TrinoBaseline + 2)) {
+        throw "API historical event_count must equal Trino baseline plus exactly two."
     }
-    if ($null -ne $TrinoFinal -and
-        [int64]$Response.evidence.historical.event_count -ne [int64]$TrinoFinal.Total) {
+    $trinoTotal = if ($null -ne $TrinoFinal -and
+        $TrinoFinal.PSObject.Properties.Name -contains "Total") { $TrinoFinal.Total } else { $TrinoFinal }
+    if ($null -ne $trinoTotal -and
+        [int64]$Response.evidence.historical.event_count -ne [int64]$trinoTotal.EventCount) {
         throw "API historical event_count must exactly match the direct Trino final total."
     }
     $historicalLatestEventTime = $null
@@ -1170,9 +1216,13 @@ function Assert-ProductionApiEvidence {
             [string]$Response.evidence.historical.latest_event_time
         )
     }
-    if ($null -ne $historicalLatestEventTime -and $null -ne $TrinoFinal.LatestEventTime -and
-        $historicalLatestEventTime -ne [DateTimeOffset]$TrinoFinal.LatestEventTime) {
-        throw "API historical latest_event_time must exactly match the direct Trino final latest event time."
+    if ($null -ne $trinoTotal) {
+        if ($null -eq $trinoTotal.LatestEventTime -or $null -eq $historicalLatestEventTime) {
+            throw "API and direct Trino historical latest_event_time are required."
+        }
+        if ($historicalLatestEventTime -ne [DateTimeOffset]$trinoTotal.LatestEventTime) {
+            throw "API historical latest_event_time must exactly match the direct Trino final latest event time."
+        }
     }
     return [pscustomobject]@{
         GeneratedAt = $generatedAt
@@ -1314,11 +1364,15 @@ function ConvertFrom-ProductionDurableCheckpointBaseline([object]$Baseline) {
 }
 
 function Get-ProductionResumeStageEvidence {
-    param([Parameter(Mandatory = $true)][object]$SourceFailedEvidence)
+    param(
+        [Parameter(Mandatory = $true)][object]$SourceFailedEvidence,
+        [Parameter(Mandatory = $true)][string]$RunId
+    )
 
     $record = $SourceFailedEvidence.stage_evidence
-    if ($null -eq $record -or [string]$record.proof_source -ne "durable_stage_evidence" -or
-        $null -eq $record.stages) {
+    if ($null -eq $record -or [int]$record.schema_version -ne 1 -or
+        [string]$record.proof_source -ne "durable_stage_evidence" -or
+        [string]$record.run_id -ne $RunId -or $null -eq $record.stages) {
         throw "Resume requires complete durable prior stage evidence."
     }
     foreach ($stage in @("output", "groups", "checkpoints", "doris_final", "trino_final", "pre_api")) {
@@ -1575,6 +1629,17 @@ function Initialize-ProductionResumeEvidenceRun {
             throw "Resume chain evidence is missing: $chainPath"
         }
     }
+    try {
+        $sourceFailedEvidence = Get-Content -Raw -LiteralPath $SourceFailedPath | ConvertFrom-Json
+    } catch {
+        throw "Resume source failed evidence is not valid JSON."
+    }
+    if ([string]$sourceFailedEvidence.status -ne "failed" -or
+        [string]$sourceFailedEvidence.run_id -ne $RunId) {
+        throw "Resume source failed evidence identity/status is invalid."
+    }
+    $priorStageEvidence = Get-ProductionResumeStageEvidence `
+        -SourceFailedEvidence $sourceFailedEvidence -RunId $RunId
     $paths = [pscustomobject]@{
         FinalPath = $FinalPath
         ArchivedPath = $null
@@ -1590,6 +1655,8 @@ function Initialize-ProductionResumeEvidenceRun {
         ResumeChainPaths = @($ResumeChainPaths)
         ResumeAttemptId = $attemptId
     }
+    Write-ProductionJsonAtomic -Value $priorStageEvidence -Path $paths.StageEvidencePath `
+        -PartialPath $paths.StageEvidencePartialPath
     Write-ProductionJsonAtomic -Value ([ordered]@{
         status = "resume_in_progress"
         run_id = $RunId
@@ -1602,6 +1669,7 @@ function Initialize-ProductionResumeEvidenceRun {
         late_sent = $false
         baseline_path = ([string]$paths.BaselinePath).Replace('\', '/')
         stage_evidence_path = ([string]$paths.StageEvidencePath).Replace('\', '/')
+        stage_evidence = $priorStageEvidence
         started_at_utc = [DateTimeOffset]::UtcNow.ToString("o")
     }) -Path $paths.InProgressPath -PartialPath $paths.StatePartialPath
     return $paths
@@ -1734,6 +1802,123 @@ function Write-ProductionRunFailure {
     }) -Path $RunPaths.FailedPath -PartialPath $RunPaths.StatePartialPath
 }
 
+function Assert-ProductionFinalEvidenceSchema {
+    param([Parameter(Mandatory = $true)][object]$Evidence)
+
+    $record = $Evidence | ConvertTo-Json -Depth 40 | ConvertFrom-Json
+    $requiredTopLevel = @(
+        "status", "run_id", "logical_run_resumed", "source_failed_evidence", "resume_chain",
+        "doris_job_id", "events_sent", "cutover_id", "batch_start_utc", "verified_at_utc",
+        "proof", "event_ids", "counts", "dlq_reason_counts", "resume", "flink",
+        "kafka_groups", "doris", "trino", "api"
+    )
+    foreach ($property in $requiredTopLevel) {
+        if ($record.PSObject.Properties.Name -notcontains $property) {
+            throw "Final production evidence is missing top-level property: $property"
+        }
+    }
+    if ([string]$record.status -ne "success" -or -not [bool]$record.events_sent -or
+        [string]$record.run_id -notmatch '^chapter9-production-[0-9a-f]{32}$' -or
+        [string]::IsNullOrWhiteSpace([string]$record.doris_job_id) -or
+        [string]::IsNullOrWhiteSpace([string]$record.cutover_id)) {
+        throw "Final production evidence identity/status is invalid."
+    }
+    [void][DateTimeOffset]::Parse([string]$record.batch_start_utc)
+    [void][DateTimeOffset]::Parse([string]$record.verified_at_utc)
+    if ([string]$record.proof.causal_baseline_source -ne "durable_run_baseline" -or
+        [string]$record.proof.stage_evidence_source -ne "durable_stage_evidence" -or
+        [string]::IsNullOrWhiteSpace([string]$record.proof.causal_baseline_path) -or
+        [string]::IsNullOrWhiteSpace([string]$record.proof.stage_evidence_path) -or
+        [string]$record.proof.pre_api_stage -ne
+            "output/groups/checkpoints/doris_final/trino_final") {
+        throw "Final production evidence durable proof metadata is invalid."
+    }
+    foreach ($key in @(
+        "duplicate", "malformed", "missing_required", "invalid_time", "future", "advancer", "late"
+    )) {
+        if ([string]::IsNullOrWhiteSpace([string]$record.event_ids.$key)) {
+            throw "Final production evidence is missing event ID: $key"
+        }
+    }
+    if ([int]$record.counts.raw -ne 8 -or [int]$record.counts.clean -ne 2 -or
+        [int]$record.counts.dlq -ne 5 -or [int]$record.counts.late -ne 1 -or
+        [int]$record.counts.duplicate_clean -ne 1) {
+        throw "Final production evidence output counts are invalid."
+    }
+    foreach ($reason in @(
+        "DUPLICATE_EVENT", "MALFORMED_JSON", "MISSING_REQUIRED_FIELD",
+        "INVALID_EVENT_TIME", "FUTURE_EVENT_TIME"
+    )) {
+        if ([int]$record.dlq_reason_counts.$reason -ne 1) {
+            throw "Final production evidence DLQ reason count is invalid: $reason"
+        }
+    }
+    if ([int]$record.flink.overview.taskmanagers -ne 1 -or
+        [int]$record.flink.overview.slots_total -ne 4 -or
+        [int]$record.flink.overview.jobs_running -ne 3) {
+        throw "Final production evidence Flink overview is invalid."
+    }
+    foreach ($key in @("production", "doris", "iceberg")) {
+        $job = $record.flink.jobs.$key
+        if ($null -eq $job -or [string]::IsNullOrWhiteSpace([string]$job.id) -or
+            [string]::IsNullOrWhiteSpace([string]$job.name) -or [string]$job.state -ne "RUNNING" -or
+            $null -eq $job.checkpoint_baseline -or $null -eq $job.checkpoint_final) {
+            throw "Final production evidence Flink job schema is invalid: $key"
+        }
+        $group = $record.kafka_groups.$key
+        if ($null -eq $group -or [string]::IsNullOrWhiteSpace([string]$group.group) -or
+            [string]::IsNullOrWhiteSpace([string]$group.topic) -or [int64]$group.cli_lag -ne 0 -or
+            [int64]$group.readable_data_lag -ne 0 -or @($group.partitions).Count -eq 0) {
+            throw "Final production evidence Kafka group schema is invalid: $key"
+        }
+        foreach ($partition in @($group.partitions)) {
+            if ([int64]$partition.cli_lag -ne 0 -or [int64]$partition.readable_data_lag -ne 0 -or
+                $partition.PSObject.Properties.Name -notcontains "classifications") {
+                throw "Final production evidence Kafka partition schema is invalid: $key"
+            }
+        }
+    }
+    $dorisBaselinePvAt = [DateTimeOffset]::Parse([string]$record.doris.baseline.pv_updated_at)
+    $dorisBaselineUvAt = [DateTimeOffset]::Parse([string]$record.doris.baseline.uv_updated_at)
+    $dorisFinalPvAt = [DateTimeOffset]::Parse([string]$record.doris.final.pv_updated_at)
+    $dorisFinalUvAt = [DateTimeOffset]::Parse([string]$record.doris.final.uv_updated_at)
+    if ([int64]$record.doris.final.pv -ne 2 -or [int64]$record.doris.final.uv -ne 2 -or
+        $dorisFinalPvAt -ne $dorisFinalUvAt -or $dorisFinalPvAt -le $dorisBaselinePvAt -or
+        $dorisFinalUvAt -le $dorisBaselineUvAt) {
+        throw "Final production evidence Doris schema/causality is invalid."
+    }
+    if (@($record.trino.exact_clean_ids).Count -ne 2 -or
+        @($record.trino.excluded_validation_and_late_ids).Count -ne 5 -or
+        [int64]$record.trino.exact_counts.EventCount -ne 2 -or
+        [int64]$record.trino.exact_counts.DistinctEventId -ne 2 -or
+        [int64]$record.trino.exact_counts.DistinctUserId -ne 2 -or
+        [int64]$record.trino.exact_counts.ExcludedEventCount -ne 0 -or
+        [int64]$record.trino.exact_counts.DuplicateEventCount -ne 1 -or
+        [int64]$record.trino.duplicate_event.iceberg_count -ne 1 -or
+        [string]$record.trino.duplicate_event.assertion -ne "measured_sql") {
+        throw "Final production evidence Trino exact-run schema is invalid."
+    }
+    if ([int64]$record.trino.total_final.EventCount -ne
+            ([int64]$record.trino.baseline.EventCount + 2) -or
+        [int64]$record.trino.total_final.DistinctEventId -ne
+            ([int64]$record.trino.baseline.DistinctEventId + 2)) {
+        throw "Final production evidence Trino totals are not an exact two-row delta."
+    }
+    $trinoLatest = [DateTimeOffset]::Parse([string]$record.trino.latest_event_time_final)
+    if ($trinoLatest -ne [DateTimeOffset]::Parse([string]$record.trino.total_final.LatestEventTime)) {
+        throw "Final production evidence Trino latest timestamps disagree."
+    }
+    if ([int64]$record.api.realtime_pv -ne [int64]$record.doris.final.pv -or
+        [int64]$record.api.realtime_uv -ne [int64]$record.doris.final.uv -or
+        [DateTimeOffset]::Parse([string]$record.api.realtime_updated_at) -ne $dorisFinalPvAt -or
+        [int64]$record.api.historical_event_count -ne [int64]$record.trino.total_final.EventCount -or
+        [DateTimeOffset]::Parse([string]$record.api.historical_latest_event_time) -ne $trinoLatest -or
+        [string]::IsNullOrWhiteSpace([string]$record.api.analyzer)) {
+        throw "Final production evidence API/direct evidence reconciliation is invalid."
+    }
+    return $record
+}
+
 function Write-ProductionEvidenceAtomic {
     param(
         [Parameter(Mandatory = $true)][object]$Evidence,
@@ -1810,7 +1995,7 @@ try {
     $resumeStageEvidence = $null
     if ($logicalRunResumed) {
         $resumeStageEvidence = Get-ProductionResumeStageEvidence `
-            -SourceFailedEvidence $resumeAuthorization.SourceFailedEvidence
+            -SourceFailedEvidence $resumeAuthorization.SourceFailedEvidence -RunId $runId
         $resumeCausal = Get-ProductionResumeCausalBaseline `
             -SourceFailedEvidence $resumeAuthorization.SourceFailedEvidence -RunId $runId
         $causalBaseline = $resumeCausal.baseline
@@ -2015,7 +2200,12 @@ try {
     $trinoFinal = Wait-ProductionTrinoEvidence -CleanEventIds $cleanEventIds `
         -ExcludedEventIds $excludedEventIds -DuplicateEventId $eventIds.duplicate `
         -BaselineEventCount $trinoBaseline.EventCount `
+        -BaselineDistinctEventId $trinoBaseline.DistinctEventId `
         -TimeoutSeconds $TimeoutSeconds
+    if ($logicalRunResumed -and $resumeState.ResumeAction -eq "read_only_finalize") {
+        Assert-ProductionTrinoMatchesDurableFinal -Current $trinoFinal `
+            -PriorFinal $resumeStageEvidence.stages.trino_final.evidence | Out-Null
+    }
     Write-ProductionStageEvidence -RunState $runState -Stage "trino_final" -Evidence $trinoFinal
     Write-ProductionStageEvidence -RunState $runState -Stage "pre_api" -Evidence ([ordered]@{
         output = $output.Matrix
@@ -2231,6 +2421,7 @@ try {
             } else { $null }
         }
     }
+    $evidence = Assert-ProductionFinalEvidenceSchema -Evidence $evidence
     Write-ProductionEvidenceAtomic -Evidence $evidence -RunPaths $runPaths
 
     Write-Host "[chapter9-production-verify] passed run_id=$runId"
