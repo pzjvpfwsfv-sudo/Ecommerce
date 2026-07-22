@@ -1034,7 +1034,7 @@ try {
 $apiResponse = [pscustomobject]@{
     generated_at = "2026-07-22T10:00:01Z"; analyzer = "rule_based"; warnings = @()
     evidence = [pscustomobject]@{
-        realtime = [pscustomobject]@{ pv = 2; uv = 2; updated_at = "2026-07-22T10:00:01Z" }
+        realtime = [pscustomobject]@{ pv = 2; uv = 2; updated_at = "2026-07-22T10:00:01" }
         historical = [pscustomobject]@{ event_count = 815; latest_event_time = "2026-07-22T09:59:00Z" }
     }
 }
@@ -1068,6 +1068,7 @@ try {
         self.assertEqual(2, payload["doris_pv"])
         self.assertTrue(payload["stale_doris_rejected"])
         self.assertTrue(payload["realtime_updated_at"].startswith("2026-07-22T10:00:01"))
+        self.assertTrue(payload["realtime_updated_at"].endswith("+00:00"))
         self.assertTrue(payload["historical_latest_event_time"].startswith("2026-07-22T09:59:00"))
         self.assertTrue(payload["equal_generated_rejected"])
         self.assertTrue(payload["stale_api_rejected"])

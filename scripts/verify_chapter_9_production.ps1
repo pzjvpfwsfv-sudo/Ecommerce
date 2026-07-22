@@ -1107,7 +1107,14 @@ function Assert-ProductionApiEvidence {
     if ([string]::IsNullOrWhiteSpace([string]$Response.evidence.realtime.updated_at)) {
         throw "API realtime updated_at is missing."
     }
-    $realtimeUpdatedAt = [DateTimeOffset]::Parse([string]$Response.evidence.realtime.updated_at)
+    $realtimeUpdatedAtText = [string]$Response.evidence.realtime.updated_at
+    if ($realtimeUpdatedAtText -notmatch '(Z|[+-]\d{2}:\d{2})$') {
+        $realtimeUpdatedAtText += "Z"
+    }
+    $realtimeUpdatedAt = [DateTimeOffset]::Parse(
+        $realtimeUpdatedAtText,
+        [Globalization.CultureInfo]::InvariantCulture
+    )
     if ($realtimeUpdatedAt -le $BatchStart) {
         throw "API realtime updated_at must be later than batch start."
     }
