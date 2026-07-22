@@ -24,6 +24,7 @@ public final class DeduplicateFunction extends KeyedProcessFunction<String, User
     private transient EventJsonCodec codec;
     private transient Counter validEvents;
     private transient Counter duplicateEvents;
+    private transient Counter dlqEvents;
 
     public DeduplicateFunction(Duration ttl, String jobVersion) {
         this.ttl = ttl;
@@ -42,6 +43,7 @@ public final class DeduplicateFunction extends KeyedProcessFunction<String, User
         codec = new EventJsonCodec();
         validEvents = getRuntimeContext().getMetricGroup().counter("valid_events_total");
         duplicateEvents = getRuntimeContext().getMetricGroup().counter("duplicate_events_total");
+        dlqEvents = getRuntimeContext().getMetricGroup().counter("dlq_events_total");
     }
 
     @Override
@@ -49,6 +51,7 @@ public final class DeduplicateFunction extends KeyedProcessFunction<String, User
             Collector<UserBehaviorEvent> output) throws Exception {
         if (Boolean.TRUE.equals(seen.value())) {
             duplicateEvents.inc();
+            dlqEvents.inc();
             context.output(DUPLICATE_TAG, new RejectedEvent("DUPLICATE_EVENT",
                     "event_id already exists within state TTL", codec.toJson(event),
                     Instant.now().toString(), jobVersion));

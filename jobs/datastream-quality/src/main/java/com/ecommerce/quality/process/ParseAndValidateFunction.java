@@ -18,6 +18,7 @@ public final class ParseAndValidateFunction extends ProcessFunction<String, User
     private transient EventJsonCodec codec;
     private transient Counter parseErrors;
     private transient Counter validationErrors;
+    private transient Counter dlqEvents;
 
     public ParseAndValidateFunction(String jobVersion) {
         this.jobVersion = jobVersion;
@@ -28,6 +29,7 @@ public final class ParseAndValidateFunction extends ProcessFunction<String, User
         codec = new EventJsonCodec();
         parseErrors = getRuntimeContext().getMetricGroup().counter("parse_errors_total");
         validationErrors = getRuntimeContext().getMetricGroup().counter("validation_errors_total");
+        dlqEvents = getRuntimeContext().getMetricGroup().counter("dlq_events_total");
     }
 
     @Override
@@ -43,6 +45,7 @@ public final class ParseAndValidateFunction extends ProcessFunction<String, User
         } else {
             validationErrors.inc();
         }
+        dlqEvents.inc();
         context.output(REJECTED_TAG, new RejectedEvent(result.getReasonCode(), result.getReasonMessage(),
                 payload, observedAt.toString(), jobVersion));
     }
