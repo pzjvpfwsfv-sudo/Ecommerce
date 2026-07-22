@@ -478,7 +478,8 @@ function Wait-ProductionWatermarkPast {
             if ($vertices.Count -ne 1) { throw "Expected one route-late-events vertex."
             }
             $metricsUrl = "$FlinkBaseUrl/jobs/$JobId/vertices/$($vertices[0].id)/metrics"
-            $metrics = @(Invoke-RestMethod -Uri $metricsUrl -TimeoutSec 5)
+            $metricResponse = Invoke-RestMethod -Uri $metricsUrl -TimeoutSec 5
+            $metrics = @($metricResponse)
             $metricIds = @($metrics | Where-Object {
                 [string]$_.id -match "^\d+\.route-late-events\.currentInputWatermark$"
             })
@@ -486,7 +487,8 @@ function Wait-ProductionWatermarkPast {
             }
             $metricId = [string]$metricIds[0].id
             $encodedMetric = [Uri]::EscapeDataString($metricId)
-            $values = @(Invoke-RestMethod -Uri "$metricsUrl`?get=$encodedMetric" -TimeoutSec 5)
+            $valueResponse = Invoke-RestMethod -Uri "$metricsUrl`?get=$encodedMetric" -TimeoutSec 5
+            $values = @($valueResponse)
             if ($values.Count -ne 1 -or [string]$values[0].id -ne $metricId) {
                 throw "Flink watermark metric returned a malformed value."
             }

@@ -963,13 +963,20 @@ function Invoke-RestMethod {
     if ($Uri -match "/metrics\?get=") {
         $script:valueCalls++
         $value = if ($script:valueCalls -eq 1) { "100" } else { "101" }
-        return @([pscustomobject]@{
+        $response = @([pscustomobject]@{
             id = "0.route-late-events.currentInputWatermark"
             value = $value
         })
+        Write-Output -NoEnumerate $response
+        return
     }
     if ($Uri -match "/vertices/.+/metrics$") {
-        return @([pscustomobject]@{ id = "0.route-late-events.currentInputWatermark" })
+        $response = @(
+            [pscustomobject]@{ id = "0.numRecordsIn" },
+            [pscustomobject]@{ id = "0.route-late-events.currentInputWatermark" }
+        )
+        Write-Output -NoEnumerate $response
+        return
     }
     return [pscustomobject]@{
         jid = "0123456789abcdef0123456789abcdef"
