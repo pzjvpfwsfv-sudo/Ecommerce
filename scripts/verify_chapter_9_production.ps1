@@ -608,9 +608,14 @@ function Assert-ProductionResumeMatrix {
         [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$LateRecords
     )
 
-    if ($RawValues.Count -ne 7 -or $CleanRecords.Count -ne 2 -or
-        $DlqRecords.Count -ne 5 -or $LateRecords.Count -ne 0) {
-        throw "Resume counts must be exactly raw=7 clean=2 dlq=5 late=0."
+    $resumeAction = if ($RawValues.Count -eq 7 -and $CleanRecords.Count -eq 2 -and
+        $DlqRecords.Count -eq 5 -and $LateRecords.Count -eq 0) {
+        "send_late"
+    } elseif ($RawValues.Count -eq 8 -and $CleanRecords.Count -eq 2 -and
+        $DlqRecords.Count -eq 5 -and $LateRecords.Count -eq 1) {
+        "read_only_finalize"
+    } else {
+        throw "Resume counts must be raw/clean/dlq/late=7/2/5/0 or 8/2/5/1."
     }
     $expectedRawIds = [ordered]@{
         "$RunId-duplicate" = 2
@@ -619,6 +624,9 @@ function Assert-ProductionResumeMatrix {
         "$RunId-invalid-time" = 1
         "$RunId-future" = 1
         "$RunId-advancer" = 1
+    }
+    if ($resumeAction -eq "read_only_finalize") {
+        $expectedRawIds["$RunId-late"] = 1
     }
     $rawById = @{}
     foreach ($value in $RawValues) {
@@ -658,15 +666,39 @@ function Assert-ProductionResumeMatrix {
     $lateJson = New-ProductionEventJson -EventId "$RunId-late" `
         -UserId ([string]$duplicateEvent.user_id) -EventTime $lateEventTime.ToString("o") `
         -RunId $RunId
-    $syntheticLate = $lateJson | ConvertFrom-Json
-    Assert-ProductionOutputMatrix -RunId $RunId -RawValues @($RawValues + $lateJson) `
-        -CleanRecords $CleanRecords -DlqRecords $DlqRecords `
-        -LateRecords @($syntheticLate) | Out-Null
+    if ($resumeAction -eq "read_only_finalize") {
+        try {
+            $lateRawEvent = @($rawById["$RunId-late"])[0] | ConvertFrom-Json
+            $lateRawTime = [DateTimeOffset]::Parse([string]$lateRawEvent.event_time)
+        } catch {
+            throw "Resume could not parse the existing late raw event."
+        }
+        $expectedLate = $lateJson | ConvertFrom-Json
+        foreach ($property in @(
+            "event_id", "user_id", "product_id", "event_type", "channel", "device_type", "page_id"
+        )) {
+            if ([string]$lateRawEvent.$property -cne [string]$expectedLate.$property) {
+                throw "Resume existing late raw event does not match reconstructed $property."
+            }
+        }
+        if ($lateRawTime -ne $lateEventTime) {
+            throw "Resume existing late raw event does not match reconstructed event_time."
+        }
+        Assert-ProductionOutputMatrix -RunId $RunId -RawValues $RawValues `
+            -CleanRecords $CleanRecords -DlqRecords $DlqRecords `
+            -LateRecords $LateRecords | Out-Null
+    } else {
+        $syntheticLate = $lateJson | ConvertFrom-Json
+        Assert-ProductionOutputMatrix -RunId $RunId -RawValues @($RawValues + $lateJson) `
+            -CleanRecords $CleanRecords -DlqRecords $DlqRecords `
+            -LateRecords @($syntheticLate) | Out-Null
+    }
     return [pscustomobject]@{
-        Raw = 7
+        Raw = $RawValues.Count
         Clean = 2
         Dlq = 5
-        Late = 0
+        Late = $LateRecords.Count
+        ResumeAction = $resumeAction
         BatchStart = $batchStart
         BatchStartBasis = "duplicate_raw_event_time_upper_bound"
         AdvancerEventTime = $advancerTime
@@ -1143,17 +1175,29 @@ function Assert-ProductionResumeAllowed {
     $failedPaths = @(Get-ChildItem -LiteralPath $Directory `
         -Filter "production-verification.$RunId*.failed.json" -File `
         -ErrorAction SilentlyContinue)
-    if ($failedPaths.Count -ne 1) {
-        throw "Resume requires exactly one matching failed evidence file."
+    if ($failedPaths.Count -eq 0) {
+        throw "Resume requires matching failed evidence."
     }
-    try {
-        $failed = Get-Content -Raw -LiteralPath $failedPaths[0].FullName | ConvertFrom-Json
-    } catch {
-        throw "Resume failed evidence is unreadable."
-    }
-    if ([string]$failed.status -ne "failed" -or [string]$failed.run_id -ne $RunId -or
-        $failed.events_sent -ne $true -or [string]$failed.doris_job_id -ne $DorisJobId) {
-        throw "Resume failed evidence status/run/events/Doris identity mismatch."
+    $resumeChain = @($failedPaths | ForEach-Object {
+        try {
+            $failed = Get-Content -Raw -LiteralPath $_.FullName | ConvertFrom-Json
+            $failedAt = [DateTimeOffset]::Parse([string]$failed.failed_at_utc)
+        } catch {
+            throw "Resume failed evidence is unreadable or has no valid failed_at_utc: $($_.FullName)"
+        }
+        if ([string]$failed.status -ne "failed" -or [string]$failed.run_id -ne $RunId -or
+            $failed.events_sent -ne $true -or [string]$failed.doris_job_id -ne $DorisJobId) {
+            throw "Resume failed evidence status/run/events/Doris identity mismatch: $($_.FullName)"
+        }
+        [pscustomobject]@{
+            Path = $_.FullName
+            FailedAt = $failedAt
+            Evidence = $failed
+        }
+    } | Sort-Object FailedAt)
+    if (@($resumeChain | Group-Object { $_.FailedAt.ToString("o") } |
+        Where-Object { $_.Count -ne 1 }).Count -ne 0) {
+        throw "Resume failed evidence timestamps must uniquely order the resume chain."
     }
     foreach ($path in @(Get-ChildItem -LiteralPath $Directory `
         -Filter "production-verification*.json" -File -ErrorAction SilentlyContinue)) {
@@ -1162,9 +1206,20 @@ function Assert-ProductionResumeAllowed {
             throw "Resume is forbidden for a successful logical run."
         }
     }
+    $latest = $resumeChain[-1]
     return [pscustomobject]@{
-        SourceFailedPath = $failedPaths[0].FullName
-        SourceFailedEvidence = $failed
+        SourceFailedPath = $latest.Path
+        SourceFailedEvidence = $latest.Evidence
+        ResumeChainPaths = @($resumeChain | ForEach-Object { $_.Path })
+        ResumeChain = @($resumeChain | ForEach-Object {
+            [pscustomobject]@{
+                path = $_.Path
+                failed_at_utc = $_.FailedAt.ToString("o")
+                error = [string]$_.Evidence.error
+                events_sent = [bool]$_.Evidence.events_sent
+                doris_job_id = [string]$_.Evidence.doris_job_id
+            }
+        })
     }
 }
 
@@ -1173,7 +1228,8 @@ function Initialize-ProductionResumeEvidenceRun {
         [Parameter(Mandatory = $true)][string]$FinalPath,
         [Parameter(Mandatory = $true)][string]$RunId,
         [Parameter(Mandatory = $true)][string]$DorisJobId,
-        [Parameter(Mandatory = $true)][string]$SourceFailedPath
+        [Parameter(Mandatory = $true)][string]$SourceFailedPath,
+        [string[]]$ResumeChainPaths = @()
     )
 
     if (Test-Path -LiteralPath $FinalPath) {
@@ -1185,6 +1241,15 @@ function Initialize-ProductionResumeEvidenceRun {
     $directory = Split-Path -Parent $FinalPath
     $attemptId = [Guid]::NewGuid().ToString("N")
     $prefix = Join-Path $directory "production-verification.$RunId.resume-$attemptId"
+    if ($ResumeChainPaths.Count -eq 0) { $ResumeChainPaths = @($SourceFailedPath) }
+    if ($SourceFailedPath -ne $ResumeChainPaths[-1]) {
+        throw "Resume source failed evidence must be the latest resume chain entry."
+    }
+    foreach ($chainPath in $ResumeChainPaths) {
+        if (-not (Test-Path -LiteralPath $chainPath -PathType Leaf)) {
+            throw "Resume chain evidence is missing: $chainPath"
+        }
+    }
     $paths = [pscustomobject]@{
         FinalPath = $FinalPath
         ArchivedPath = $null
@@ -1193,6 +1258,7 @@ function Initialize-ProductionResumeEvidenceRun {
         FailedPath = "$prefix.failed.json"
         StatePartialPath = "$prefix.state.partial"
         SourceFailedPath = $SourceFailedPath
+        ResumeChainPaths = @($ResumeChainPaths)
         ResumeAttemptId = $attemptId
     }
     Write-ProductionJsonAtomic -Value ([ordered]@{
@@ -1200,6 +1266,7 @@ function Initialize-ProductionResumeEvidenceRun {
         run_id = $RunId
         logical_run_resumed = $true
         source_failed_evidence = $SourceFailedPath
+        resume_chain = @($ResumeChainPaths)
         doris_job_id = $DorisJobId
         events_sent = $true
         initial_sent = $true
@@ -1225,9 +1292,35 @@ function Write-ProductionInProgressState {
         $state.status = "resume_in_progress"
         $state.logical_run_resumed = $true
         $state.source_failed_evidence = [string]$RunState.SourceFailedEvidence
+        $state.resume_chain = @($RunState.ResumeChain)
+        $state.resume_action = [string]$RunState.ResumeAction
     }
     Write-ProductionJsonAtomic -Value $state -Path $RunState.RunPaths.InProgressPath `
         -PartialPath $RunState.RunPaths.StatePartialPath
+}
+
+function Set-ProductionResumeRunState {
+    param(
+        [Parameter(Mandatory = $true)][object]$RunState,
+        [Parameter(Mandatory = $true)][object]$ResumeState
+    )
+
+    if (-not [bool]$RunState.LogicalRunResumed -or -not [bool]$RunState.InitialSent) {
+        throw "Resume run state must identify an already-sent logical run."
+    }
+    if ([bool]$RunState.LateSent) {
+        throw "Resume run state was already initialized."
+    }
+    if ($RunState.PSObject.Properties.Name -notcontains "ResumeAction") {
+        $RunState | Add-Member -NotePropertyName ResumeAction -NotePropertyValue $null
+    }
+    $RunState.ResumeAction = [string]$ResumeState.ResumeAction
+    switch ($RunState.ResumeAction) {
+        "send_late" { $RunState.LateSent = $false }
+        "read_only_finalize" { $RunState.LateSent = $true }
+        default { throw "Resume action is invalid: $($RunState.ResumeAction)" }
+    }
+    Write-ProductionInProgressState -RunState $RunState
 }
 
 function Assert-ProductionRunAllowed {
@@ -1318,6 +1411,8 @@ $runState = [pscustomobject]@{
     RunPaths = $null
     LogicalRunResumed = $logicalRunResumed
     SourceFailedEvidence = $null
+    ResumeChain = @()
+    ResumeAction = $null
 }
 $runPaths = $null
 $runLock = $null
@@ -1339,8 +1434,10 @@ try {
             -DorisJobId ([string]$manifest.doris_job_id)
         $runPaths = Initialize-ProductionResumeEvidenceRun -FinalPath $evidencePath `
             -RunId $runId -DorisJobId ([string]$manifest.doris_job_id) `
-            -SourceFailedPath $resumeAuthorization.SourceFailedPath
+            -SourceFailedPath $resumeAuthorization.SourceFailedPath `
+            -ResumeChainPaths $resumeAuthorization.ResumeChainPaths
         $runState.SourceFailedEvidence = $resumeAuthorization.SourceFailedPath
+        $runState.ResumeChain = @($resumeAuthorization.ResumeChainPaths)
     } else {
         Assert-ProductionRunAllowed -Directory $evidenceDirectory `
             -DorisJobId ([string]$manifest.doris_job_id)
@@ -1368,6 +1465,7 @@ try {
     }
     if ($logicalRunResumed) {
         $resumeState = Get-ProductionResumeTopicState -RunId $runId
+        Set-ProductionResumeRunState -RunState $runState -ResumeState $resumeState
         $batchStart = $resumeState.BatchStart
         $lateEventTime = $resumeState.LateEventTime
         $late = $resumeState.LateJson
@@ -1395,7 +1493,7 @@ try {
             -CurrentDistinctEventId $trinoCurrent.DistinctEventId `
             -RunEventCount $resumeTrinoPre.EventCount `
             -RunDistinctEventId $resumeTrinoPre.DistinctEventId
-        Write-Host "[chapter9-production-verify] resuming logical run $runId; sending late only"
+        Write-Host "[chapter9-production-verify] resuming logical run $runId; action=$($resumeState.ResumeAction)"
     } else {
         $trinoBaseline = Get-ProductionTrinoBaseline
         $batchStart = [DateTimeOffset]::UtcNow
@@ -1434,14 +1532,21 @@ try {
     $watermarkEvidence = Wait-ProductionWatermarkPast -JobId $productionJob.Id `
         -ExpectedName $productionJob.Name `
         -ThresholdEpochMs $lateEventTime.ToUnixTimeMilliseconds()
-    $preLateCheckpoint = Get-ProductionCheckpointEvidence -JobId $productionJob.Id `
-        -ExpectedName $productionJob.Name
-    Invoke-ProductionSendOnce -RunState $runState -Stage Late -Action {
-        Send-ProductionKafkaValue -Topic $rawTopic -Value $late
+    if ($logicalRunResumed -and $resumeState.ResumeAction -eq "read_only_finalize") {
+        $productionFinalCheckpoint = Wait-NewProductionCheckpoint -JobId $productionJob.Id `
+            -ExpectedName $productionJob.Name `
+            -Baseline $checkpointBaselines.production.Completed `
+            -TimeoutSeconds $TimeoutSeconds
+    } else {
+        $preLateCheckpoint = Get-ProductionCheckpointEvidence -JobId $productionJob.Id `
+            -ExpectedName $productionJob.Name
+        Invoke-ProductionSendOnce -RunState $runState -Stage Late -Action {
+            Send-ProductionKafkaValue -Topic $rawTopic -Value $late
+        }
+        $productionFinalCheckpoint = Wait-NewProductionCheckpoint -JobId $productionJob.Id `
+            -ExpectedName $productionJob.Name -Baseline $preLateCheckpoint.Completed `
+            -TimeoutSeconds $TimeoutSeconds
     }
-    $productionFinalCheckpoint = Wait-NewProductionCheckpoint -JobId $productionJob.Id `
-        -ExpectedName $productionJob.Name -Baseline $preLateCheckpoint.Completed `
-        -TimeoutSeconds $TimeoutSeconds
 
     $output = Wait-ProductionOutputMatrix -RunId $runId -TimeoutSeconds $TimeoutSeconds
     $rawPartitions = @($manifest.raw_offsets | ForEach-Object {
@@ -1532,6 +1637,9 @@ try {
         source_failed_evidence = if ($logicalRunResumed) {
             [string]$resumeAuthorization.SourceFailedPath
         } else { $null }
+        resume_chain = if ($logicalRunResumed) {
+            @($resumeAuthorization.ResumeChain)
+        } else { @() }
         doris_job_id = [string]$manifest.doris_job_id
         events_sent = $true
         cutover_id = [string]$manifest.cutover_id
@@ -1556,8 +1664,13 @@ try {
                     dlq = $resumeState.Dlq
                     late = $resumeState.Late
                 }
-                send_action = "late_only"
+                resume_action = $resumeState.ResumeAction
+                send_action = if ($resumeState.ResumeAction -eq "send_late") {
+                    "late_only"
+                } else { "none" }
                 initial_events_resent = $false
+                late_event_sent_this_attempt = ($resumeState.ResumeAction -eq "send_late")
+                events_sent_this_attempt = ($resumeState.ResumeAction -eq "send_late")
                 reconstructed_fields = [ordered]@{
                     batch_start_utc = $batchStart.ToString("o")
                     batch_start_basis = $resumeState.BatchStartBasis
