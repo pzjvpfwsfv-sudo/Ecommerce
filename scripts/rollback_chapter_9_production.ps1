@@ -1,6 +1,7 @@
 param(
     [switch]$TrafficPaused,
     [switch]$DryRun,
+    [switch]$Resume,
     [switch]$FunctionsOnly
 )
 
@@ -290,6 +291,17 @@ function Get-RollbackSavepointPath([string[]]$Lines) {
     return Assert-RollbackSavepointPath -Path ([string]$uniquePaths[0]) -EvidenceName "stop output"
 }
 
+function Get-RollbackSavepointDirectorySnapshot([string]$JobManager = "ecom-flink-jobmanager") {
+    $output = Invoke-DockerCommand -Arguments @(
+        "exec", $JobManager, "sh", "-lc",
+        "find /workspace/tmp/savepoints/chapter-9 -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null | sort"
+    ) -FailureMessage "Unable to snapshot the rollback savepoint directory."
+    return @($output | ForEach-Object {
+        $value = ([string]$_).Trim()
+        if ($value -and $value -match '^[A-Za-z0-9._-]+$') { $value }
+    } | Sort-Object -Unique)
+}
+
 function Wait-RollbackJobRunning {
     param(
         [string]$JobId,
@@ -432,6 +444,166 @@ function Write-RollbackDryRunPlan {
     Write-Host "[plan] require both rollback jobs RUNNING; traffic resume remains operator-controlled"
 }
 
+function Write-RollbackProgressAtomic {
+    param(
+        [Parameter(Mandatory = $true)][object]$Progress,
+        [Parameter(Mandatory = $true)][string]$Path
+    )
+
+    $nextPath = "$Path.next"
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $Path) | Out-Null
+    [System.IO.File]::WriteAllText($nextPath, (($Progress | ConvertTo-Json -Depth 15) + "`n"), (New-Object System.Text.UTF8Encoding($false)))
+    Move-Item -LiteralPath $nextPath -Destination $Path -Force
+}
+
+function New-RollbackMutationState {
+    return [pscustomobject]@{ status = "not_started"; intent = $null; result = $null }
+}
+
+function New-RollbackProgress {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][hashtable]$ManifestIds
+    )
+
+    $progress = [pscustomobject]@{
+        schema_version = 1
+        status = "in_progress"
+        started_at_utc = [DateTimeOffset]::UtcNow.ToString("o")
+        manifest_ids = [pscustomobject]$ManifestIds
+        stages = [pscustomobject]@{
+            production_stop = New-RollbackMutationState
+            doris_cancel = New-RollbackMutationState
+            iceberg_cancel = New-RollbackMutationState
+            doris_submit = New-RollbackMutationState
+            iceberg_submit = New-RollbackMutationState
+            finalization = New-RollbackMutationState
+        }
+        rollback_jobs = [pscustomobject]@{ doris = $null; iceberg = $null }
+    }
+    Write-RollbackProgressAtomic -Progress $progress -Path $Path
+    return $progress
+}
+
+function Invoke-RollbackMutation {
+    param(
+        [Parameter(Mandatory = $true)][object]$Progress,
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$Stage,
+        [Parameter(Mandatory = $true)][string]$Operation,
+        [hashtable]$Details = @{},
+        [Parameter(Mandatory = $true)][scriptblock]$Action
+    )
+
+    $stageState = $Progress.stages.$Stage
+    if ($null -eq $stageState) { throw "Unknown rollback mutation stage: $Stage" }
+    $stageState.status = "intent"
+    $stageState.intent = [pscustomobject]@{
+        operation = $Operation
+        details = [pscustomobject]$Details
+        created_at_utc = [DateTimeOffset]::UtcNow.ToString("o")
+    }
+    [void](Write-RollbackProgressAtomic -Progress $Progress -Path $Path)
+    try {
+        $value = & $Action
+        $stageState.status = "result"
+        $result = [pscustomobject]@{
+            status = "result"
+            completed_at_utc = [DateTimeOffset]::UtcNow.ToString("o")
+        }
+        if ($value -is [pscustomobject]) {
+            foreach ($property in $value.PSObject.Properties) {
+                $result | Add-Member -Force -NotePropertyName $property.Name -NotePropertyValue $property.Value
+            }
+        }
+        $stageState.result = $result
+        [void](Write-RollbackProgressAtomic -Progress $Progress -Path $Path)
+        return $value
+    } catch {
+        $stageState.status = "failed"
+        $stageState.result = [pscustomobject]@{
+            status = "failed"
+            error = $_.Exception.Message
+            completed_at_utc = [DateTimeOffset]::UtcNow.ToString("o")
+        }
+        [void](Write-RollbackProgressAtomic -Progress $Progress -Path $Path)
+        throw
+    }
+}
+
+function Get-RollbackResumePlan {
+    param(
+        [Parameter(Mandatory = $true)][object]$Progress,
+        [Parameter(Mandatory = $true)][string]$Stage,
+        [Parameter(Mandatory = $true)][object]$Job,
+        [string[]]$SavepointCandidates = @()
+    )
+
+    $expected = switch -Regex ($Stage) {
+        "production" { "chapter-9-datastream-quality-production"; break }
+        "doris" { "chapter-9-doris-clean"; break }
+        "iceberg" { "chapter-9-iceberg-clean"; break }
+        default { throw "Unknown rollback reconciliation stage: $Stage" }
+    }
+    if ([string]$Job.name -ne $expected) { throw "Rollback Job name mismatch for $Stage." }
+    $state = $Progress.stages.$Stage
+    if ($null -eq $state -or $null -eq $state.intent) {
+        throw "Rollback resume requires a persisted intent for $Stage."
+    }
+    $jobState = [string]$Job.state
+    if ($Stage -eq "production_stop") {
+        if ($jobState -eq "RUNNING") { return [pscustomobject]@{ Action = "retry_stop" } }
+        if ($jobState -eq "FINISHED" -and $state.result.savepoint_path -and $state.result.new_savepoint_verified) {
+            return [pscustomobject]@{ Action = "complete" }
+        }
+        if ($jobState -eq "FINISHED") {
+            $before = @($state.intent.details.savepoint_directory_snapshot)
+            $newCandidates = @($SavepointCandidates | Where-Object { $_ -notin $before })
+            if ($newCandidates.Count -eq 1) {
+                $recoveredPath = Assert-RollbackSavepointPath `
+                    -Path "file:/workspace/tmp/savepoints/chapter-9/$($newCandidates[0])" `
+                    -EvidenceName "recovered directory snapshot"
+                return [pscustomobject]@{ Action = "recover_savepoint"; SavepointPath = $recoveredPath }
+            }
+        }
+        throw "Production resume is fail-closed for state $jobState without a verified new savepoint."
+    }
+    if ($jobState -eq "CANCELED") { return [pscustomobject]@{ Action = "complete" } }
+    if ($jobState -eq "RUNNING") { return [pscustomobject]@{ Action = "retry_cancel" } }
+    throw "Rollback clean-job resume is fail-closed for state $jobState."
+}
+
+function Resolve-RollbackSubmittedJob {
+    param(
+        [Parameter(Mandatory = $true)][object]$Progress,
+        [Parameter(Mandatory = $true)][string]$Stage,
+        [Parameter(Mandatory = $true)][string]$ExpectedName,
+        [Parameter(Mandatory = $true)][object]$Jobs,
+        [Parameter(Mandatory = $true)][string]$Path
+    )
+
+    $state = $Progress.stages.$Stage
+    if ($null -eq $state -or $null -eq $state.intent) { throw "No rollback submission intent exists for $ExpectedName." }
+    $jobId = [string]$state.result.job_id
+    if ($jobId) {
+        $byId = @($Jobs.jobs | Where-Object { [string]$_.jid -eq $jobId })
+        if ($byId.Count -ne 1 -or [string]$byId[0].name -ne $ExpectedName -or [string]$byId[0].state -ne "RUNNING") {
+            throw "Persisted rollback Job ID is not the exact RUNNING $ExpectedName."
+        }
+        return $jobId
+    }
+    $namedJobs = @($Jobs.jobs | Where-Object { [string]$_.name -eq $ExpectedName })
+    if ($namedJobs.Count -ne 1) { throw "Cannot adopt ${ExpectedName}: expected one exact-name RUNNING job." }
+    if ([string]$namedJobs[0].state -ne "RUNNING" -or [string]$namedJobs[0].jid -notmatch "^[0-9a-f]{32}$") {
+        throw "Cannot adopt ${ExpectedName}: job is terminal or malformed."
+    }
+    $jobId = [string]$namedJobs[0].jid
+    $state.status = "result"
+    $state.result = [pscustomobject]@{ status = "result"; job_id = $jobId; adopted = $true; completed_at_utc = [DateTimeOffset]::UtcNow.ToString("o") }
+    Write-RollbackProgressAtomic -Progress $Progress -Path $Path
+    return [string]$jobId
+}
+
 function Invoke-RollbackRealMode {
     param(
         [object]$Manifest,
@@ -444,54 +616,168 @@ function Invoke-RollbackRealMode {
         [string]$IcebergClasspath,
         [string]$JobManager = "ecom-flink-jobmanager",
         [string]$SqlClient = "ecom-flink-sql-client",
+        [AllowNull()][object]$Progress = $null,
+        [string]$ProgressPath = "",
+        [switch]$Resume,
         [int]$Attempts = 60,
         [int]$SleepSeconds = 2
     )
 
     Write-Host "[rollback] stopping production DataStream with Savepoint"
-    $stopOutput = @(Invoke-DockerCommand -Arguments @(
-        "exec", $JobManager, "/opt/flink/bin/flink", "stop", "--savepointPath",
-        "file:///workspace/tmp/savepoints/chapter-9", $Manifest.production_job_id
-    ) -FailureMessage "Production DataStream Stop-with-Savepoint failed.")
-    $stopOutput | ForEach-Object { Write-Host $_ }
-    $savepointPath = Get-RollbackSavepointPath -Lines $stopOutput
-    $productionResult = Wait-RollbackProductionFinished -JobId $Manifest.production_job_id `
-        -ExpectedName "chapter-9-datastream-quality-production" -SavepointPath $savepointPath `
-        -Attempts $Attempts -SleepSeconds $SleepSeconds
+    $savepointPath = $null
+    $productionResult = $null
+    $productionJob = if ($Resume -and $null -ne $Progress) {
+        Get-FlinkJob -JobId $Manifest.production_job_id
+    } else { $null }
+    $savepointSnapshot = if ($null -ne $Progress -and
+        (-not $Resume -or -not $Progress.stages.production_stop.result.savepoint_path)) {
+        @(Get-RollbackSavepointDirectorySnapshot -JobManager $JobManager)
+    } else { @() }
+    $productionAction = if ($Resume -and $null -ne $Progress) {
+        Get-RollbackResumePlan -Progress $Progress -Stage "production_stop" -Job $productionJob `
+            -SavepointCandidates $savepointSnapshot
+    } else { [pscustomobject]@{ Action = "retry_stop" } }
+    if ($productionAction.Action -eq "complete" -or $productionAction.Action -eq "recover_savepoint") {
+        $savepointPath = if ($productionAction.SavepointPath) {
+            [string]$productionAction.SavepointPath
+        } else { [string]$Progress.stages.production_stop.result.savepoint_path }
+        Assert-RollbackSavepointPath -Path $savepointPath -EvidenceName "progress" | Out-Null
+        $productionResult = [pscustomobject]@{ RequestedJobId = $Manifest.production_job_id; ReturnedJobId = $Manifest.production_job_id; State = "FINISHED" }
+        if ($productionAction.Action -eq "recover_savepoint") {
+            $Progress.stages.production_stop.status = "result"
+            $Progress.stages.production_stop.result = [pscustomobject]@{
+                status = "result"
+                savepoint_path = $savepointPath
+                new_savepoint_verified = $true
+                recovered_from_directory_snapshot = $true
+                completed_at_utc = [DateTimeOffset]::UtcNow.ToString("o")
+            }
+            Write-RollbackProgressAtomic -Progress $Progress -Path $ProgressPath
+        }
+    } else {
+        $stopAction = {
+            $stopOutput = @(Invoke-DockerCommand -Arguments @(
+                "exec", $JobManager, "/opt/flink/bin/flink", "stop", "--savepointPath",
+                "file:///workspace/tmp/savepoints/chapter-9", $Manifest.production_job_id
+            ) -FailureMessage "Production DataStream Stop-with-Savepoint failed.")
+            $stopOutput | ForEach-Object { Write-Host $_ }
+            $newPath = Get-RollbackSavepointPath -Lines $stopOutput
+            $result = Wait-RollbackProductionFinished -JobId $Manifest.production_job_id `
+                -ExpectedName "chapter-9-datastream-quality-production" -SavepointPath $newPath `
+                -Attempts $Attempts -SleepSeconds $SleepSeconds
+            [pscustomobject]@{ savepoint_path = $newPath; new_savepoint_verified = $true; result = $result }
+        }
+        if ($null -ne $Progress) {
+            $productionResult = Invoke-RollbackMutation -Progress $Progress -Path $ProgressPath `
+                -Stage "production_stop" -Operation "stop_production_with_savepoint" `
+                -Details @{ job_id = $Manifest.production_job_id; savepoint_directory_snapshot = $savepointSnapshot } `
+                -Action $stopAction
+        } else { $productionResult = & $stopAction }
+        $savepointPath = [string]$productionResult.savepoint_path
+        if ($null -ne $Progress) {
+            $Progress.stages.production_stop.result | Add-Member -Force -NotePropertyName savepoint_path -NotePropertyValue $savepointPath
+            $Progress.stages.production_stop.result | Add-Member -Force -NotePropertyName new_savepoint_verified -NotePropertyValue $true
+            Write-RollbackProgressAtomic -Progress $Progress -Path $ProgressPath
+        }
+    }
     Write-Host "[rollback] production stopped requested_job_id=$($productionResult.RequestedJobId) returned_job_id=$($productionResult.ReturnedJobId) state=$($productionResult.State) savepoint=$savepointPath"
 
     Write-Host "[rollback] stopping exact Doris clean job"
-    Invoke-DockerCommand -Arguments @(
-        "exec", $JobManager, "/opt/flink/bin/flink", "cancel", $Manifest.doris_job_id
-    ) -FailureMessage "Doris clean job cancel failed." | ForEach-Object { Write-Host $_ }
-    $dorisResult = Wait-RollbackCleanCanceled -JobId $Manifest.doris_job_id `
-        -ExpectedName "chapter-9-doris-clean" -Attempts $Attempts -SleepSeconds $SleepSeconds
+    $dorisPlan = if ($Resume -and $null -ne $Progress) {
+        Get-RollbackResumePlan -Progress $Progress -Stage "doris_cancel" -Job (Get-FlinkJob $Manifest.doris_job_id)
+    } else { [pscustomobject]@{ Action = "retry_cancel" } }
+    if ($dorisPlan.Action -eq "complete") {
+        $dorisResult = [pscustomobject]@{ RequestedJobId = $Manifest.doris_job_id; ReturnedJobId = $Manifest.doris_job_id; State = "CANCELED" }
+    } else {
+        $cancelDoris = { Invoke-DockerCommand -Arguments @("exec", $JobManager, "/opt/flink/bin/flink", "cancel", $Manifest.doris_job_id) `
+            -FailureMessage "Doris clean job cancel failed." | Out-Null; Wait-RollbackCleanCanceled -JobId $Manifest.doris_job_id `
+            -ExpectedName "chapter-9-doris-clean" -Attempts $Attempts -SleepSeconds $SleepSeconds }
+        if ($null -ne $Progress) {
+            $dorisResult = Invoke-RollbackMutation -Progress $Progress -Path $ProgressPath -Stage "doris_cancel" `
+                -Operation "cancel_doris_clean" -Details @{ job_id = $Manifest.doris_job_id } -Action $cancelDoris
+        } else { $dorisResult = & $cancelDoris }
+    }
     Write-Host "[rollback] Doris canceled requested_job_id=$($dorisResult.RequestedJobId) returned_job_id=$($dorisResult.ReturnedJobId) state=$($dorisResult.State)"
 
     Write-Host "[rollback] stopping exact Iceberg clean job"
-    Invoke-DockerCommand -Arguments @(
-        "exec", $JobManager, "/opt/flink/bin/flink", "cancel", $Manifest.iceberg_job_id
-    ) -FailureMessage "Iceberg clean job cancel failed." | ForEach-Object { Write-Host $_ }
-    $icebergResult = Wait-RollbackCleanCanceled -JobId $Manifest.iceberg_job_id `
-        -ExpectedName "chapter-9-iceberg-clean" -Attempts $Attempts -SleepSeconds $SleepSeconds
+    $icebergPlan = if ($Resume -and $null -ne $Progress) {
+        Get-RollbackResumePlan -Progress $Progress -Stage "iceberg_cancel" -Job (Get-FlinkJob $Manifest.iceberg_job_id)
+    } else { [pscustomobject]@{ Action = "retry_cancel" } }
+    if ($icebergPlan.Action -eq "complete") {
+        $icebergResult = [pscustomobject]@{ RequestedJobId = $Manifest.iceberg_job_id; ReturnedJobId = $Manifest.iceberg_job_id; State = "CANCELED" }
+    } else {
+        $cancelIceberg = { Invoke-DockerCommand -Arguments @("exec", $JobManager, "/opt/flink/bin/flink", "cancel", $Manifest.iceberg_job_id) `
+            -FailureMessage "Iceberg clean job cancel failed." | Out-Null; Wait-RollbackCleanCanceled -JobId $Manifest.iceberg_job_id `
+            -ExpectedName "chapter-9-iceberg-clean" -Attempts $Attempts -SleepSeconds $SleepSeconds }
+        if ($null -ne $Progress) {
+            $icebergResult = Invoke-RollbackMutation -Progress $Progress -Path $ProgressPath -Stage "iceberg_cancel" `
+                -Operation "cancel_iceberg_clean" -Details @{ job_id = $Manifest.iceberg_job_id } -Action $cancelIceberg
+        } else { $icebergResult = & $cancelIceberg }
+    }
     Write-Host "[rollback] Iceberg canceled requested_job_id=$($icebergResult.RequestedJobId) returned_job_id=$($icebergResult.ReturnedJobId) state=$($icebergResult.State)"
 
     Write-Host "[rollback] submitting raw Doris rollback SQL"
-    $dorisOutput = @(Submit-RollbackSqlJob -SqlClient $SqlClient -ContainerSqlPath $DorisSqlPath `
-        -ConnectorPaths $DorisConnectors)
+    if ($Resume -and $null -ne $Progress) {
+        $dorisId = Resolve-RollbackSubmittedJob -Progress $Progress -Stage "doris_submit" -ExpectedName $DorisJobName `
+            -Jobs (Get-FlinkJobs) -Path $ProgressPath
+        $dorisSubmitted = [pscustomobject]@{ output = @(); job_id = $dorisId }
+        $dorisOutput = @()
+    } else {
+        $dorisSubmit = {
+            $output = @(Submit-RollbackSqlJob -SqlClient $SqlClient -ContainerSqlPath $DorisSqlPath -ConnectorPaths $DorisConnectors)
+            [pscustomobject]@{ output = $output; job_id = (Get-SubmittedRollbackJobId -Lines $output) }
+        }
+        if ($null -ne $Progress) {
+            $dorisSubmitted = Invoke-RollbackMutation -Progress $Progress -Path $ProgressPath -Stage "doris_submit" `
+                -Operation "submit_doris_raw_rollback" -Details @{ name = $DorisJobName } -Action $dorisSubmit
+            $dorisOutput = @($dorisSubmitted.output)
+            $Progress.stages.doris_submit.result | Add-Member -Force -NotePropertyName job_id -NotePropertyValue ([string]$dorisSubmitted.job_id)
+            $Progress.rollback_jobs.doris = [string]$dorisSubmitted.job_id
+            Write-RollbackProgressAtomic -Progress $Progress -Path $ProgressPath
+        } else { $dorisSubmitted = & $dorisSubmit; $dorisOutput = @($dorisSubmitted.output) }
+    }
     $dorisOutput | ForEach-Object { Write-Host $_ }
 
     Write-Host "[rollback] submitting raw Iceberg rollback SQL"
-    $icebergOutput = @(Submit-RollbackSqlJob -SqlClient $SqlClient -ContainerSqlPath $IcebergSqlPath `
-        -ConnectorPaths $IcebergConnectors -ParentClasspath $IcebergClasspath)
+    if ($Resume -and $null -ne $Progress) {
+        $icebergId = Resolve-RollbackSubmittedJob -Progress $Progress -Stage "iceberg_submit" -ExpectedName $IcebergJobName `
+            -Jobs (Get-FlinkJobs) -Path $ProgressPath
+        $icebergSubmitted = [pscustomobject]@{ output = @(); job_id = $icebergId }
+        $icebergOutput = @()
+    } else {
+        $icebergSubmit = {
+            $output = @(Submit-RollbackSqlJob -SqlClient $SqlClient -ContainerSqlPath $IcebergSqlPath `
+                -ConnectorPaths $IcebergConnectors -ParentClasspath $IcebergClasspath)
+            [pscustomobject]@{ output = $output; job_id = (Get-SubmittedRollbackJobId -Lines $output) }
+        }
+        if ($null -ne $Progress) {
+            $icebergSubmitted = Invoke-RollbackMutation -Progress $Progress -Path $ProgressPath -Stage "iceberg_submit" `
+                -Operation "submit_iceberg_raw_rollback" -Details @{ name = $IcebergJobName } -Action $icebergSubmit
+            $icebergOutput = @($icebergSubmitted.output)
+            $Progress.stages.iceberg_submit.result | Add-Member -Force -NotePropertyName job_id -NotePropertyValue ([string]$icebergSubmitted.job_id)
+            $Progress.rollback_jobs.iceberg = [string]$icebergSubmitted.job_id
+            Write-RollbackProgressAtomic -Progress $Progress -Path $ProgressPath
+        } else { $icebergSubmitted = & $icebergSubmit; $icebergOutput = @($icebergSubmitted.output) }
+    }
     $icebergOutput | ForEach-Object { Write-Host $_ }
 
-    $rollbackDoris = Wait-RollbackJobRunning -JobId (Get-SubmittedRollbackJobId -Lines $dorisOutput) `
+    $dorisRollbackJobId = if ($Resume -and $null -ne $Progress) {
+        [string]$dorisSubmitted.job_id
+    } else { Get-SubmittedRollbackJobId -Lines $dorisOutput }
+    $icebergRollbackJobId = if ($Resume -and $null -ne $Progress) {
+        [string]$icebergSubmitted.job_id
+    } else { Get-SubmittedRollbackJobId -Lines $icebergOutput }
+    $rollbackDoris = Wait-RollbackJobRunning -JobId $dorisRollbackJobId `
         -ExpectedName $DorisJobName -Attempts $Attempts -SleepSeconds $SleepSeconds
-    $rollbackIceberg = Wait-RollbackJobRunning -JobId (Get-SubmittedRollbackJobId -Lines $icebergOutput) `
+    $rollbackIceberg = Wait-RollbackJobRunning -JobId $icebergRollbackJobId `
         -ExpectedName $IcebergJobName -Attempts $Attempts -SleepSeconds $SleepSeconds
     Write-Host "[rollback] RUNNING requested_job_id=$($rollbackDoris.RequestedJobId) returned_job_id=$($rollbackDoris.ReturnedJobId) name=$($rollbackDoris.Name)"
     Write-Host "[rollback] RUNNING requested_job_id=$($rollbackIceberg.RequestedJobId) returned_job_id=$($rollbackIceberg.ReturnedJobId) name=$($rollbackIceberg.Name)"
+    if ($null -ne $Progress) {
+        $Progress.rollback_jobs.doris = [string]$rollbackDoris.RequestedJobId
+        $Progress.rollback_jobs.iceberg = [string]$rollbackIceberg.RequestedJobId
+        Write-RollbackProgressAtomic -Progress $Progress -Path $ProgressPath
+    }
     return [pscustomobject]@{
         SavepointPath = $savepointPath
         DorisJob = $rollbackDoris
@@ -526,14 +812,22 @@ if (-not $TrafficPaused) { throw "Rollback requires explicit -TrafficPaused conf
 $root = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $tmpRoot = Join-Path $root "tmp/chapter-9"
 $manifestPath = Join-Path $tmpRoot "cutover-manifest.json"
+$progressPath = Join-Path $tmpRoot "rollback-progress.json"
 $templatePath = Join-Path $root "jobs/sql/15_source_user_behavior_raw_rollback.sql.template"
 $dorisPath = Join-Path $tmpRoot "rollback-doris-raw.sql"
 $icebergPath = Join-Path $tmpRoot "rollback-iceberg-raw.sql"
 $manifest = Get-Content -Raw -Encoding UTF8 $manifestPath | ConvertFrom-Json
 $validated = Assert-RollbackManifest -Manifest $manifest
 
+if (-not $DryRun -and (Test-Path -LiteralPath $progressPath -PathType Leaf) -and -not $Resume) {
+    throw "Rollback progress already exists: use explicit -Resume to reconcile $progressPath."
+}
+if (-not $DryRun -and $Resume -and -not (Test-Path -LiteralPath $progressPath -PathType Leaf)) {
+    throw "-Resume requires rollback progress: $progressPath"
+}
+
 $jobs = Get-FlinkJobs
-$liveJobs = @(Assert-RollbackLiveJobs -Manifest $manifest -Jobs $jobs)
+$liveJobs = if ($Resume) { @($jobs.jobs) } else { @(Assert-RollbackLiveJobs -Manifest $manifest -Jobs $jobs) }
 Write-Host "[rollback] cutover_id=$($validated.CutoverId) raw_offsets=$($validated.RawOffsets -join ';')"
 Write-RollbackJobEvidence -Jobs $liveJobs
 
@@ -571,6 +865,22 @@ if ($DryRun) {
     return
 }
 
+$rollbackProgress = $null
+if ($Resume) {
+    $rollbackProgress = Get-Content -Raw -Encoding UTF8 $progressPath | ConvertFrom-Json
+    foreach ($key in @("production", "doris", "iceberg")) {
+        if ([string]$rollbackProgress.manifest_ids.$key -ne [string]$manifest.($key + "_job_id")) {
+            throw "Rollback progress manifest identity mismatch for $key."
+        }
+    }
+} else {
+    $rollbackProgress = New-RollbackProgress -Path $progressPath -ManifestIds @{
+        production = [string]$manifest.production_job_id
+        doris = [string]$manifest.doris_job_id
+        iceberg = [string]$manifest.iceberg_job_id
+    }
+}
+
 $jobManager = "ecom-flink-jobmanager"
 $sqlClient = "ecom-flink-sql-client"
 $dorisJobName = $rendered.DorisGroup
@@ -591,9 +901,25 @@ $icebergConnectors = @(
 )
 $icebergClasspath = $icebergConnectors -join ":"
 Write-Host "[rollback] revalidating exact production jobs before mutation"
-Assert-RollbackLiveJobs -Manifest $manifest -Jobs (Get-FlinkJobs) | Out-Null
+if (-not $Resume) { Assert-RollbackLiveJobs -Manifest $manifest -Jobs (Get-FlinkJobs) | Out-Null }
 Invoke-RollbackRealMode -Manifest $manifest -DorisJobName $dorisJobName -IcebergJobName $icebergJobName `
     -DorisSqlPath "/workspace/tmp/chapter-9/rollback-doris-raw.sql" `
     -IcebergSqlPath "/workspace/tmp/chapter-9/rollback-iceberg-raw.sql" `
-    -DorisConnectors $dorisConnectors -IcebergConnectors $icebergConnectors -IcebergClasspath $icebergClasspath | Out-Null
+    -DorisConnectors $dorisConnectors -IcebergConnectors $icebergConnectors -IcebergClasspath $icebergClasspath `
+    -Progress $rollbackProgress -ProgressPath $progressPath -Resume:$Resume | Out-Null
+$rollbackProgress.stages.finalization.status = "intent"
+$rollbackProgress.stages.finalization.intent = [pscustomobject]@{
+    operation = "finalize_rollback_progress"
+    details = [pscustomobject]@{ production = $manifest.production_job_id; doris = $manifest.doris_job_id; iceberg = $manifest.iceberg_job_id }
+    created_at_utc = [DateTimeOffset]::UtcNow.ToString("o")
+}
+Write-RollbackProgressAtomic -Progress $rollbackProgress -Path $progressPath
+$rollbackProgress.status = "complete"
+$rollbackProgress.completed_at_utc = [DateTimeOffset]::UtcNow.ToString("o")
+$rollbackProgress.stages.finalization.status = "result"
+$rollbackProgress.stages.finalization.result = [pscustomobject]@{
+    status = "result"
+    completed_at_utc = [DateTimeOffset]::UtcNow.ToString("o")
+}
+Write-RollbackProgressAtomic -Progress $rollbackProgress -Path $progressPath
 Write-Host "[rollback] traffic may be resumed by the operator; generator was not started."

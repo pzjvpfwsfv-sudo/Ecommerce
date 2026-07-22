@@ -179,6 +179,14 @@ function Get-SavepointPath([string[]]$Lines) {
     return [string]$uniquePaths[0]
 }
 
+function Assert-CutoverSavepointPath([string]$Path) {
+    if ([string]::IsNullOrWhiteSpace($Path) -or $Path -match "\.\." -or
+        $Path -notmatch "^file:/workspace/tmp/savepoints/chapter-9/[A-Za-z0-9._-]+$") {
+        throw "Invalid cutover Savepoint evidence: $Path"
+    }
+    return $Path
+}
+
 function Assert-FileHash([string]$Path, [string]$ExpectedHash) {
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
         throw "Connector is not a file: $Path"
@@ -231,6 +239,239 @@ function Write-ManifestPartial([System.Collections.IDictionary]$Manifest, [strin
     $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
     [System.IO.File]::WriteAllText($nextPath, $json + "`n", $utf8NoBom)
     Move-Item -LiteralPath $nextPath -Destination $PartialPath -Force
+}
+
+function Write-CutoverStateAtomic {
+    param(
+        [Parameter(Mandatory = $true)][object]$State,
+        [Parameter(Mandatory = $true)][string]$Path
+    )
+
+    $nextPath = "$Path.next"
+    $directory = Split-Path -Parent $Path
+    New-Item -ItemType Directory -Force -Path $directory | Out-Null
+    $json = $State | ConvertTo-Json -Depth 12
+    [System.IO.File]::WriteAllText($nextPath, $json + "`n", (New-Object System.Text.UTF8Encoding($false)))
+    Move-Item -LiteralPath $nextPath -Destination $Path -Force
+}
+
+function New-CutoverMutationState {
+    return [pscustomobject]@{
+        status = "not_started"
+        intent = $null
+        result = $null
+    }
+}
+
+function New-CutoverRecoveryState {
+    param(
+        [Parameter(Mandatory = $true)][string]$CutoverId,
+        [Parameter(Mandatory = $true)][string]$Path
+    )
+
+    $state = [pscustomobject]@{
+        schema_version = 2
+        cutover_id = $CutoverId
+        phase = "prepared"
+        mutations = [pscustomobject]@{
+            shadow_stop = New-CutoverMutationState
+            production_submit = New-CutoverMutationState
+            doris_submit = New-CutoverMutationState
+            iceberg_submit = New-CutoverMutationState
+            finalization = New-CutoverMutationState
+        }
+    }
+    Write-CutoverStateAtomic -State $state -Path $Path
+    return $state
+}
+
+function Set-CutoverMutationIntent {
+    param(
+        [Parameter(Mandatory = $true)][object]$State,
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$Stage,
+        [Parameter(Mandatory = $true)][string]$Operation,
+        [hashtable]$Details = @{}
+    )
+
+    $mutation = $State.mutations.$Stage
+    if ($null -eq $mutation) { throw "Unknown cutover mutation stage: $Stage" }
+    $mutation.status = "intent"
+    $mutation.intent = [pscustomobject]@{
+        operation = $Operation
+        details = [pscustomobject]$Details
+        created_at_utc = [DateTimeOffset]::UtcNow.ToString("o")
+    }
+    $mutation.result = $null
+    $State.phase = $Stage
+    Write-CutoverStateAtomic -State $State -Path $Path
+}
+
+function Set-CutoverMutationResult {
+    param(
+        [Parameter(Mandatory = $true)][object]$State,
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$Stage,
+        [Parameter(Mandatory = $true)][ValidateSet("result", "failed")][string]$Status,
+        [hashtable]$Details = @{}
+    )
+
+    $mutation = $State.mutations.$Stage
+    if ($null -eq $mutation -or $null -eq $mutation.intent) {
+        throw "Cutover mutation result requires a persisted intent: $Stage"
+    }
+    $mutation.status = $Status
+    $mutation.result = [pscustomobject]@{
+        status = $Status
+        details = [pscustomobject]$Details
+        completed_at_utc = [DateTimeOffset]::UtcNow.ToString("o")
+    }
+    Write-CutoverStateAtomic -State $State -Path $Path
+}
+
+function Set-CutoverMutationJobId {
+    param(
+        [Parameter(Mandatory = $true)][object]$State,
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$Stage,
+        [Parameter(Mandatory = $true)][string]$JobId
+    )
+
+    $mutation = $State.mutations.$Stage
+    if ($null -eq $mutation -or $null -eq $mutation.result) {
+        throw "Cannot persist a cutover Job ID without a mutation result: $Stage"
+    }
+    $mutation.result | Add-Member -Force -NotePropertyName job_id -NotePropertyValue $JobId
+    Write-CutoverStateAtomic -State $State -Path $Path
+}
+
+function Invoke-CutoverMutation {
+    param(
+        [Parameter(Mandatory = $true)][object]$State,
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$Stage,
+        [Parameter(Mandatory = $true)][string]$Operation,
+        [hashtable]$Details = @{},
+        [Parameter(Mandatory = $true)][scriptblock]$Action
+    )
+
+    Set-CutoverMutationIntent -State $State -Path $Path -Stage $Stage -Operation $Operation -Details $Details
+    try {
+        $value = & $Action
+        $resultDetails = @{}
+        if ($value -is [pscustomobject]) {
+            foreach ($property in $value.PSObject.Properties) { $resultDetails[$property.Name] = $property.Value }
+        }
+        Set-CutoverMutationResult -State $State -Path $Path -Stage $Stage -Status "result" -Details $resultDetails
+        return $value
+    } catch {
+        Set-CutoverMutationResult -State $State -Path $Path -Stage $Stage -Status "failed" `
+            -Details @{ error = $_.Exception.Message }
+        throw
+    }
+}
+
+function Ensure-CutoverRecoveryState {
+    param(
+        [Parameter(Mandatory = $true)][object]$State,
+        [Parameter(Mandatory = $true)][string]$Path
+    )
+
+    if ($null -eq $State.PSObject.Properties["schema_version"]) {
+        $State | Add-Member -NotePropertyName schema_version -NotePropertyValue 2
+    }
+    if ($null -eq $State.PSObject.Properties["phase"]) {
+        $State | Add-Member -NotePropertyName phase -NotePropertyValue "legacy"
+    }
+    if ($null -eq $State.PSObject.Properties["mutations"]) {
+        $State | Add-Member mutations ([pscustomobject]@{
+            shadow_stop = New-CutoverMutationState
+            production_submit = New-CutoverMutationState
+            doris_submit = New-CutoverMutationState
+            iceberg_submit = New-CutoverMutationState
+            finalization = New-CutoverMutationState
+        })
+    }
+    if (-not [string]::IsNullOrWhiteSpace([string]$State.savepoint_path) -and
+        $null -eq $State.mutations.shadow_stop.intent) {
+        $State.mutations.shadow_stop.status = "result"
+        $State.mutations.shadow_stop.intent = [pscustomobject]@{
+            operation = "legacy_shadow_stop_with_savepoint"
+            details = [pscustomobject]@{ name = "chapter-9-datastream-quality-shadow" }
+            created_at_utc = [string]$State.created_at
+        }
+        $State.mutations.shadow_stop.result = [pscustomobject]@{
+            status = "result"
+            savepoint_path = [string]$State.savepoint_path
+            completed_at_utc = [string]$State.created_at
+        }
+    }
+    foreach ($mapping in @(
+        @{ Stage = "production_submit"; Field = "production_job_id"; Name = "chapter-9-datastream-quality-production" },
+        @{ Stage = "doris_submit"; Field = "doris_job_id"; Name = "chapter-9-doris-clean" },
+        @{ Stage = "iceberg_submit"; Field = "iceberg_job_id"; Name = "chapter-9-iceberg-clean" }
+    )) {
+        $mutation = $State.mutations.($mapping.Stage)
+        if ([string]::IsNullOrWhiteSpace([string]$mutation.result.job_id) -and
+            -not [string]::IsNullOrWhiteSpace([string]$State.($mapping.Field))) {
+            $mutation.status = "result"
+            $mutation.intent = [pscustomobject]@{
+                operation = "legacy_submission"
+                details = [pscustomobject]@{ name = $mapping.Name }
+                created_at_utc = [string]$State.created_at
+            }
+            $mutation.result = [pscustomobject]@{
+                status = "result"
+                job_id = [string]$State.($mapping.Field)
+                completed_at_utc = [string]$State.created_at
+            }
+        }
+    }
+    Write-CutoverStateAtomic -State $State -Path $Path
+    return $State
+}
+
+function Resolve-CutoverJobReference {
+    param(
+        [Parameter(Mandatory = $true)][object]$State,
+        [Parameter(Mandatory = $true)][string]$Stage,
+        [Parameter(Mandatory = $true)][string]$ExpectedName,
+        [Parameter(Mandatory = $true)][object]$Jobs,
+        [Parameter(Mandatory = $true)][string]$Path
+    )
+
+    $mutation = $State.mutations.$Stage
+    if ($null -eq $mutation) { throw "Unknown cutover submission stage: $Stage" }
+    if ($null -eq $mutation.intent) {
+        throw "No submission intent exists for $ExpectedName; adoption is forbidden."
+    }
+    $jobId = [string]$mutation.result.job_id
+    if ($jobId) {
+        $byId = @($Jobs.jobs | Where-Object { [string]$_.jid -eq $jobId })
+        if ($byId.Count -ne 1 -or [string]$byId[0].name -ne $ExpectedName -or
+            [string]$byId[0].state -ne "RUNNING") {
+            throw "Persisted cutover job is not the exact RUNNING $ExpectedName."
+        }
+        return [string]$jobId
+    }
+    $namedJobs = @($Jobs.jobs | Where-Object { [string]$_.name -eq $ExpectedName })
+    if ($namedJobs.Count -ne 1) {
+        throw "Cannot adopt ${ExpectedName}: expected one exact-name job, found $($namedJobs.Count)."
+    }
+    if ([string]$namedJobs[0].state -ne "RUNNING" -or
+        [string]$namedJobs[0].jid -notmatch "^[0-9a-f]{32}$") {
+        throw "Cannot adopt ${ExpectedName}: exact-name job is not RUNNING."
+    }
+    $jobId = [string]$namedJobs[0].jid
+    [void]($mutation.status = "result")
+    [void]($mutation.result = [pscustomobject]@{
+        status = "result"
+        job_id = $jobId
+        adopted = $true
+        completed_at_utc = [DateTimeOffset]::UtcNow.ToString("o")
+    })
+    Write-CutoverStateAtomic -State $State -Path $Path
+    return [string]$jobId
 }
 
 function Complete-CutoverManifest {
@@ -619,7 +860,22 @@ $overview = Invoke-RestMethod -Uri "http://localhost:8081/overview" -TimeoutSec 
 Assert-FlinkCapacity $overview
 
 New-Item -ItemType Directory -Force -Path $tmpRoot, $connectorDirectory, $savepointDirectory, $productionCheckpointDirectory | Out-Null
-if (Test-Path -LiteralPath $manifestPath) { throw "Final cutover manifest already exists: $manifestPath" }
+if (Test-Path -LiteralPath $manifestPath) {
+    if (-not $ResumePartial) {
+        throw "Final cutover manifest already exists: $manifestPath"
+    }
+}
+if ($ResumePartial -and (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
+    if (-not (Test-Path -LiteralPath $manifestPartialPath -PathType Leaf)) {
+        throw "Final cutover manifest exists but its partial recovery state is missing."
+    }
+    $finalManifest = Get-Content -Raw -Encoding UTF8 $manifestPath | ConvertFrom-Json
+    if ([string]::IsNullOrWhiteSpace([string]$finalManifest.iceberg_job_id)) {
+        throw "Final cutover manifest is incomplete and cannot be safely resumed."
+    }
+    Write-Host "[resume] final cutover manifest already durable; finalization is complete."
+    return
+}
 if ($ResumePartial -and -not (Test-Path -LiteralPath $manifestPartialPath -PathType Leaf)) {
     throw "Partial cutover manifest is missing: $manifestPartialPath"
 }
@@ -674,29 +930,91 @@ Write-SqlFile -Path (Join-Path $tmpRoot "iceberg-clean.sql") -Parts @(
 
 if ($ResumePartial) {
     $savedManifest = Get-Content -Raw -Encoding UTF8 $manifestPartialPath | ConvertFrom-Json
-    $existingIcebergJobId = Assert-ResumeManifest -Manifest $savedManifest -Jobs (Get-FlinkJobs)
-    $productionJobId = [string]$savedManifest.production_job_id
-    $dorisJobId = [string]$savedManifest.doris_job_id
+    $recoveryState = Ensure-CutoverRecoveryState -State $savedManifest -Path $manifestPartialPath
+    $resumeJobs = Get-FlinkJobs
+    if ($savedManifest.production_job_id -and $savedManifest.doris_job_id) {
+        Assert-ResumeManifest -Manifest $savedManifest -Jobs $resumeJobs | Out-Null
+    }
+    $savepointPath = [string]$savedManifest.savepoint_path
+    if (-not $savepointPath) { $savepointPath = [string]$recoveryState.mutations.shadow_stop.result.savepoint_path }
+    if ([string]::IsNullOrWhiteSpace($savepointPath)) {
+        throw "Resume requires a verified shadow Stop-with-Savepoint result."
+    }
+    Assert-CutoverSavepointPath -Path $savepointPath | Out-Null
+    $productionJobId = $null
+    $dorisJobId = $null
+    $icebergJobId = $null
+    if ($recoveryState.mutations.production_submit.intent) {
+        $productionJobId = Resolve-CutoverJobReference -State $recoveryState -Stage "production_submit" `
+            -ExpectedName $productionJobName -Jobs $resumeJobs -Path $manifestPartialPath
+    }
+    if ($recoveryState.mutations.doris_submit.intent) {
+        $dorisJobId = Resolve-CutoverJobReference -State $recoveryState -Stage "doris_submit" `
+            -ExpectedName $dorisJobName -Jobs $resumeJobs -Path $manifestPartialPath
+    }
+    if ($recoveryState.mutations.iceberg_submit.intent) {
+        $icebergJobId = Resolve-CutoverJobReference -State $recoveryState -Stage "iceberg_submit" `
+            -ExpectedName $icebergJobName -Jobs $resumeJobs -Path $manifestPartialPath
+    }
+
+    if (-not $productionJobId) {
+        $productionResult = Invoke-CutoverMutation -State $recoveryState -Path $manifestPartialPath `
+            -Stage "production_submit" -Operation "submit_production_from_savepoint" `
+            -Details @{ name = $productionJobName; savepoint_path = $savepointPath } -Action {
+                $output = Invoke-DockerCommand -Arguments @(
+                    "exec", $jobManager, "/opt/flink/bin/flink", "run", "-d", "-s", $savepointPath,
+                    "-c", "com.ecommerce.quality.DataQualityJob", "/tmp/datastream-quality-1.0.0.jar",
+                    "--bootstrap-servers", "kafka:29092", "--input-topic", "user_behavior_events",
+                    "--mode", "production", "--consumer-group", "chapter9-quality-production",
+                    "--checkpoint-uri", "file:///workspace/tmp/checkpoints/chapter-9-production",
+                    "--transaction-prefix", "chapter9-production", "--job-version", "chapter-9-v1"
+                ) -FailureMessage "Production resume submission failed."
+                $id = Get-SubmittedJobId $output
+                Wait-FlinkJobRunning -JobId $id -ExpectedName $productionJobName | Out-Null
+                [pscustomobject]@{ job_id = $id }
+            }
+        $productionJobId = [string]$productionResult.job_id
+        Set-CutoverMutationJobId -State $recoveryState -Path $manifestPartialPath -Stage "production_submit" -JobId $productionJobId
+        $savedManifest.production_job_id = $productionJobId
+        Write-ManifestPartial -Manifest $savedManifest -PartialPath $manifestPartialPath
+    }
     $productionCheckpoints = Wait-NewCompletedCheckpoint -JobId $productionJobId -ExpectedName $productionJobName
+
+    if (-not $dorisJobId) {
+        $dorisResult = Invoke-CutoverMutation -State $recoveryState -Path $manifestPartialPath `
+            -Stage "doris_submit" -Operation "submit_doris_clean" -Details @{ name = $dorisJobName } -Action {
+                [void](Submit-SqlJob -SqlClient $sqlClient -ContainerSqlPath "/workspace/tmp/chapter-9/doris-clean.sql" -Connectors $dorisConnectors)
+                $id = Wait-NewNamedJob -Name $dorisJobName
+                [pscustomobject]@{ job_id = $id }
+            }
+        $dorisJobId = [string]$dorisResult.job_id
+        Set-CutoverMutationJobId -State $recoveryState -Path $manifestPartialPath -Stage "doris_submit" -JobId $dorisJobId
+        $savedManifest.doris_job_id = $dorisJobId
+        Write-ManifestPartial -Manifest $savedManifest -PartialPath $manifestPartialPath
+    }
     $dorisCheckpoints = Wait-NewCompletedCheckpoint -JobId $dorisJobId -ExpectedName $dorisJobName
 
-    if ($existingIcebergJobId) {
-        $icebergJobId = [string]$existingIcebergJobId
-        Write-Host "[resume] adopting existing RUNNING Iceberg job_id=$icebergJobId"
-    } else {
-        Write-Host "[resume] submitting only the missing Iceberg clean SQL job"
-        Submit-SqlJob -SqlClient $sqlClient -ContainerSqlPath "/workspace/tmp/chapter-9/iceberg-clean.sql" `
-            -Connectors $icebergConnectors -ParentClasspath $icebergParentClasspath |
-            ForEach-Object { Write-Host $_ }
-        $icebergJobId = Wait-NewNamedJob -Name $icebergJobName
+    if (-not $icebergJobId) {
+        $icebergResult = Invoke-CutoverMutation -State $recoveryState -Path $manifestPartialPath `
+            -Stage "iceberg_submit" -Operation "submit_iceberg_clean" -Details @{ name = $icebergJobName } -Action {
+                [void](Submit-SqlJob -SqlClient $sqlClient -ContainerSqlPath "/workspace/tmp/chapter-9/iceberg-clean.sql" `
+                    -Connectors $icebergConnectors -ParentClasspath $icebergParentClasspath)
+                $id = Wait-NewNamedJob -Name $icebergJobName
+                [pscustomobject]@{ job_id = $id }
+            }
+        $icebergJobId = [string]$icebergResult.job_id
+        Set-CutoverMutationJobId -State $recoveryState -Path $manifestPartialPath -Stage "iceberg_submit" -JobId $icebergJobId
     }
     Wait-FlinkJobRunning -JobId $icebergJobId -ExpectedName $icebergJobName | Out-Null
     $icebergCheckpoints = Wait-NewCompletedCheckpoint -JobId $icebergJobId -ExpectedName $icebergJobName
-
+    Set-CutoverMutationIntent -State $recoveryState -Path $manifestPartialPath -Stage "finalization" `
+        -Operation "finalize_cutover_manifest" -Details @{ final_path = $manifestPath }
     Complete-CutoverManifest -PartialPath $manifestPartialPath -FinalPath $manifestPath `
         -ProductionJobId $productionJobId -DorisJobId $dorisJobId -IcebergJobId $icebergJobId `
         -ProductionCheckpoints $productionCheckpoints -DorisCheckpoints $dorisCheckpoints `
         -IcebergCheckpoints $icebergCheckpoints
+    Set-CutoverMutationResult -State $recoveryState -Path $manifestPartialPath -Stage "finalization" -Status "result" `
+        -Details @{ final_path = $manifestPath }
     return
 }
 # ResumePartial ends before normal cutover.
@@ -738,7 +1056,9 @@ if (($rawOffsets -join ";") -ne ($rawOffsetConfirmation -join ";")) {
 }
 
 $manifest = [ordered]@{
+    schema_version = 2
     cutover_id = [guid]::NewGuid().ToString()
+    phase = "prepared"
     created_at = [DateTimeOffset]::UtcNow.ToString("o")
     raw_offsets = @($rawOffsets)
     shadow_job_id = $shadowJobId
@@ -746,58 +1066,86 @@ $manifest = [ordered]@{
     production_job_id = $null
     doris_job_id = $null
     iceberg_job_id = $null
+    mutations = [ordered]@{
+        shadow_stop = New-CutoverMutationState
+        production_submit = New-CutoverMutationState
+        doris_submit = New-CutoverMutationState
+        iceberg_submit = New-CutoverMutationState
+        finalization = New-CutoverMutationState
+    }
 }
 Write-ManifestPartial -Manifest $manifest -PartialPath $manifestPartialPath
 Write-Host "[cutover] manifest_partial=$manifestPartialPath raw_offsets=$($rawOffsets -join ';') shadow_lag=$($shadowGroup.TotalLag) shadow_job_id=$shadowJobId"
 
 Write-Host "[cutover] stopping shadow job with Savepoint"
-$stopOutput = Invoke-DockerCommand -Arguments @(
-    "exec", $jobManager, "/opt/flink/bin/flink", "stop",
-    "--savepointPath", "file:///workspace/tmp/savepoints/chapter-9", $shadowJobId
-) -FailureMessage "Shadow Stop-with-Savepoint failed."
-$stopOutput | ForEach-Object { Write-Host $_ }
-$savepointPath = Get-SavepointPath $stopOutput
+$stopResult = Invoke-CutoverMutation -State $manifest -Path $manifestPartialPath `
+    -Stage "shadow_stop" -Operation "stop_shadow_with_savepoint" `
+    -Details @{ job_id = $shadowJobId; name = $shadowJobName } -Action {
+        $output = Invoke-DockerCommand -Arguments @(
+            "exec", $jobManager, "/opt/flink/bin/flink", "stop",
+            "--savepointPath", "file:///workspace/tmp/savepoints/chapter-9", $shadowJobId
+        ) -FailureMessage "Shadow Stop-with-Savepoint failed."
+        $output | ForEach-Object { Write-Host $_ }
+        [pscustomobject]@{ savepoint_path = (Get-SavepointPath $output) }
+    }
+$savepointPath = [string]$stopResult.savepoint_path
 $manifest["savepoint_path"] = $savepointPath
 Write-ManifestPartial -Manifest $manifest -PartialPath $manifestPartialPath
 
 Write-Host "[cutover] starting production DataStream from Savepoint"
 # Restore contract: flink run -d -s $savepointPath.
 # Production contract: --mode production --consumer-group chapter9-quality-production --transaction-prefix chapter9-production.
-$productionOutput = Invoke-DockerCommand -Arguments @(
-    "exec", $jobManager, "/opt/flink/bin/flink", "run", "-d", "-s", $savepointPath,
-    "-c", "com.ecommerce.quality.DataQualityJob", "/tmp/datastream-quality-1.0.0.jar",
-    "--bootstrap-servers", "kafka:29092",
-    "--input-topic", "user_behavior_events",
-    "--mode", "production",
-    "--consumer-group", "chapter9-quality-production",
-    "--checkpoint-uri", "file:///workspace/tmp/checkpoints/chapter-9-production",
-    "--transaction-prefix", "chapter9-production",
-    "--job-version", "chapter-9-v1"
-) -FailureMessage "Production DataStream submission or Savepoint restore failed."
-$productionOutput | ForEach-Object { Write-Host $_ }
-$productionJobId = Get-SubmittedJobId $productionOutput
-Wait-FlinkJobRunning -JobId $productionJobId -ExpectedName $productionJobName | Out-Null
+$productionResult = Invoke-CutoverMutation -State $manifest -Path $manifestPartialPath `
+    -Stage "production_submit" -Operation "submit_production_from_savepoint" `
+    -Details @{ name = $productionJobName; savepoint_path = $savepointPath } -Action {
+        $output = Invoke-DockerCommand -Arguments @(
+            "exec", $jobManager, "/opt/flink/bin/flink", "run", "-d", "-s", $savepointPath,
+            "-c", "com.ecommerce.quality.DataQualityJob", "/tmp/datastream-quality-1.0.0.jar",
+            "--bootstrap-servers", "kafka:29092", "--input-topic", "user_behavior_events",
+            "--mode", "production", "--consumer-group", "chapter9-quality-production",
+            "--checkpoint-uri", "file:///workspace/tmp/checkpoints/chapter-9-production",
+            "--transaction-prefix", "chapter9-production", "--job-version", "chapter-9-v1"
+        ) -FailureMessage "Production DataStream submission or Savepoint restore failed."
+        $output | ForEach-Object { Write-Host $_ }
+        $id = Get-SubmittedJobId $output
+        Wait-FlinkJobRunning -JobId $id -ExpectedName $productionJobName | Out-Null
+        [pscustomobject]@{ job_id = $id }
+    }
+$productionJobId = [string]$productionResult.job_id
+Set-CutoverMutationJobId -State $manifest -Path $manifestPartialPath -Stage "production_submit" -JobId $productionJobId
 $productionCheckpoints = Wait-NewCompletedCheckpoint -JobId $productionJobId -ExpectedName $productionJobName
 $manifest["production_job_id"] = $productionJobId
 Write-ManifestPartial -Manifest $manifest -PartialPath $manifestPartialPath
 
 Write-Host "[cutover] submitting Doris clean SQL job"
-Submit-SqlJob -SqlClient $sqlClient -ContainerSqlPath "/workspace/tmp/chapter-9/doris-clean.sql" -Connectors $dorisConnectors |
-    ForEach-Object { Write-Host $_ }
-$dorisJobId = Wait-NewNamedJob -Name $dorisJobName
+$dorisResult = Invoke-CutoverMutation -State $manifest -Path $manifestPartialPath `
+    -Stage "doris_submit" -Operation "submit_doris_clean" -Details @{ name = $dorisJobName } -Action {
+        [void](Submit-SqlJob -SqlClient $sqlClient -ContainerSqlPath "/workspace/tmp/chapter-9/doris-clean.sql" -Connectors $dorisConnectors)
+        [pscustomobject]@{ job_id = (Wait-NewNamedJob -Name $dorisJobName) }
+    }
+$dorisJobId = [string]$dorisResult.job_id
+Set-CutoverMutationJobId -State $manifest -Path $manifestPartialPath -Stage "doris_submit" -JobId $dorisJobId
 Wait-FlinkJobRunning -JobId $dorisJobId -ExpectedName $dorisJobName | Out-Null
 $dorisCheckpoints = Wait-NewCompletedCheckpoint -JobId $dorisJobId -ExpectedName $dorisJobName
 $manifest["doris_job_id"] = $dorisJobId
 Write-ManifestPartial -Manifest $manifest -PartialPath $manifestPartialPath
 
 Write-Host "[cutover] submitting Iceberg clean SQL job"
-Submit-SqlJob -SqlClient $sqlClient -ContainerSqlPath "/workspace/tmp/chapter-9/iceberg-clean.sql" `
-    -Connectors $icebergConnectors -ParentClasspath $icebergParentClasspath |
-    ForEach-Object { Write-Host $_ }
-$icebergJobId = Wait-NewNamedJob -Name $icebergJobName
+$icebergResult = Invoke-CutoverMutation -State $manifest -Path $manifestPartialPath `
+    -Stage "iceberg_submit" -Operation "submit_iceberg_clean" -Details @{ name = $icebergJobName } -Action {
+        [void](Submit-SqlJob -SqlClient $sqlClient -ContainerSqlPath "/workspace/tmp/chapter-9/iceberg-clean.sql" `
+            -Connectors $icebergConnectors -ParentClasspath $icebergParentClasspath)
+        [pscustomobject]@{ job_id = (Wait-NewNamedJob -Name $icebergJobName) }
+    }
+$icebergJobId = [string]$icebergResult.job_id
+Set-CutoverMutationJobId -State $manifest -Path $manifestPartialPath -Stage "iceberg_submit" -JobId $icebergJobId
 Wait-FlinkJobRunning -JobId $icebergJobId -ExpectedName $icebergJobName | Out-Null
 $icebergCheckpoints = Wait-NewCompletedCheckpoint -JobId $icebergJobId -ExpectedName $icebergJobName
+Set-CutoverMutationIntent -State $manifest -Path $manifestPartialPath -Stage "finalization" `
+    -Operation "finalize_cutover_manifest" -Details @{ final_path = $manifestPath }
 Complete-CutoverManifest -PartialPath $manifestPartialPath -FinalPath $manifestPath `
     -ProductionJobId $productionJobId -DorisJobId $dorisJobId -IcebergJobId $icebergJobId `
     -ProductionCheckpoints $productionCheckpoints -DorisCheckpoints $dorisCheckpoints `
     -IcebergCheckpoints $icebergCheckpoints
+Set-CutoverMutationResult -State $manifest -Path $manifestPartialPath -Stage "finalization" -Status "result" `
+    -Details @{ final_path = $manifestPath }

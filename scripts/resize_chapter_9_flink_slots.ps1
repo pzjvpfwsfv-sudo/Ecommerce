@@ -15,6 +15,26 @@ function Get-WorkspaceMountSource([string]$Container) {
     return [string]$workspaceMount.Source
 }
 
+function Assert-ContainerBindMountSource {
+    param(
+        [Parameter(Mandatory = $true)][string]$Container,
+        [Parameter(Mandatory = $true)][string]$Destination,
+        [Parameter(Mandatory = $true)][string]$ExpectedSource
+    )
+
+    $inspection = @(docker inspect $Container | ConvertFrom-Json)
+    if ($LASTEXITCODE -ne 0) { throw "Docker inspect failed for $Container." }
+    $mounts = @($inspection[0].Mounts | Where-Object { $_.Destination -eq $Destination })
+    if ($mounts.Count -ne 1 -or [string]$mounts[0].Type -ne "bind") {
+        throw "Container $Container must have exactly one bind mount at $Destination."
+    }
+    $actual = [IO.Path]::GetFullPath([string]$mounts[0].Source).TrimEnd("\", "/")
+    $expected = [IO.Path]::GetFullPath($ExpectedSource).TrimEnd("\", "/")
+    if (-not [string]::Equals($actual, $expected, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "Container $Container mount source mismatch after recreate. Expected $expected, got $actual."
+    }
+}
+
 function Assert-FlinkCapacity([object]$Overview) {
     if ($Overview.taskmanagers -ne 1) {
         throw "Expected exactly one TaskManager, got $($Overview.taskmanagers)."
@@ -75,6 +95,9 @@ Write-Host "Before resize: job_id=$jobId taskmanagers=$($overviewBefore.taskmana
 docker compose --env-file $envFile -f $compose --profile flink up -d `
     --no-deps --force-recreate flink-taskmanager
 if ($LASTEXITCODE -ne 0) { throw "TaskManager resize failed." }
+
+Write-Host "[post-recreate] verifying TaskManager /workspace bind source"
+Assert-ContainerBindMountSource -Container $taskManager -Destination "/workspace" -ExpectedSource $root
 
 $overviewAfter = $null
 for ($attempt = 1; $attempt -le 60; $attempt++) {

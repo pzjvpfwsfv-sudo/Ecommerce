@@ -888,7 +888,8 @@ function Get-ProductionDorisMetrics {
 function Assert-ProductionDorisFreshness {
     param(
         [Parameter(Mandatory = $true)][object]$Metrics,
-        [Parameter(Mandatory = $true)][DateTimeOffset]$BatchStart
+        [Parameter(Mandatory = $true)][DateTimeOffset]$BatchStart,
+        [AllowNull()][object]$Baseline = $null
     )
 
     if ([int64]$Metrics.Pv -ne 2 -or [int64]$Metrics.Uv -ne 2) {
@@ -898,6 +899,16 @@ function Assert-ProductionDorisFreshness {
     $uvUpdatedAt = [DateTimeOffset]$Metrics.UvUpdatedAt
     if ($pvUpdatedAt -le $BatchStart -or $uvUpdatedAt -le $BatchStart) {
         throw "Doris updated_at must be strictly later than batch start."
+    }
+    if ($null -ne $Baseline) {
+        $baselinePvAt = [DateTimeOffset]$Baseline.pv_updated_at
+        $baselineUvAt = [DateTimeOffset]$Baseline.uv_updated_at
+        if ($pvUpdatedAt -le $baselinePvAt -or $uvUpdatedAt -le $baselineUvAt) {
+            throw "Doris updated_at must be strictly later than the durable original baseline."
+        }
+        if ($pvUpdatedAt -eq $baselinePvAt -or $uvUpdatedAt -eq $baselineUvAt) {
+            throw "Doris final evidence must not reuse a baseline timestamp."
+        }
     }
     return [pscustomobject]@{
         Pv = [int64]$Metrics.Pv
@@ -910,7 +921,8 @@ function Assert-ProductionDorisFreshness {
 function Wait-ProductionDorisMetrics {
     param(
         [Parameter(Mandatory = $true)][DateTimeOffset]$BatchStart,
-        [int]$TimeoutSeconds = 180
+        [int]$TimeoutSeconds = 180,
+        [AllowNull()][object]$Baseline = $null
     )
 
     $deadline = [DateTimeOffset]::UtcNow.AddSeconds($TimeoutSeconds)
@@ -918,7 +930,7 @@ function Wait-ProductionDorisMetrics {
     do {
         try {
             $metrics = Get-ProductionDorisMetrics
-            return Assert-ProductionDorisFreshness -Metrics $metrics -BatchStart $BatchStart
+            return Assert-ProductionDorisFreshness -Metrics $metrics -BatchStart $BatchStart -Baseline $Baseline
         } catch {
             $lastError = $_.Exception.Message
         }
@@ -960,16 +972,26 @@ function ConvertTo-ProductionSqlStringLiteral {
 function Get-ProductionTrinoBaseline {
     $sql = @"
 SELECT COUNT(*) AS event_count, COUNT(DISTINCT event_id) AS distinct_event_id
+       , MAX(event_time) AS latest_event_time
 FROM lakehouse.analytics.user_behavior_detail
 "@
     $rows = @(Invoke-ProductionTrinoStatement -Sql $sql)
-    if ($rows.Count -ne 1 -or @($rows[0]).Count -ne 2) {
+    if ($rows.Count -ne 1 -or @($rows[0]).Count -ne 3) {
         throw "Trino baseline returned a malformed result."
     }
     $row = @($rows[0])
+    $latestEventTime = $null
+    if (-not [string]::IsNullOrWhiteSpace([string]$row[2])) {
+        $latestEventTime = [DateTimeOffset]::Parse(
+            [string]$row[2],
+            [Globalization.CultureInfo]::InvariantCulture,
+            [Globalization.DateTimeStyles]::AssumeUniversal
+        )
+    }
     return [pscustomobject]@{
         EventCount = [int64]$row[0]
         DistinctEventId = [int64]$row[1]
+        LatestEventTime = $latestEventTime
     }
 }
 
@@ -1084,7 +1106,9 @@ function Assert-ProductionApiEvidence {
     param(
         [Parameter(Mandatory = $true)][object]$Response,
         [Parameter(Mandatory = $true)][DateTimeOffset]$BatchStart,
-        [Parameter(Mandatory = $true)][int64]$TrinoBaseline
+        [Parameter(Mandatory = $true)][int64]$TrinoBaseline,
+        [AllowNull()][object]$DorisFinal = $null,
+        [AllowNull()][object]$TrinoFinal = $null
     )
 
     if ([string]::IsNullOrWhiteSpace([string]$Response.generated_at)) {
@@ -1118,9 +1142,26 @@ function Assert-ProductionApiEvidence {
     if ($realtimeUpdatedAt -le $BatchStart) {
         throw "API realtime updated_at must be later than batch start."
     }
+    if ($null -ne $DorisFinal) {
+        if ([int64]$Response.evidence.realtime.pv -ne [int64]$DorisFinal.Pv -or
+            [int64]$Response.evidence.realtime.uv -ne [int64]$DorisFinal.Uv) {
+            throw "API realtime pv/uv must exactly match the direct Doris final evidence."
+        }
+        $dorisUpdatedAt = [DateTimeOffset]$DorisFinal.PvUpdatedAt
+        if ($dorisUpdatedAt -ne [DateTimeOffset]$DorisFinal.UvUpdatedAt) {
+            throw "Direct Doris pv and uv final timestamps must agree before API comparison."
+        }
+        if ($realtimeUpdatedAt -ne $dorisUpdatedAt) {
+            throw "API realtime updated_at must exactly match the direct Doris final timestamp."
+        }
+    }
     if ($null -eq $Response.evidence.historical -or
         [int64]$Response.evidence.historical.event_count -lt ($TrinoBaseline + 2)) {
         throw "API historical event_count is below Trino baseline plus two."
+    }
+    if ($null -ne $TrinoFinal -and
+        [int64]$Response.evidence.historical.event_count -ne [int64]$TrinoFinal.Total) {
+        throw "API historical event_count must exactly match the direct Trino final total."
     }
     $historicalLatestEventTime = $null
     if ($Response.evidence.historical.PSObject.Properties.Name -contains "latest_event_time" -and
@@ -1128,6 +1169,10 @@ function Assert-ProductionApiEvidence {
         $historicalLatestEventTime = [DateTimeOffset]::Parse(
             [string]$Response.evidence.historical.latest_event_time
         )
+    }
+    if ($null -ne $historicalLatestEventTime -and $null -ne $TrinoFinal.LatestEventTime -and
+        $historicalLatestEventTime -ne [DateTimeOffset]$TrinoFinal.LatestEventTime) {
+        throw "API historical latest_event_time must exactly match the direct Trino final latest event time."
     }
     return [pscustomobject]@{
         GeneratedAt = $generatedAt
@@ -1145,6 +1190,8 @@ function Wait-ProductionApiEvidence {
     param(
         [Parameter(Mandatory = $true)][DateTimeOffset]$BatchStart,
         [Parameter(Mandatory = $true)][int64]$TrinoBaseline,
+        [AllowNull()][object]$DorisFinal = $null,
+        [AllowNull()][object]$TrinoFinal = $null,
         [int]$TimeoutSeconds = 180
     )
 
@@ -1156,7 +1203,8 @@ function Wait-ProductionApiEvidence {
             $response = Invoke-RestMethod -Method Post -Uri "http://localhost:8000/analysis/realtime" `
                 -ContentType "application/json" -Body $body -TimeoutSec 20
             $evidence = Assert-ProductionApiEvidence -Response $response `
-                -BatchStart $BatchStart -TrinoBaseline $TrinoBaseline
+                -BatchStart $BatchStart -TrinoBaseline $TrinoBaseline `
+                -DorisFinal $DorisFinal -TrinoFinal $TrinoFinal
             return [pscustomobject]@{ Response = $response; Evidence = $evidence }
         } catch {
             $lastError = $_.Exception.Message
@@ -1182,6 +1230,184 @@ function Write-ProductionJsonAtomic {
         (New-Object System.Text.UTF8Encoding($false))
     )
     Move-Item -LiteralPath $PartialPath -Destination $Path -Force
+}
+
+function Write-ProductionCausalBaseline {
+    param(
+        [Parameter(Mandatory = $true)][object]$RunState,
+        [Parameter(Mandatory = $true)][object]$Baseline
+    )
+
+    if ($null -eq $RunState.RunPaths.BaselinePath) {
+        throw "Production run has no durable causal baseline path."
+    }
+    $record = [ordered]@{
+        schema_version = 1
+        proof_source = "durable_run_baseline"
+        run_id = [string]$RunState.RunId
+        persisted_at_utc = [DateTimeOffset]::UtcNow.ToString("o")
+        baseline = $Baseline
+    }
+    Write-ProductionJsonAtomic -Value $record -Path $RunState.RunPaths.BaselinePath `
+        -PartialPath $RunState.RunPaths.BaselinePartialPath
+    if ($RunState.PSObject.Properties.Name -notcontains "CausalBaseline") {
+        $RunState | Add-Member -NotePropertyName CausalBaseline -NotePropertyValue $record
+    } else {
+        $RunState.CausalBaseline = $record
+    }
+    Write-ProductionInProgressState -RunState $RunState
+}
+
+function Get-ProductionCausalBaseline {
+    param([Parameter(Mandatory = $true)][object]$RunState)
+
+    $path = [string]$RunState.RunPaths.BaselinePath
+    if ([string]::IsNullOrWhiteSpace($path) -or -not (Test-Path -LiteralPath $path -PathType Leaf)) {
+        throw "Durable original causal baseline is missing."
+    }
+    try { $record = Get-Content -Raw -LiteralPath $path | ConvertFrom-Json } catch {
+        throw "Durable original causal baseline is unreadable."
+    }
+    if ([string]$record.proof_source -ne "durable_run_baseline" -or
+        [string]$record.run_id -ne [string]$RunState.RunId -or $null -eq $record.baseline) {
+        throw "Durable causal baseline identity/schema is invalid."
+    }
+    $record | Add-Member -NotePropertyName Source -NotePropertyValue "durable_run_baseline"
+    return $record
+}
+
+function Get-ProductionResumeCausalBaseline {
+    param(
+        [Parameter(Mandatory = $true)][object]$SourceFailedEvidence,
+        [Parameter(Mandatory = $true)][string]$RunId
+    )
+
+    $record = $SourceFailedEvidence.causal_baseline
+    if ($null -eq $record -or [string]$record.proof_source -ne "durable_run_baseline" -or
+        [string]$record.run_id -ne $RunId -or $null -eq $record.baseline) {
+        throw "Resume requires the original durable causal baseline; current values cannot reconstruct it."
+    }
+    return $record
+}
+
+function ConvertFrom-ProductionDurableDorisBaseline([object]$Baseline) {
+    if ($null -eq $Baseline -or $null -eq $Baseline.pv_updated_at -or $null -eq $Baseline.uv_updated_at) {
+        throw "Durable Doris baseline is incomplete."
+    }
+    return [pscustomobject]@{
+        Pv = [int64]$Baseline.pv
+        Uv = [int64]$Baseline.uv
+        PvUpdatedAt = [DateTimeOffset]$Baseline.pv_updated_at
+        UvUpdatedAt = [DateTimeOffset]$Baseline.uv_updated_at
+    }
+}
+
+function ConvertFrom-ProductionDurableCheckpointBaseline([object]$Baseline) {
+    if ($null -eq $Baseline -or $null -eq $Baseline.completed) {
+        throw "Durable checkpoint baseline is incomplete."
+    }
+    return [pscustomobject]@{
+        Completed = [int64]$Baseline.completed
+        LatestId = [string]$Baseline.latest_id
+        LatestStatus = [string]$Baseline.latest_status
+    }
+}
+
+function Get-ProductionResumeStageEvidence {
+    param([Parameter(Mandatory = $true)][object]$SourceFailedEvidence)
+
+    $record = $SourceFailedEvidence.stage_evidence
+    if ($null -eq $record -or [string]$record.proof_source -ne "durable_stage_evidence" -or
+        $null -eq $record.stages) {
+        throw "Resume requires complete durable prior stage evidence."
+    }
+    foreach ($stage in @("output", "groups", "checkpoints", "doris_final", "trino_final", "pre_api")) {
+        if ($null -eq $record.stages.$stage -or $null -eq $record.stages.$stage.evidence) {
+            throw "Resume prior stage evidence is missing: $stage"
+        }
+    }
+    return $record
+}
+
+function Assert-ProductionDorisMatchesDurableFinal {
+    param(
+        [Parameter(Mandatory = $true)][object]$Current,
+        [Parameter(Mandatory = $true)][object]$PriorFinal
+    )
+
+    if ([int64]$Current.Pv -ne [int64]$PriorFinal.Pv -or
+        [int64]$Current.Uv -ne [int64]$PriorFinal.Uv -or
+        [DateTimeOffset]$Current.PvUpdatedAt -ne [DateTimeOffset]$PriorFinal.PvUpdatedAt -or
+        [DateTimeOffset]$Current.UvUpdatedAt -ne [DateTimeOffset]$PriorFinal.UvUpdatedAt) {
+        throw "Current Doris final evidence does not exactly match the durable prior final evidence."
+    }
+    return $Current
+}
+
+function Write-ProductionStageEvidence {
+    param(
+        [Parameter(Mandatory = $true)][object]$RunState,
+        [Parameter(Mandatory = $true)][string]$Stage,
+        [Parameter(Mandatory = $true)][object]$Evidence
+    )
+
+    if ([string]::IsNullOrWhiteSpace([string]$RunState.RunPaths.StageEvidencePath)) {
+        throw "Production run has no durable stage evidence path."
+    }
+    $record = [ordered]@{
+        schema_version = 1
+        proof_source = "durable_stage_evidence"
+        run_id = [string]$RunState.RunId
+        stages = [ordered]@{}
+    }
+    if (Test-Path -LiteralPath $RunState.RunPaths.StageEvidencePath -PathType Leaf) {
+        $record = Get-Content -Raw -LiteralPath $RunState.RunPaths.StageEvidencePath | ConvertFrom-Json
+        if ([string]$record.run_id -ne [string]$RunState.RunId) {
+            throw "Durable stage evidence belongs to another run."
+        }
+    }
+    if ($record.PSObject.Properties.Name -notcontains "stages") {
+        $record | Add-Member -NotePropertyName stages -NotePropertyValue ([ordered]@{})
+    }
+    $stageRecord = [ordered]@{
+        completed_at_utc = [DateTimeOffset]::UtcNow.ToString("o")
+        evidence = $Evidence
+    }
+    if ($record -is [System.Collections.IDictionary]) {
+        if ($record["stages"] -is [System.Collections.IDictionary]) {
+            $record["stages"][$Stage] = $stageRecord
+        } else {
+            Add-Member -InputObject $record["stages"] -Force -NotePropertyName $Stage -NotePropertyValue $stageRecord
+        }
+    } elseif ($record.stages -is [System.Collections.IDictionary]) {
+        $record.stages[$Stage] = $stageRecord
+    } elseif ($record.stages.PSObject.Properties.Name -contains $Stage) {
+        $record.stages.$Stage = $stageRecord
+    } else {
+        Add-Member -InputObject $record.stages -Force -NotePropertyName $Stage -NotePropertyValue $stageRecord
+    }
+    Write-ProductionJsonAtomic -Value $record -Path $RunState.RunPaths.StageEvidencePath `
+        -PartialPath $RunState.RunPaths.StageEvidencePartialPath
+    if ($RunState.PSObject.Properties.Name -notcontains "StageEvidence") {
+        $RunState | Add-Member -NotePropertyName StageEvidence -NotePropertyValue $record
+    } else {
+        $RunState.StageEvidence = $record
+    }
+}
+
+function Get-ProductionStageEvidence {
+    param([Parameter(Mandatory = $true)][object]$RunState)
+
+    $path = [string]$RunState.RunPaths.StageEvidencePath
+    if ([string]::IsNullOrWhiteSpace($path) -or -not (Test-Path -LiteralPath $path -PathType Leaf)) {
+        throw "Durable stage evidence is missing."
+    }
+    $record = Get-Content -Raw -LiteralPath $path | ConvertFrom-Json
+    if ([string]$record.proof_source -ne "durable_stage_evidence" -or
+        [string]$record.run_id -ne [string]$RunState.RunId -or $null -eq $record.stages) {
+        throw "Durable stage evidence identity/schema is invalid."
+    }
+    return $record.stages
 }
 
 function Enter-ProductionRunLock {
@@ -1232,6 +1458,10 @@ function Initialize-ProductionEvidenceRun {
         InProgressPath = "$prefix.in-progress.json"
         FailedPath = "$prefix.failed.json"
         StatePartialPath = "$prefix.state.partial"
+        BaselinePath = "$prefix.baseline.json"
+        BaselinePartialPath = "$prefix.baseline.partial"
+        StageEvidencePath = "$prefix.stage-evidence.json"
+        StageEvidencePartialPath = "$prefix.stage-evidence.partial"
     }
     Write-ProductionJsonAtomic -Value ([ordered]@{
         status = "in_progress"
@@ -1240,6 +1470,8 @@ function Initialize-ProductionEvidenceRun {
         events_sent = $false
         initial_sent = $false
         late_sent = $false
+        baseline_path = ([string]$paths.BaselinePath).Replace('\', '/')
+        stage_evidence_path = ([string]$paths.StageEvidencePath).Replace('\', '/')
         started_at_utc = [DateTimeOffset]::UtcNow.ToString("o")
     }) -Path $paths.InProgressPath -PartialPath $paths.StatePartialPath
     return $paths
@@ -1350,6 +1582,10 @@ function Initialize-ProductionResumeEvidenceRun {
         InProgressPath = "$prefix.in-progress.json"
         FailedPath = "$prefix.failed.json"
         StatePartialPath = "$prefix.state.partial"
+        BaselinePath = "$prefix.baseline.json"
+        BaselinePartialPath = "$prefix.baseline.partial"
+        StageEvidencePath = "$prefix.stage-evidence.json"
+        StageEvidencePartialPath = "$prefix.stage-evidence.partial"
         SourceFailedPath = $SourceFailedPath
         ResumeChainPaths = @($ResumeChainPaths)
         ResumeAttemptId = $attemptId
@@ -1358,12 +1594,14 @@ function Initialize-ProductionResumeEvidenceRun {
         status = "resume_in_progress"
         run_id = $RunId
         logical_run_resumed = $true
-        source_failed_evidence = $SourceFailedPath
-        resume_chain = @($ResumeChainPaths)
+        source_failed_evidence = ([string]$SourceFailedPath).Replace('\', '/')
+        resume_chain = @($ResumeChainPaths | ForEach-Object { ([string]$_).Replace('\', '/') })
         doris_job_id = $DorisJobId
         events_sent = $true
         initial_sent = $true
         late_sent = $false
+        baseline_path = ([string]$paths.BaselinePath).Replace('\', '/')
+        stage_evidence_path = ([string]$paths.StageEvidencePath).Replace('\', '/')
         started_at_utc = [DateTimeOffset]::UtcNow.ToString("o")
     }) -Path $paths.InProgressPath -PartialPath $paths.StatePartialPath
     return $paths
@@ -1379,13 +1617,21 @@ function Write-ProductionInProgressState {
         events_sent = ([bool]$RunState.InitialSent -or [bool]$RunState.LateSent)
         initial_sent = [bool]$RunState.InitialSent
         late_sent = [bool]$RunState.LateSent
+        baseline_path = ([string]$RunState.RunPaths.BaselinePath).Replace('\', '/')
+        stage_evidence_path = ([string]$RunState.RunPaths.StageEvidencePath).Replace('\', '/')
         updated_at_utc = [DateTimeOffset]::UtcNow.ToString("o")
+    }
+    if ($RunState.PSObject.Properties.Name -contains "CausalBaseline" -and $null -ne $RunState.CausalBaseline) {
+        $state.causal_baseline = $RunState.CausalBaseline
+    }
+    if ($RunState.PSObject.Properties.Name -contains "StageEvidence" -and $null -ne $RunState.StageEvidence) {
+        $state.stage_evidence = $RunState.StageEvidence
     }
     if ([bool]$RunState.LogicalRunResumed) {
         $state.status = "resume_in_progress"
         $state.logical_run_resumed = $true
-        $state.source_failed_evidence = [string]$RunState.SourceFailedEvidence
-        $state.resume_chain = @($RunState.ResumeChain)
+        $state.source_failed_evidence = ([string]$RunState.SourceFailedEvidence).Replace('\', '/')
+        $state.resume_chain = @($RunState.ResumeChain | ForEach-Object { ([string]$_).Replace('\', '/') })
         $state.resume_action = [string]$RunState.ResumeAction
     }
     Write-ProductionJsonAtomic -Value $state -Path $RunState.RunPaths.InProgressPath `
@@ -1459,6 +1705,19 @@ function Write-ProductionRunFailure {
         [AllowNull()][string]$DorisJobId
     )
 
+    $durableState = $null
+    if (Test-Path -LiteralPath $RunPaths.InProgressPath -PathType Leaf) {
+        try { $durableState = Get-Content -Raw -LiteralPath $RunPaths.InProgressPath | ConvertFrom-Json } catch {}
+    }
+    $causalBaseline = $null
+    if ($null -ne $durableState -and $durableState.causal_baseline) { $causalBaseline = $durableState.causal_baseline }
+    if ($null -eq $causalBaseline -and $RunPaths.BaselinePath -and (Test-Path -LiteralPath $RunPaths.BaselinePath -PathType Leaf)) {
+        try { $causalBaseline = Get-Content -Raw -LiteralPath $RunPaths.BaselinePath | ConvertFrom-Json } catch {}
+    }
+    $stageEvidence = $null
+    if ($RunPaths.StageEvidencePath -and (Test-Path -LiteralPath $RunPaths.StageEvidencePath -PathType Leaf)) {
+        try { $stageEvidence = Get-Content -Raw -LiteralPath $RunPaths.StageEvidencePath | ConvertFrom-Json } catch {}
+    }
     Remove-Item -LiteralPath $RunPaths.InProgressPath -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $RunPaths.PartialPath -Force -ErrorAction SilentlyContinue
     Write-ProductionJsonAtomic -Value ([ordered]@{
@@ -1468,6 +1727,10 @@ function Write-ProductionRunFailure {
         events_sent = $EventsSent
         failed_at_utc = [DateTimeOffset]::UtcNow.ToString("o")
         error = $ErrorMessage
+        proof_source = "durable_run_baseline_and_stage_evidence"
+        causal_baseline = $causalBaseline
+        stage_evidence = $stageEvidence
+        stage_evidence_path = ([string]$RunPaths.StageEvidencePath).Replace('\', '/')
     }) -Path $RunPaths.FailedPath -PartialPath $RunPaths.StatePartialPath
 }
 
@@ -1542,11 +1805,72 @@ try {
     $initialFlink = Wait-ProductionJobsAndCapacity -Manifest $manifest -TimeoutSeconds $TimeoutSeconds
     $expectedJobs = @(Get-ProductionExpectedJobs -Manifest $manifest)
     $checkpointBaselines = [ordered]@{}
-    foreach ($expected in $expectedJobs) {
-        $checkpointBaselines[$expected.Key] = Get-ProductionCheckpointEvidence `
-            -JobId $expected.Id -ExpectedName $expected.Name
+    $causalBaseline = $null
+    $batchStart = $null
+    $resumeStageEvidence = $null
+    if ($logicalRunResumed) {
+        $resumeStageEvidence = Get-ProductionResumeStageEvidence `
+            -SourceFailedEvidence $resumeAuthorization.SourceFailedEvidence
+        $resumeCausal = Get-ProductionResumeCausalBaseline `
+            -SourceFailedEvidence $resumeAuthorization.SourceFailedEvidence -RunId $runId
+        $causalBaseline = $resumeCausal.baseline
+        $batchStart = [DateTimeOffset]::Parse([string]$causalBaseline.batch_start_utc)
+        foreach ($expected in $expectedJobs) {
+            $checkpointBaselines[$expected.Key] = ConvertFrom-ProductionDurableCheckpointBaseline `
+                -Baseline $causalBaseline.checkpoints.($expected.Key)
+        }
+        $dorisBaseline = ConvertFrom-ProductionDurableDorisBaseline -Baseline $causalBaseline.doris
+        $trinoBaseline = [pscustomobject]@{
+            EventCount = [int64]$causalBaseline.trino.event_count
+            DistinctEventId = [int64]$causalBaseline.trino.distinct_event_id
+            LatestEventTime = if ($causalBaseline.trino.latest_event_time) {
+                [DateTimeOffset]$causalBaseline.trino.latest_event_time
+            } else { $null }
+            SampleType = "durable_run_baseline"
+            Basis = "same logical run durable initial baseline"
+        }
+        Write-ProductionCausalBaseline -RunState $runState -Baseline $causalBaseline
+    } else {
+        $batchStart = [DateTimeOffset]::UtcNow
+        foreach ($expected in $expectedJobs) {
+            $checkpointBaselines[$expected.Key] = Get-ProductionCheckpointEvidence `
+                -JobId $expected.Id -ExpectedName $expected.Name
+        }
+        $dorisBaseline = Get-ProductionDorisMetrics
+        $trinoBaseline = Get-ProductionTrinoBaseline
+        $causalBaseline = [ordered]@{
+            batch_start_utc = $batchStart.ToString("o")
+            doris = [ordered]@{
+                pv = $dorisBaseline.Pv
+                uv = $dorisBaseline.Uv
+                pv_updated_at = $dorisBaseline.PvUpdatedAt.ToString("o")
+                uv_updated_at = $dorisBaseline.UvUpdatedAt.ToString("o")
+            }
+            trino = [ordered]@{
+                event_count = $trinoBaseline.EventCount
+                distinct_event_id = $trinoBaseline.DistinctEventId
+                latest_event_time = if ($trinoBaseline.LatestEventTime) {
+                    $trinoBaseline.LatestEventTime.ToString("o")
+                } else { $null }
+            }
+            checkpoints = [ordered]@{}
+        }
+        foreach ($expected in $expectedJobs) {
+            $checkpoint = $checkpointBaselines[$expected.Key]
+            $causalBaseline.checkpoints[$expected.Key] = [ordered]@{
+                completed = $checkpoint.Completed
+                latest_id = $checkpoint.LatestId
+                latest_status = $checkpoint.LatestStatus
+            }
+        }
+        Write-ProductionCausalBaseline -RunState $runState -Baseline $causalBaseline
+        Write-ProductionStageEvidence -RunState $runState -Stage "initial_baseline" -Evidence @{
+            batch_start_utc = $batchStart.ToString("o")
+            checkpoint_baselines = $causalBaseline.checkpoints
+            doris_baseline = $causalBaseline.doris
+            trino_baseline = $causalBaseline.trino
+        }
     }
-    $dorisBaseline = Get-ProductionDorisMetrics
     $eventIds = [ordered]@{
         duplicate = "$runId-duplicate"
         malformed = "$runId-malformed"
@@ -1559,7 +1883,9 @@ try {
     if ($logicalRunResumed) {
         $resumeState = Get-ProductionResumeTopicState -RunId $runId
         Set-ProductionResumeRunState -RunState $runState -ResumeState $resumeState
-        $batchStart = $resumeState.BatchStart
+        if ([DateTimeOffset]$resumeState.BatchStart -ne $batchStart) {
+            throw "Resume topic reconstruction does not match the durable original batch start."
+        }
         $lateEventTime = $resumeState.LateEventTime
         $late = $resumeState.LateJson
         $failedAt = [DateTimeOffset]::Parse(
@@ -1568,7 +1894,6 @@ try {
         if ($failedAt -le $batchStart) {
             throw "Resume failed evidence timestamp does not follow reconstructed batch start."
         }
-        $trinoCurrent = Get-ProductionTrinoBaseline
         $resumeTrinoPre = Get-ProductionTrinoRunEvidence `
             -CleanEventIds @($eventIds.duplicate, $eventIds.advancer) `
             -ExcludedEventIds @(
@@ -1581,15 +1906,8 @@ try {
             $resumeTrinoPre.DuplicateEventCount -ne 1) {
             throw "Resume Trino preflight does not prove the exact existing two clean rows."
         }
-        $trinoBaseline = Get-ProductionRecoveredTrinoBaseline `
-            -CurrentEventCount $trinoCurrent.EventCount `
-            -CurrentDistinctEventId $trinoCurrent.DistinctEventId `
-            -RunEventCount $resumeTrinoPre.EventCount `
-            -RunDistinctEventId $resumeTrinoPre.DistinctEventId
         Write-Host "[chapter9-production-verify] resuming logical run $runId; action=$($resumeState.ResumeAction)"
     } else {
-        $trinoBaseline = Get-ProductionTrinoBaseline
-        $batchStart = [DateTimeOffset]::UtcNow
         $now = [DateTimeOffset]::UtcNow
         $userOne = "$runId-user-1"
         $userTwo = "$runId-user-2"
@@ -1646,6 +1964,13 @@ try {
     }
 
     $output = Wait-ProductionOutputMatrix -RunId $runId -TimeoutSeconds $TimeoutSeconds
+    Write-ProductionStageEvidence -RunState $runState -Stage "output" -Evidence @{
+        matrix = $output.Matrix
+        raw = $output.Matrix.Raw
+        clean = $output.CleanRecords
+        dlq = $output.DlqRecords
+        late = $output.LateRecords
+    }
     $rawPartitions = @($manifest.raw_offsets | ForEach-Object {
         if ($_ -notmatch "^partition:(\d+),offset:\d+$") {
             throw "Invalid raw offset in cutover manifest: $_"
@@ -1662,6 +1987,7 @@ try {
         $groups[$spec.Key] = Wait-ProductionKafkaGroupReadableLagZero -Group $spec.Group `
             -Topic $spec.Topic -ExpectedPartitions $rawPartitions -TimeoutSeconds $TimeoutSeconds
     }
+    Write-ProductionStageEvidence -RunState $runState -Stage "groups" -Evidence $groups
 
     $checkpointFinals = [ordered]@{ production = $productionFinalCheckpoint }
     foreach ($expected in @($expectedJobs | Where-Object { $_.Key -ne "production" })) {
@@ -1669,9 +1995,15 @@ try {
             -ExpectedName $expected.Name -Baseline $checkpointBaselines[$expected.Key].Completed `
             -TimeoutSeconds $TimeoutSeconds
     }
+    Write-ProductionStageEvidence -RunState $runState -Stage "checkpoints" -Evidence $checkpointFinals
     $finalFlink = Wait-ProductionJobsAndCapacity -Manifest $manifest -TimeoutSeconds $TimeoutSeconds
     $dorisFinal = Wait-ProductionDorisMetrics -BatchStart $batchStart `
-        -TimeoutSeconds $TimeoutSeconds
+        -Baseline $dorisBaseline -TimeoutSeconds $TimeoutSeconds
+    if ($logicalRunResumed -and $resumeState.ResumeAction -eq "read_only_finalize") {
+        Assert-ProductionDorisMatchesDurableFinal -Current $dorisFinal `
+            -PriorFinal $resumeStageEvidence.stages.doris_final.evidence | Out-Null
+    }
+    Write-ProductionStageEvidence -RunState $runState -Stage "doris_final" -Evidence $dorisFinal
     $cleanEventIds = @($eventIds.duplicate, $eventIds.advancer)
     $excludedEventIds = @(
         $eventIds.malformed,
@@ -1684,8 +2016,26 @@ try {
         -ExcludedEventIds $excludedEventIds -DuplicateEventId $eventIds.duplicate `
         -BaselineEventCount $trinoBaseline.EventCount `
         -TimeoutSeconds $TimeoutSeconds
-    $apiFinal = Wait-ProductionApiEvidence -BatchStart $batchStart `
-        -TrinoBaseline $trinoBaseline.EventCount -TimeoutSeconds $TimeoutSeconds
+    Write-ProductionStageEvidence -RunState $runState -Stage "trino_final" -Evidence $trinoFinal
+    Write-ProductionStageEvidence -RunState $runState -Stage "pre_api" -Evidence ([ordered]@{
+        output = $output.Matrix
+        groups = $groups
+        checkpoints = $checkpointFinals
+        doris_final = $dorisFinal
+        trino_final = $trinoFinal
+    })
+    try {
+        $apiFinal = Wait-ProductionApiEvidence -BatchStart $batchStart `
+            -TrinoBaseline $trinoBaseline.EventCount -DorisFinal $dorisFinal `
+            -TrinoFinal $trinoFinal -TimeoutSeconds $TimeoutSeconds
+    } catch {
+        Write-ProductionStageEvidence -RunState $runState -Stage "api_gate" -Evidence ([ordered]@{
+            status = "failed"
+            error = $_.Exception.Message
+        })
+        throw
+    }
+    Write-ProductionStageEvidence -RunState $runState -Stage "api_final" -Evidence $apiFinal.Evidence
 
     $jobEvidence = [ordered]@{}
     foreach ($expected in $expectedJobs) {
@@ -1732,16 +2082,33 @@ try {
         run_id = $runId
         logical_run_resumed = $logicalRunResumed
         source_failed_evidence = if ($logicalRunResumed) {
-            [string]$resumeAuthorization.SourceFailedPath
+            ([string]$resumeAuthorization.SourceFailedPath).Replace('\', '/')
         } else { $null }
         resume_chain = if ($logicalRunResumed) {
-            @($resumeAuthorization.ResumeChain)
+            @($resumeAuthorization.ResumeChain | ForEach-Object {
+                if ($_.PSObject.Properties.Name -contains "path") {
+                    [ordered]@{
+                        path = ([string]$_.path).Replace('\', '/')
+                        failed_at_utc = $_.failed_at_utc
+                        error = $_.error
+                        events_sent = $_.events_sent
+                        doris_job_id = $_.doris_job_id
+                    }
+                } else { $_ }
+            })
         } else { @() }
         doris_job_id = [string]$manifest.doris_job_id
         events_sent = $true
         cutover_id = [string]$manifest.cutover_id
         batch_start_utc = $batchStart.ToString("o")
         verified_at_utc = [DateTimeOffset]::UtcNow.ToString("o")
+        proof = [ordered]@{
+            causal_baseline_source = "durable_run_baseline"
+            causal_baseline_path = ([string]$runPaths.BaselinePath).Replace('\', '/')
+            stage_evidence_source = "durable_stage_evidence"
+            stage_evidence_path = ([string]$runPaths.StageEvidencePath).Replace('\', '/')
+            pre_api_stage = "output/groups/checkpoints/doris_final/trino_final"
+        }
         event_ids = $eventIds
         counts = [ordered]@{
             raw = $output.Matrix.Raw
@@ -1839,6 +2206,9 @@ try {
         trino = [ordered]@{
             baseline = $trinoBaseline
             total_final = $trinoFinal.Total
+            latest_event_time_final = if ($trinoFinal.Total.LatestEventTime) {
+                $trinoFinal.Total.LatestEventTime.ToString("o")
+            } else { $null }
             exact_clean_ids = $cleanEventIds
             exact_counts = $trinoFinal.Run
             excluded_validation_and_late_ids = $excludedEventIds

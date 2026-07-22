@@ -61,10 +61,15 @@ class Chapter9PhaseBArtifactsTest(unittest.TestCase):
             "chapter9-doris-raw-rollback",
             "chapter9-iceberg-raw-rollback",
             "--savepointPath",
+            "[switch]$Resume",
+            "rollback-progress.json",
+            "Invoke-RollbackMutation",
+            "finalization",
         ):
             self.assertIn(marker, text)
         for forbidden in ("kafka-topics --delete", "docker compose down", "DROP TABLE", "Remove-Item"):
             self.assertNotIn(forbidden, text)
+        self.assertLess(text.index("if ($DryRun) {"), text.index("$rollbackProgress = $null"))
 
     def test_rollback_waiters_fail_closed_and_preserve_savepoint_evidence(self):
         command = r'''
@@ -384,8 +389,8 @@ try {
         self.assertIn("Assert-ResumeManifest", resume_block)
         self.assertIn("iceberg-clean.sql", resume_block)
         self.assertNotIn('"stop"', resume_block)
-        self.assertNotIn("--mode", resume_block)
-        self.assertNotIn("doris-clean.sql", resume_block)
+        self.assertIn("--mode", resume_block)
+        self.assertIn("doris-clean.sql", resume_block)
 
         command = r'''
 $ErrorActionPreference = "Stop"
@@ -837,8 +842,202 @@ try {
         self.assertEqual(0, result.returncode, result.stderr or result.stdout)
         payload = json.loads(result.stdout.strip().splitlines()[-1])
         self.assertTrue(payload["terminal_rejected"])
-        self.assertEqual(1, payload["job_calls"])
-        self.assertEqual(0, payload["checkpoint_calls"])
+
+    def test_cutover_recovery_state_records_intent_and_result_and_fails_closed_on_adoption(self):
+        command = r'''
+$ErrorActionPreference = "Stop"
+. (Resolve-Path "scripts/run_chapter_9_production_cutover.ps1") -FunctionsOnly
+$root = Join-Path ([IO.Path]::GetTempPath()) ("chapter9-cutover-state-" + [guid]::NewGuid())
+New-Item -ItemType Directory -Path $root | Out-Null
+try {
+    $path = Join-Path $root "cutover-manifest.json.partial"
+    $state = New-CutoverRecoveryState -CutoverId "cutover-1" -Path $path
+    $script:mutationCalls = 0
+    $crashRejected = $false
+    try {
+        Invoke-CutoverMutation -State $state -Path $path -Stage "production_submit" `
+            -Operation "submit_production" -Details @{ name = "chapter-9-datastream-quality-production" } `
+            -Action { $script:mutationCalls++; throw "simulated REST output loss" } | Out-Null
+    } catch { $crashRejected = $true }
+    $crashed = Get-Content -Raw $path | ConvertFrom-Json
+    $crashedStatus = $crashed.mutations.production_submit.status
+    $crashedIntentExists = ($null -ne $crashed.mutations.production_submit.intent)
+    $ambiguousState = Get-Content -Raw $path | ConvertFrom-Json
+    $jobs = [pscustomobject]@{ jobs = @(
+        [pscustomobject]@{ jid = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"; name = "chapter-9-datastream-quality-production"; state = "RUNNING" }
+    ) }
+    $adopted = Resolve-CutoverJobReference -State $crashed -Stage "production_submit" `
+        -ExpectedName "chapter-9-datastream-quality-production" -Jobs $jobs -Path $path
+    $adoptedState = Get-Content -Raw $path | ConvertFrom-Json
+    $noIntentRejected = $false
+    try {
+        Resolve-CutoverJobReference -State $adoptedState -Stage "doris_submit" `
+            -ExpectedName "chapter-9-doris-clean" -Jobs $jobs -Path $path | Out-Null
+    } catch { $noIntentRejected = $true }
+    $ambiguousRejected = $false
+    try {
+        Resolve-CutoverJobReference -State $ambiguousState -Stage "production_submit" `
+            -ExpectedName "chapter-9-datastream-quality-production" -Jobs ([pscustomobject]@{ jobs = @(
+                [pscustomobject]@{ jid = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"; name = "chapter-9-datastream-quality-production"; state = "RUNNING" },
+                [pscustomobject]@{ jid = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"; name = "chapter-9-datastream-quality-production"; state = "RUNNING" }
+            ) }) -Path $path | Out-Null
+    } catch { $ambiguousRejected = $true }
+    [ordered]@{
+        crash_rejected = $crashRejected
+        mutation_calls = $script:mutationCalls
+        intent_status = $crashedStatus
+        intent_exists = $crashedIntentExists
+        intent_operation = "submit_production"
+        result_status = "failed"
+        adopted_id = $adopted
+        adopted_persisted = $adoptedState.mutations.production_submit.result.job_id
+        no_intent_rejected = $noIntentRejected
+        ambiguous_rejected = $ambiguousRejected
+    } | ConvertTo-Json -Compress
+} finally { Remove-Item -LiteralPath $root -Recurse -Force }
+'''
+        result = self._run_powershell(command)
+        self.assertEqual(0, result.returncode, result.stderr or result.stdout)
+        payload = json.loads(result.stdout.strip().splitlines()[-1])
+        self.assertTrue(payload["crash_rejected"])
+        self.assertEqual(1, payload["mutation_calls"])
+        self.assertEqual("failed", payload["intent_status"])
+        self.assertTrue(payload["intent_exists"])
+        self.assertEqual("submit_production", payload["intent_operation"])
+        self.assertEqual("failed", payload["result_status"])
+        self.assertEqual("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", payload["adopted_id"], result.stdout)
+        self.assertEqual("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", payload["adopted_persisted"])
+        self.assertTrue(payload["no_intent_rejected"])
+        self.assertTrue(payload["ambiguous_rejected"])
+
+    def test_rollback_progress_reconciles_mutation_windows_and_persists_ids(self):
+        command = r'''
+$ErrorActionPreference = "Stop"
+. (Resolve-Path "scripts/rollback_chapter_9_production.ps1") -FunctionsOnly
+$root = Join-Path ([IO.Path]::GetTempPath()) ("chapter9-rollback-progress-" + [guid]::NewGuid())
+New-Item -ItemType Directory -Path $root | Out-Null
+try {
+    $path = Join-Path $root "rollback-progress.json"
+    $progress = New-RollbackProgress -Path $path -ManifestIds @{ production = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"; doris = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"; iceberg = "cccccccccccccccccccccccccccccccc" }
+    $failed = $false
+    try {
+        Invoke-RollbackMutation -Progress $progress -Path $path -Stage "production_stop" `
+            -Operation "stop_with_savepoint" -Details @{ job_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" } `
+            -Action { throw "crash after stop" } | Out-Null
+    } catch { $failed = $true }
+    $afterStop = Get-Content -Raw $path | ConvertFrom-Json
+    $afterStop.stages.doris_cancel.intent = [pscustomobject]@{ operation = "cancel" }
+    $afterStop.stages.iceberg_cancel.intent = [pscustomobject]@{ operation = "cancel" }
+    $running = [pscustomobject]@{ jid = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"; name = "chapter-9-datastream-quality-production"; state = "RUNNING" }
+    $runningPlan = Get-RollbackResumePlan -Progress $afterStop -Stage "production_stop" -Job $running
+    $canceledPlan = Get-RollbackResumePlan -Progress $afterStop -Stage "doris_cancel" `
+        -Job ([pscustomobject]@{ jid = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"; name = "chapter-9-doris-clean"; state = "CANCELED" })
+    $terminalRejected = $false
+    try {
+        Get-RollbackResumePlan -Progress $afterStop -Stage "iceberg_cancel" `
+            -Job ([pscustomobject]@{ jid = "cccccccccccccccccccccccccccccccc"; name = "chapter-9-iceberg-clean"; state = "FAILED" }) | Out-Null
+    } catch { $terminalRejected = $true }
+    $afterStop.stages.doris_submit.intent = [pscustomobject]@{ operation = "submit_doris_raw_rollback" }
+    $adoptedRollback = Resolve-RollbackSubmittedJob -Progress $afterStop -Stage "doris_submit" `
+        -ExpectedName "chapter-9-doris-clean" -Jobs ([pscustomobject]@{ jobs = @(
+            [pscustomobject]@{ jid = "dddddddddddddddddddddddddddddddd"; name = "chapter-9-doris-clean"; state = "RUNNING" }
+        ) }) -Path $path
+    $adoptAmbiguousRejected = $false
+    $ambiguousRollback = Get-Content -Raw $path | ConvertFrom-Json
+    $ambiguousRollback.stages.iceberg_submit.intent = [pscustomobject]@{ operation = "submit_iceberg_raw_rollback" }
+    try {
+        Resolve-RollbackSubmittedJob -Progress $ambiguousRollback -Stage "iceberg_submit" `
+            -ExpectedName "chapter-9-iceberg-clean" -Jobs ([pscustomobject]@{ jobs = @(
+                [pscustomobject]@{ jid = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"; name = "chapter-9-iceberg-clean"; state = "RUNNING" },
+                [pscustomobject]@{ jid = "ffffffffffffffffffffffffffffffff"; name = "chapter-9-iceberg-clean"; state = "RUNNING" }
+            ) }) -Path $path | Out-Null
+    } catch { $adoptAmbiguousRejected = $true }
+    $progress.rollback_jobs = [ordered]@{ doris = "dddddddddddddddddddddddddddddddd"; iceberg = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee" }
+    Write-RollbackProgressAtomic -Progress $progress -Path $path
+    $final = Get-Content -Raw $path | ConvertFrom-Json
+    [ordered]@{
+        failed = $failed
+        intent = $afterStop.stages.production_stop.status
+        intent_exists = ($null -ne $afterStop.stages.production_stop.intent)
+        result = $afterStop.stages.production_stop.result.status
+        retry_stop = $runningPlan.Action
+        canceled_done = $canceledPlan.Action
+        terminal_rejected = $terminalRejected
+        adopted_id = $adoptedRollback
+        adoption_ambiguous_rejected = $adoptAmbiguousRejected
+        doris_id = $final.rollback_jobs.doris
+        iceberg_id = $final.rollback_jobs.iceberg
+    } | ConvertTo-Json -Compress
+} finally { Remove-Item -LiteralPath $root -Recurse -Force }
+'''
+        result = self._run_powershell(command)
+        self.assertEqual(0, result.returncode, result.stderr or result.stdout)
+        payload = json.loads(result.stdout.strip().splitlines()[-1])
+        self.assertTrue(payload["failed"])
+        self.assertEqual("failed", payload["intent"])
+        self.assertTrue(payload["intent_exists"])
+        self.assertEqual("failed", payload["result"])
+        self.assertEqual("retry_stop", payload["retry_stop"])
+        self.assertEqual("complete", payload["canceled_done"])
+        self.assertTrue(payload["terminal_rejected"])
+        self.assertEqual("dddddddddddddddddddddddddddddddd", payload["adopted_id"])
+        self.assertTrue(payload["adoption_ambiguous_rejected"])
+        self.assertEqual("dddddddddddddddddddddddddddddddd", payload["doris_id"])
+        self.assertEqual("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", payload["iceberg_id"])
+
+    def test_verifier_durable_baseline_requires_causal_freshness_and_exact_api_values(self):
+        command = r'''
+$ErrorActionPreference = "Stop"
+. (Resolve-Path "scripts/verify_chapter_9_production.ps1") -FunctionsOnly
+$root = Join-Path ([IO.Path]::GetTempPath()) ("chapter9-proof-" + [guid]::NewGuid())
+New-Item -ItemType Directory -Path $root | Out-Null
+try {
+    $paths = Initialize-ProductionEvidenceRun -FinalPath (Join-Path $root "final.json") `
+        -RunId "chapter9-production-0123456789abcdef0123456789abcdef" -DorisJobId "doris-job"
+    $state = [pscustomobject]@{ RunId = "chapter9-production-0123456789abcdef0123456789abcdef"; RunPaths = $paths; DorisJobId = "doris-job"; InitialSent = $false; LateSent = $false }
+    $baseline = [ordered]@{
+        batch_start_utc = "2026-07-22T10:00:00.0000000+00:00"
+        doris = [ordered]@{ pv = 1; uv = 1; pv_updated_at = "2026-07-22T09:59:00.0000000+00:00"; uv_updated_at = "2026-07-22T09:59:00.0000000+00:00" }
+        trino = [ordered]@{ event_count = 815; distinct_event_id = 65 }
+        checkpoints = [ordered]@{ production = 1 }
+    }
+    Write-ProductionCausalBaseline -RunState $state -Baseline $baseline
+    Write-ProductionStageEvidence -RunState $state -Stage "pre_api" -Evidence @{ output = @{ raw = 8 }; groups = @{ production = @{ readable_data_lag = 0 } }; checkpoints = @{ production = @{ completed = 2 } }; doris_final = @{ pv = 2; uv = 2 }; trino_final = @{ total = 817 } }
+    $loaded = Get-ProductionCausalBaseline -RunState $state
+    $sameRejected = $false
+    try { Assert-ProductionDorisFreshness -Metrics ([pscustomobject]@{ Pv = 2; Uv = 2; PvUpdatedAt = [DateTimeOffset]"2026-07-22T10:00:00Z"; UvUpdatedAt = [DateTimeOffset]"2026-07-22T10:00:00Z" }) -BatchStart ([DateTimeOffset]"2026-07-22T10:00:00Z") -Baseline $loaded.doris | Out-Null } catch { $sameRejected = $true }
+    $api = [pscustomobject]@{ generated_at = "2026-07-22T10:01:00Z"; analyzer = "rules"; warnings = @(); evidence = [pscustomobject]@{ realtime = [pscustomobject]@{ pv = 2; uv = 2; updated_at = "2026-07-22T10:00:30Z" }; historical = [pscustomobject]@{ event_count = 817; latest_event_time = "2026-07-22T10:00:30Z" } } }
+    $doris = [pscustomobject]@{ Pv = 2; Uv = 2; PvUpdatedAt = [DateTimeOffset]"2026-07-22T10:00:30Z"; UvUpdatedAt = [DateTimeOffset]"2026-07-22T10:00:30Z" }
+    $trinoFinal = [pscustomobject]@{ Total = 817; LatestEventTime = [DateTimeOffset]"2026-07-22T10:00:30Z" }
+    $apiAccepted = Assert-ProductionApiEvidence -Response $api -BatchStart ([DateTimeOffset]"2026-07-22T10:00:00Z") -TrinoBaseline 815 -DorisFinal $doris -TrinoFinal $trinoFinal
+    $apiMismatchRejected = $false
+    try { $api.evidence.realtime.updated_at = "2026-07-22T10:00:31Z"; Assert-ProductionApiEvidence -Response $api -BatchStart ([DateTimeOffset]"2026-07-22T10:00:00Z") -TrinoBaseline 815 -DorisFinal $doris -TrinoFinal $trinoFinal | Out-Null } catch { $apiMismatchRejected = $true }
+    $api.evidence.realtime.updated_at = "2026-07-22T10:00:30Z"
+    $api.evidence.historical.latest_event_time = "2026-07-22T10:00:31Z"
+    $apiLatestMismatchRejected = $false
+    try { Assert-ProductionApiEvidence -Response $api -BatchStart ([DateTimeOffset]"2026-07-22T10:00:00Z") -TrinoBaseline 815 -DorisFinal $doris -TrinoFinal $trinoFinal | Out-Null } catch { $apiLatestMismatchRejected = $true }
+    $stageEvidence = Get-ProductionStageEvidence -RunState $state
+    [ordered]@{ baseline_source = $loaded.Source; stage = $stageEvidence.pre_api.evidence.output.raw; same_rejected = $sameRejected; api_pv = $apiAccepted.RealtimePv; api_mismatch_rejected = $apiMismatchRejected; api_latest_mismatch_rejected = $apiLatestMismatchRejected } | ConvertTo-Json -Compress
+} finally { Remove-Item -LiteralPath $root -Recurse -Force }
+'''
+        result = self._run_powershell(command)
+        self.assertEqual(0, result.returncode, result.stderr or result.stdout)
+        payload = json.loads(result.stdout.strip().splitlines()[-1])
+        self.assertEqual("durable_run_baseline", payload["baseline_source"])
+        self.assertEqual(8, payload["stage"], result.stdout)
+        self.assertTrue(payload["same_rejected"])
+        self.assertEqual(2, payload["api_pv"])
+        self.assertTrue(payload["api_mismatch_rejected"])
+        self.assertTrue(payload["api_latest_mismatch_rejected"])
+
+    def test_phase_b_recovery_contracts_cover_resize_bind_abort_and_final_evidence_schema(self):
+        resize = (ROOT / "scripts/resize_chapter_9_flink_slots.ps1").read_text(encoding="ascii")
+        verifier = (ROOT / "scripts/verify_chapter_9_production.ps1").read_text(encoding="ascii")
+        self.assertGreater(resize.count("Assert-ContainerBindMountSource"), 0)
+        self.assertIn("post-recreate", resize)
+        self.assertIn("ABORT", verifier)
+        self.assertIn("stage_evidence", verifier)
+        self.assertIn("proof_source", verifier)
 
     def test_resize_script_recreates_only_taskmanager_and_checks_recovery(self):
         text = (ROOT / "scripts/resize_chapter_9_flink_slots.ps1").read_text(encoding="utf-8")
@@ -1149,6 +1348,51 @@ try {
         self.assertEqual("COMMIT", payload["marker"])
         self.assertTrue(payload["data_rejected"])
 
+    def test_production_verifier_classifies_abort_control_record(self):
+        command = r'''
+$ErrorActionPreference = "Stop"
+. (Resolve-Path "scripts/verify_chapter_9_production.ps1") -FunctionsOnly
+$before = [pscustomobject]@{ Group = "g"; Topic = "t"; Rows = @([pscustomobject]@{ Partition = 0; CurrentOffset = 4; LogEndOffset = 5; Lag = 1 }); TotalLag = 1 }
+$after = [pscustomobject]@{ Group = "g"; Topic = "t"; Rows = @([pscustomobject]@{ Partition = 0; CurrentOffset = 4; LogEndOffset = 5; Lag = 1 }); TotalLag = 1 }
+$dump = @("baseOffset: 4 lastOffset: 4 isControl: true", "endTxnMarker: ABORT")
+$classified = ConvertFrom-ProductionKafkaDumpLog -Lines $dump -Partition 0 -StartOffset 4 -EndOffsetExclusive 5
+$proof = Assert-StableProductionKafkaLag -Before $before -After $after -Classifications $classified
+[ordered]@{ kind = $proof.Classifications[0].Kind; control = $proof.Classifications[0].ControlType; readable = $proof.ReadableDataLag } | ConvertTo-Json -Compress
+'''
+        result = self._run_powershell(command)
+        self.assertEqual(0, result.returncode, result.stderr or result.stdout)
+        payload = json.loads(result.stdout.strip().splitlines()[-1])
+        self.assertEqual("transaction_control", payload["kind"])
+        self.assertEqual("ABORT", payload["control"])
+        self.assertEqual(0, payload["readable"])
+
+    def test_production_failed_evidence_preserves_post_api_stage_state(self):
+        command = r'''
+$ErrorActionPreference = "Stop"
+. (Resolve-Path "scripts/verify_chapter_9_production.ps1") -FunctionsOnly
+$root = Join-Path ([IO.Path]::GetTempPath()) ("chapter9-failure-chain-" + [guid]::NewGuid())
+New-Item -ItemType Directory -Path $root | Out-Null
+try {
+    $paths = Initialize-ProductionEvidenceRun -FinalPath (Join-Path $root "final.json") `
+        -RunId "chapter9-production-0123456789abcdef0123456789abcdef" -DorisJobId "doris-job"
+    $state = [pscustomobject]@{ RunId = "chapter9-production-0123456789abcdef0123456789abcdef"; RunPaths = $paths; DorisJobId = "doris-job"; InitialSent = $true; LateSent = $true }
+    Write-ProductionCausalBaseline -RunState $state -Baseline @{ batch_start_utc = "2026-07-22T10:00:00Z"; doris = @{ pv = 1; uv = 1; pv_updated_at = "2026-07-22T09:59:00Z"; uv_updated_at = "2026-07-22T09:59:00Z" }; trino = @{ event_count = 815; distinct_event_id = 65 }; checkpoints = @{} }
+    Write-ProductionStageEvidence -RunState $state -Stage "pre_api" -Evidence @{ output = @{ raw = 8 }; groups = @{ production = @{ readable_data_lag = 0 } }; checkpoints = @{ production = @{ completed = 2 } }; doris_final = @{ pv = 2; uv = 2 }; trino_final = @{ total = 817 } }
+    Write-ProductionStageEvidence -RunState $state -Stage "api_gate" -Evidence @{ status = "failed"; error = "api timeout" }
+    Write-ProductionRunFailure -RunPaths $paths -RunId $state.RunId -ErrorMessage "late checkpoint timeout" -EventsSent $true -DorisJobId "doris-job"
+    $failed = Get-Content -Raw $paths.FailedPath | ConvertFrom-Json
+    [ordered]@{ proof_source = $failed.proof_source; has_baseline = ($null -ne $failed.causal_baseline); has_stages = ($null -ne $failed.stage_evidence); has_api_gate = ($null -ne $failed.stage_evidence.stages.api_gate); api_error = $failed.stage_evidence.stages.api_gate.evidence.error } | ConvertTo-Json -Compress
+} finally { Remove-Item -LiteralPath $root -Recurse -Force }
+'''
+        result = self._run_powershell(command)
+        self.assertEqual(0, result.returncode, result.stderr or result.stdout)
+        payload = json.loads(result.stdout.strip().splitlines()[-1])
+        self.assertEqual("durable_run_baseline_and_stage_evidence", payload["proof_source"])
+        self.assertTrue(payload["has_baseline"])
+        self.assertTrue(payload["has_stages"])
+        self.assertTrue(payload["has_api_gate"])
+        self.assertEqual("api timeout", payload["api_error"])
+
     def test_production_verifier_requires_stable_complete_lag_classification(self):
         command = r'''
 $ErrorActionPreference = "Stop"
@@ -1337,6 +1581,11 @@ try {
         -DorisJobId "success-job"
     Write-ProductionEvidenceAtomic -Evidence ([ordered]@{
         status = "success"; run_id = "success-run"
+        proof = [ordered]@{
+            causal_baseline_source = "durable_run_baseline"
+            stage_evidence_source = "durable_stage_evidence"
+            pre_api_stage = "output/groups/checkpoints/doris_final/trino_final"
+        }
     }) -RunPaths $successRun
     $success = Get-Content -Raw $finalPath | ConvertFrom-Json
 
@@ -1373,6 +1622,8 @@ try {
         repeat_job_rejected = $repeatJobRejected
         partial_is_per_run = $run.PartialPath -like "*new-run*"
         success_run = $success.run_id
+        success_proof_source = $success.proof.causal_baseline_source + "/" + $success.proof.stage_evidence_source
+        success_pre_api_stage = $success.proof.pre_api_stage
         success_partial_removed = -not (Test-Path $successRun.PartialPath)
         success_in_progress_removed = -not (Test-Path $successRun.InProgressPath)
         interrupted_sent = $interrupted.events_sent
@@ -1396,6 +1647,8 @@ try {
         self.assertTrue(payload["repeat_job_rejected"])
         self.assertTrue(payload["partial_is_per_run"])
         self.assertEqual("success-run", payload["success_run"])
+        self.assertEqual("durable_run_baseline/durable_stage_evidence", payload["success_proof_source"])
+        self.assertEqual("output/groups/checkpoints/doris_final/trino_final", payload["success_pre_api_stage"])
         self.assertTrue(payload["success_partial_removed"])
         self.assertTrue(payload["success_in_progress_removed"])
         self.assertTrue(payload["interrupted_sent"])
