@@ -66,6 +66,222 @@ class Chapter9PhaseBArtifactsTest(unittest.TestCase):
         for forbidden in ("kafka-topics --delete", "docker compose down", "DROP TABLE", "Remove-Item"):
             self.assertNotIn(forbidden, text)
 
+    def test_rollback_waiters_fail_closed_and_preserve_savepoint_evidence(self):
+        command = r'''
+$ErrorActionPreference = "Stop"
+. (Resolve-Path "scripts/rollback_chapter_9_production.ps1") -FunctionsOnly
+$savepoint = Get-RollbackSavepointPath -Lines @(
+    "Savepoint completed. Path: file:/workspace/tmp/savepoints/chapter-9/savepoint-new"
+)
+$missingRejected = $false
+try { Get-RollbackSavepointPath -Lines @("stop completed without evidence") | Out-Null } catch { $missingRejected = $true }
+$invalidRejected = $false
+try { Get-RollbackSavepointPath -Lines @(
+    "Savepoint completed. Path: file:/workspace/tmp/savepoints/chapter-9/../bad"
+) | Out-Null } catch { $invalidRejected = $true }
+
+$script:jobState = "FAILED"
+function Get-FlinkJob {
+    param([string]$JobId)
+    $name = if ($JobId -match "^a") { "chapter-9-datastream-quality-production" } else { "chapter-9-doris-clean" }
+    [pscustomobject]@{ jid = $JobId; name = $name; state = $script:jobState }
+}
+$productionFailedRejected = $false
+try {
+    Wait-RollbackProductionFinished -JobId "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" `
+        -ExpectedName "chapter-9-datastream-quality-production" -SavepointPath $savepoint `
+        -Attempts 1 -SleepSeconds 0 | Out-Null
+} catch { $productionFailedRejected = $_.Exception.Message -match "aaaaaaaa.*FAILED.*savepoint" }
+$cleanFailedRejected = $false
+try {
+    Wait-RollbackCleanCanceled -JobId "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" `
+        -ExpectedName "chapter-9-doris-clean" -Attempts 1 -SleepSeconds 0 | Out-Null
+} catch { $cleanFailedRejected = $_.Exception.Message -match "bbbb.*FAILED" }
+
+function Get-FlinkJob {
+    param([string]$JobId)
+    [pscustomobject]@{ jid = "cccccccccccccccccccccccccccccccc"; name = "chapter9-doris-raw-rollback-test"; state = "RUNNING" }
+}
+$wrongIdRejected = $false
+try {
+    Wait-RollbackJobRunning -JobId "dddddddddddddddddddddddddddddddd" `
+        -ExpectedName "chapter9-doris-raw-rollback-test" -Attempts 1 -SleepSeconds 0 | Out-Null
+} catch { $wrongIdRejected = $_.Exception.Message -match "requested.*dddd|returned.*cccc" }
+
+[ordered]@{
+    savepoint = $savepoint
+    missing_rejected = $missingRejected
+    invalid_rejected = $invalidRejected
+    production_failed_rejected = $productionFailedRejected
+    clean_failed_rejected = $cleanFailedRejected
+    wrong_id_rejected = $wrongIdRejected
+} | ConvertTo-Json -Compress
+'''
+        result = self._run_powershell(command)
+        self.assertEqual(0, result.returncode, result.stderr or result.stdout)
+        payload = json.loads(result.stdout.strip().splitlines()[-1])
+        self.assertEqual("file:/workspace/tmp/savepoints/chapter-9/savepoint-new", payload["savepoint"])
+        self.assertTrue(payload["missing_rejected"])
+        self.assertTrue(payload["invalid_rejected"])
+        self.assertTrue(payload["production_failed_rejected"])
+        self.assertTrue(payload["clean_failed_rejected"])
+        self.assertTrue(payload["wrong_id_rejected"])
+
+    def test_rollback_manifest_schema_rejects_unknown_types_and_bad_offsets(self):
+        command = r'''
+$ErrorActionPreference = "Stop"
+. (Resolve-Path "scripts/rollback_chapter_9_production.ps1") -FunctionsOnly
+$base = [pscustomobject]@{
+    cutover_id = "85c971e5-1e96-4c21-8cce-35f25402a543"
+    created_at = "2026-07-22T09:05:59.8072951+00:00"
+    raw_offsets = @("partition:0,offset:212", "partition:2,offset:0")
+    shadow_job_id = "6f6e24deea18e22722bfd5e0a83895e4"
+    savepoint_path = "file:/workspace/tmp/savepoints/chapter-9/savepoint-new"
+    production_job_id = "0d8edd967461402a66e9672d2335ca6d"
+    doris_job_id = "bf10b31978af0ae53446535c41120870"
+    iceberg_job_id = "ce7ec8a8d04e70f45f6c7806ed1ede28"
+}
+function Copy-Manifest([object]$Value) { return ($Value | ConvertTo-Json | ConvertFrom-Json) }
+function Is-Rejected([object]$Value) {
+    try { Assert-RollbackManifest -Manifest $Value | Out-Null; return $false } catch { return $true }
+}
+$valid = $false
+try { Assert-RollbackManifest -Manifest $base | Out-Null; $valid = $true } catch {}
+$unknown = Copy-Manifest $base
+$unknown | Add-Member -MemberType NoteProperty -Name unexpected -Value "x"
+$nonIso = Copy-Manifest $base; $nonIso.created_at = "07/22/2026"
+$pathTraversal = Copy-Manifest $base; $pathTraversal.savepoint_path = "file:/workspace/tmp/savepoints/chapter-9/../bad"
+$negative = Copy-Manifest $base; $negative.raw_offsets = @("partition:0,offset:-1")
+$duplicate = Copy-Manifest $base; $duplicate.raw_offsets = @("partition:0,offset:1", "partition:0,offset:2")
+$scalarOffsets = Copy-Manifest $base; $scalarOffsets.raw_offsets = "partition:0,offset:212"
+$badClean = Copy-Manifest $base; $badClean | Add-Member -MemberType NoteProperty -Name clean_event_ids -Value @("clean-a", "clean-a")
+$badId = Copy-Manifest $base; $badId.production_job_id = "ABC"
+[ordered]@{
+    valid = $valid
+    unknown_rejected = Is-Rejected $unknown
+    non_iso_rejected = Is-Rejected $nonIso
+    path_traversal_rejected = Is-Rejected $pathTraversal
+    negative_rejected = Is-Rejected $negative
+    duplicate_rejected = Is-Rejected $duplicate
+    scalar_offsets_rejected = Is-Rejected $scalarOffsets
+    bad_clean_rejected = Is-Rejected $badClean
+    bad_id_rejected = Is-Rejected $badId
+} | ConvertTo-Json -Compress
+'''
+        result = self._run_powershell(command)
+        self.assertEqual(0, result.returncode, result.stderr or result.stdout)
+        payload = json.loads(result.stdout.strip().splitlines()[-1])
+        self.assertTrue(payload["valid"])
+        for key in (
+            "unknown_rejected", "non_iso_rejected", "path_traversal_rejected",
+            "negative_rejected", "duplicate_rejected", "scalar_offsets_rejected",
+            "bad_clean_rejected", "bad_id_rejected"
+        ):
+            self.assertTrue(payload[key], key)
+
+    def test_rollback_render_and_dry_run_boundaries_cover_multi_partition_offsets(self):
+        command = r'''
+$ErrorActionPreference = "Stop"
+. (Resolve-Path "scripts/rollback_chapter_9_production.ps1") -FunctionsOnly
+$root = Join-Path ([IO.Path]::GetTempPath()) ("chapter9-render-" + [guid]::NewGuid())
+New-Item -ItemType Directory -Path $root | Out-Null
+$result = Render-RollbackSql -Template "'properties.group.id' = '__ROLLBACK_GROUP_ID__'; 'scan.startup.specific-offsets' = '__SPECIFIC_OFFSETS__'" `
+    -RawOffsets @("partition:0,offset:212", "partition:2,offset:0") -CutoverId "85c971e5-1e96-4c21-8cce-35f25402a543" `
+    -DorisPath (Join-Path $root "doris.sql") -IcebergPath (Join-Path $root "iceberg.sql") `
+    -DorisSink "DORIS" -DorisInsert "INSERT_DORIS" -IcebergCatalog "ICEBERG" -IcebergInsert "INSERT_ICEBERG"
+$doris = Get-Content -Raw (Join-Path $root "doris.sql")
+$iceberg = Get-Content -Raw (Join-Path $root "iceberg.sql")
+$script:forbiddenCalls = @()
+function Invoke-DockerCommand { $script:forbiddenCalls += "docker"; throw "dry-run called docker" }
+function Submit-RollbackSqlJob { $script:forbiddenCalls += "submit"; throw "dry-run submitted" }
+Write-RollbackDryRunPlan -ProductionJobId "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" -DorisJobId "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" `
+    -IcebergJobId "cccccccccccccccccccccccccccccccc" -DorisGroup $result.DorisGroup -IcebergGroup $result.IcebergGroup `
+    -DorisPath "doris.sql" -IcebergPath "iceberg.sql"
+[ordered]@{
+    doris_multi = ($doris -match "partition:0,offset:212;partition:2,offset:0")
+    iceberg_multi = ($iceberg -match "partition:0,offset:212;partition:2,offset:0")
+    groups_isolated = (($doris -match "chapter9-doris-raw-rollback") -and ($iceberg -match "chapter9-iceberg-raw-rollback") -and ($doris -notmatch "chapter9-iceberg-raw-rollback") -and ($iceberg -notmatch "chapter9-doris-raw-rollback"))
+    dry_run_calls = ($script:forbiddenCalls -join ",")
+} | ConvertTo-Json -Compress
+'''
+        result = self._run_powershell(command)
+        self.assertEqual(0, result.returncode, result.stderr or result.stdout)
+        payload = json.loads(result.stdout.strip().splitlines()[-1])
+        self.assertTrue(payload["doris_multi"])
+        self.assertTrue(payload["iceberg_multi"])
+        self.assertTrue(payload["groups_isolated"])
+        self.assertEqual("", payload["dry_run_calls"])
+
+    def test_rollback_real_orchestration_is_ordered_and_stops_after_failure(self):
+        command = r'''
+$ErrorActionPreference = "Stop"
+. (Resolve-Path "scripts/rollback_chapter_9_production.ps1") -FunctionsOnly
+$manifest = [pscustomobject]@{
+    production_job_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    doris_job_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    iceberg_job_id = "cccccccccccccccccccccccccccccccc"
+}
+$script:calls = @()
+$script:productionState = "FINISHED"
+function Invoke-DockerCommand {
+    param([string[]]$Arguments, [string]$FailureMessage)
+    if ($Arguments -contains "stop") {
+        $script:calls += "stop-production"
+        return @("Savepoint completed. Path: file:/workspace/tmp/savepoints/chapter-9/savepoint-new")
+    }
+    if ($Arguments -contains "cancel") {
+        $id = $Arguments[-1]
+        $script:calls += "cancel-$id"
+        return @("canceled")
+    }
+    throw "unexpected docker call"
+}
+function Get-FlinkJob {
+    param([string]$JobId)
+    $script:calls += "get-$JobId"
+    if ($JobId -eq $manifest.production_job_id) { return [pscustomobject]@{ jid = $JobId; name = "chapter-9-datastream-quality-production"; state = $script:productionState } }
+    if ($JobId -eq $manifest.doris_job_id) { return [pscustomobject]@{ jid = $JobId; name = "chapter-9-doris-clean"; state = "CANCELED" } }
+    if ($JobId -eq $manifest.iceberg_job_id) { return [pscustomobject]@{ jid = $JobId; name = "chapter-9-iceberg-clean"; state = "CANCELED" } }
+    if ($JobId -eq "dddddddddddddddddddddddddddddddd") { return [pscustomobject]@{ jid = $JobId; name = "chapter9-doris-raw-rollback-test"; state = "RUNNING" } }
+    if ($JobId -eq "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee") { return [pscustomobject]@{ jid = $JobId; name = "chapter9-iceberg-raw-rollback-test"; state = "RUNNING" } }
+    throw "unknown job $JobId"
+}
+function Submit-RollbackSqlJob {
+    param([string]$SqlClient, [string]$ContainerSqlPath, [string[]]$ConnectorPaths, [string]$ParentClasspath)
+    $script:calls += "submit-$ContainerSqlPath"
+    if ($ContainerSqlPath -match "doris") { return @("JobID: dddddddddddddddddddddddddddddddd") }
+    return @("JobID: eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee")
+}
+$success = Invoke-RollbackRealMode -Manifest $manifest -DorisJobName "chapter9-doris-raw-rollback-test" `
+    -IcebergJobName "chapter9-iceberg-raw-rollback-test" -DorisSqlPath "doris.sql" -IcebergSqlPath "iceberg.sql" `
+    -DorisConnectors @() -IcebergConnectors @() -IcebergClasspath "" -Attempts 1 -SleepSeconds 0
+$successCalls = $script:calls -join ">"
+$script:calls = @(); $script:productionState = "FAILED"
+$failureRejected = $false
+try {
+    Invoke-RollbackRealMode -Manifest $manifest -DorisJobName "chapter9-doris-raw-rollback-test" `
+        -IcebergJobName "chapter9-iceberg-raw-rollback-test" -DorisSqlPath "doris.sql" -IcebergSqlPath "iceberg.sql" `
+        -DorisConnectors @() -IcebergConnectors @() -IcebergClasspath "" -Attempts 1 -SleepSeconds 0 | Out-Null
+} catch { $failureRejected = $true }
+[ordered]@{
+    success_order = $successCalls
+    failure_rejected = $failureRejected
+    failure_calls = $script:calls -join ">"
+} | ConvertTo-Json -Compress
+'''
+        result = self._run_powershell(command)
+        self.assertEqual(0, result.returncode, result.stderr or result.stdout)
+        payload = json.loads(result.stdout.strip().splitlines()[-1])
+        self.assertEqual(
+            "stop-production>get-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa>cancel-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb>get-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb>cancel-cccccccccccccccccccccccccccccccc>get-cccccccccccccccccccccccccccccccc>submit-doris.sql>submit-iceberg.sql>get-dddddddddddddddddddddddddddddddd>get-eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            payload["success_order"]
+        )
+        self.assertTrue(payload["failure_rejected"])
+        self.assertEqual(
+            "stop-production>get-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            payload["failure_calls"]
+        )
+
     def test_cutover_requires_traffic_gate_savepoint_manifest_and_three_jobs(self):
         text = (ROOT / "scripts/run_chapter_9_production_cutover.ps1").read_text(encoding="utf-8")
         for marker in (

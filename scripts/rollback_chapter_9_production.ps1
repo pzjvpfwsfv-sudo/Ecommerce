@@ -49,53 +49,80 @@ function Assert-RollbackJobId([string]$JobId, [string]$Field) {
     }
 }
 
-function Get-RollbackProperty([object]$Object, [string]$Name, [bool]$Required = $true) {
-    $property = $Object.PSObject.Properties[$Name]
-    if ($null -eq $property) {
-        if ($Required) { throw "Manifest field is missing: $Name." }
-        return $null
+function Assert-RollbackSavepointPath([string]$Path, [string]$EvidenceName = "manifest") {
+    if ([string]::IsNullOrWhiteSpace($Path) -or $Path -match "\.\.") {
+        throw "Invalid $EvidenceName savepoint evidence: $Path"
     }
-    return $property.Value
+    if ($Path -notmatch "^file:/workspace/tmp/savepoints/chapter-9/[A-Za-z0-9._-]+$") {
+        throw "Invalid $EvidenceName savepoint evidence: $Path"
+    }
+    return $Path
 }
 
 function Assert-RollbackManifest([object]$Manifest) {
     if ($null -eq $Manifest) { throw "Cutover manifest is empty." }
-    foreach ($field in @(
+    $allowedFields = @(
         "cutover_id", "created_at", "raw_offsets", "shadow_job_id", "savepoint_path",
+        "production_job_id", "doris_job_id", "iceberg_job_id", "clean_event_ids"
+    )
+    $actualFields = @($Manifest.PSObject.Properties.Name)
+    $unknownFields = @($actualFields | Where-Object { $_ -notin $allowedFields })
+    if ($unknownFields.Count -gt 0) {
+        throw "Manifest contains unknown fields: $($unknownFields -join ',')."
+    }
+    $requiredFields = @(
+        "cutover_id", "created_at", "shadow_job_id", "savepoint_path",
         "production_job_id", "doris_job_id", "iceberg_job_id"
-    )) {
-        Get-RollbackProperty -Object $Manifest -Name $field | Out-Null
+    )
+    foreach ($field in $requiredFields) {
+        $property = $Manifest.PSObject.Properties[$field]
+        if ($null -eq $property -or $null -eq $property.Value -or $property.Value -isnot [string]) {
+            throw "Manifest field $field must be a non-null string."
+        }
     }
 
     $cutoverId = [string]$Manifest.cutover_id
     if ($cutoverId -notmatch "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$") {
         throw "Manifest cutover_id is not a canonical lowercase GUID."
     }
-    try { [DateTimeOffset]::Parse([string]$Manifest.created_at) | Out-Null } catch {
-        throw "Manifest created_at is not an ISO timestamp."
+    try {
+        $createdAt = [DateTimeOffset]::ParseExact(
+            [string]$Manifest.created_at, "o",
+            [System.Globalization.CultureInfo]::InvariantCulture,
+            [System.Globalization.DateTimeStyles]::RoundtripKind
+        )
+        if ($createdAt.ToString("o", [System.Globalization.CultureInfo]::InvariantCulture) -ne [string]$Manifest.created_at) {
+            throw "round-trip mismatch"
+        }
+    } catch {
+        throw "Manifest created_at must be round-trip ISO-8601."
     }
     Assert-RollbackJobId -JobId ([string]$Manifest.shadow_job_id) -Field "shadow_job_id"
     Assert-RollbackJobId -JobId ([string]$Manifest.production_job_id) -Field "production_job_id"
     Assert-RollbackJobId -JobId ([string]$Manifest.doris_job_id) -Field "doris_job_id"
     Assert-RollbackJobId -JobId ([string]$Manifest.iceberg_job_id) -Field "iceberg_job_id"
 
-    $savepoint = [string]$Manifest.savepoint_path
-    if ($savepoint -notmatch "^file:/{1,3}workspace/tmp/savepoints/chapter-9/[^/]+$") {
-        throw "Manifest savepoint_path is outside the Chapter 9 savepoint directory."
-    }
+    $savepoint = Assert-RollbackSavepointPath -Path ([string]$Manifest.savepoint_path)
 
-    if ($Manifest.raw_offsets -is [string]) {
+    if ($Manifest.raw_offsets -isnot [array]) {
         throw "Manifest raw_offsets must be an array of partition offsets."
     }
     $offsets = @($Manifest.raw_offsets)
     if ($offsets.Count -eq 0) { throw "Manifest raw_offsets is empty." }
     $partitions = @{}
     foreach ($offset in $offsets) {
+        if ($offset -isnot [string]) { throw "Manifest raw_offsets elements must be strings." }
         $value = [string]$offset
         if ($value -notmatch "^partition:(\d+),offset:(\d+)$") {
             throw "Invalid raw offset in cutover manifest: $value"
         }
-        $partition = [int]$Matches[1]
+        try {
+            $partition = [int64]$Matches[1]
+            $offsetValue = [int64]$Matches[2]
+        } catch {
+            throw "Raw offset is outside the supported non-negative integer range: $value"
+        }
+        if ($partition -lt 0 -or $offsetValue -lt 0) { throw "Raw offsets cannot be negative: $value" }
         if ($partitions.ContainsKey($partition)) { throw "Duplicate raw offset partition: $partition." }
         $partitions[$partition] = $true
     }
@@ -120,22 +147,22 @@ function Assert-RollbackManifest([object]$Manifest) {
 }
 
 function Get-RollbackCleanEventIds([object]$Manifest) {
-    $direct = Get-RollbackProperty -Object $Manifest -Name "clean_event_ids" -Required $false
-    if ($null -ne $direct) { return @($direct | ForEach-Object { [string]$_ }) }
-
-    $eventIds = Get-RollbackProperty -Object $Manifest -Name "event_ids" -Required $false
-    if ($null -eq $eventIds) { return @() }
-    $clean = Get-RollbackProperty -Object $eventIds -Name "clean" -Required $false
-    if ($null -ne $clean) { return @($clean | ForEach-Object { [string]$_ }) }
-    $duplicate = Get-RollbackProperty -Object $eventIds -Name "duplicate" -Required $false
-    $advancer = Get-RollbackProperty -Object $eventIds -Name "advancer" -Required $false
-    if ($null -ne $duplicate -or $null -ne $advancer) {
-        if ($null -eq $duplicate -or $null -eq $advancer) {
-            throw "Manifest event_ids must include both duplicate and advancer clean IDs."
-        }
-        return @([string]$duplicate, [string]$advancer)
+    $property = $Manifest.PSObject.Properties["clean_event_ids"]
+    if ($null -eq $property) { return @() }
+    if ($null -eq $property.Value -or $property.Value -isnot [array]) {
+        throw "Manifest clean_event_ids must be an array when present."
     }
-    return @()
+    $ids = @($property.Value)
+    if ($ids.Count -ne 2) { throw "Manifest clean_event_ids must contain exactly two IDs." }
+    foreach ($id in $ids) {
+        if ($id -isnot [string] -or [string]$id -notmatch "^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$") {
+            throw "Manifest clean_event_ids elements have an invalid format."
+        }
+    }
+    if (@($ids | Select-Object -Unique).Count -ne 2) {
+        throw "Manifest clean_event_ids must be distinct."
+    }
+    return @($ids | ForEach-Object { [string]$_ })
 }
 
 function Assert-RollbackLiveJobs([object]$Manifest, [object]$Jobs) {
@@ -246,6 +273,23 @@ function Submit-RollbackSqlJob {
     return @($output)
 }
 
+function Get-RollbackSavepointPath([string[]]$Lines) {
+    $paths = @()
+    foreach ($line in $Lines) {
+        $match = [regex]::Match(
+            [string]$line,
+            "(?i)Savepoint completed\.\s*Path:\s*(file:/workspace/tmp/savepoints/chapter-9/[^\s]+)"
+        )
+        if ($match.Success) { $paths += $match.Groups[1].Value }
+    }
+    $uniquePaths = @($paths | Sort-Object -Unique)
+    if ($uniquePaths.Count -ne 1) {
+        $evidence = if ($uniquePaths.Count -eq 0) { "MISSING" } else { $uniquePaths -join ";" }
+        throw "Stop-with-savepoint output must contain exactly one valid path. savepoint evidence=$evidence"
+    }
+    return Assert-RollbackSavepointPath -Path ([string]$uniquePaths[0]) -EvidenceName "stop output"
+}
+
 function Wait-RollbackJobRunning {
     param(
         [string]$JobId,
@@ -258,24 +302,38 @@ function Wait-RollbackJobRunning {
     for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
         try {
             $job = Get-FlinkJob -JobId $JobId
+            $returnedId = [string]$job.jid
+            if ($returnedId -ne $JobId) {
+                throw "Rollback Job ID mismatch: requested=$JobId returned=$returnedId."
+            }
             if ([string]$job.name -ne $ExpectedName) { throw "Job $JobId has unexpected name $($job.name)." }
             $lastState = [string]$job.state
-            if ($lastState -eq "RUNNING") { return $job }
+            if ($lastState -eq "RUNNING") {
+                return [pscustomobject]@{
+                    RequestedJobId = $JobId
+                    ReturnedJobId = $returnedId
+                    Name = [string]$job.name
+                    State = $lastState
+                    Job = $job
+                }
+            }
             if ($lastState -in @("FAILED", "CANCELED", "FINISHED", "SUSPENDED")) {
                 throw "Job $JobId entered terminal state $lastState."
             }
         } catch {
             $lastError = $_.Exception.Message
-            if ($lastError -match "unexpected name|terminal state") { throw }
+            if ($lastError -match "mismatch|unexpected name|terminal state") { throw }
         }
         if ($attempt -lt $Attempts -and $SleepSeconds -gt 0) { Start-Sleep -Seconds $SleepSeconds }
     }
     throw "Job $JobId did not reach RUNNING. Last state: $lastState. Last error: $lastError"
 }
 
-function Wait-RollbackJobStopped {
+function Wait-RollbackProductionFinished {
     param(
         [string]$JobId,
+        [string]$ExpectedName,
+        [string]$SavepointPath,
         [int]$Attempts = 60,
         [int]$SleepSeconds = 2
     )
@@ -284,17 +342,161 @@ function Wait-RollbackJobStopped {
     for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
         try {
             $job = Get-FlinkJob -JobId $JobId
+            $returnedId = [string]$job.jid
+            if ($returnedId -ne $JobId) {
+                throw "Production Job ID mismatch: requested=$JobId returned=$returnedId."
+            }
+            if ([string]$job.name -ne $ExpectedName) {
+                throw "Production Job $JobId has unexpected name $($job.name)."
+            }
             $lastState = [string]$job.state
-            if ($lastState -in @("CANCELED", "FINISHED", "SUSPENDED", "FAILED")) { return $job }
+            if ($lastState -eq "FINISHED") {
+                return [pscustomobject]@{
+                    RequestedJobId = $JobId
+                    ReturnedJobId = $returnedId
+                    Name = [string]$job.name
+                    State = $lastState
+                    SavepointPath = $SavepointPath
+                    Job = $job
+                }
+            }
+            if ($lastState -in @("FAILED", "CANCELED", "SUSPENDED")) {
+                throw "Production JobID=$JobId failed to stop safely. last_state=$lastState savepoint evidence=$SavepointPath"
+            }
         } catch {
             $lastError = $_.Exception.Message
-            if ($lastError -match "404|Not Found|does not exist") {
-                return [pscustomobject]@{ jid = $JobId; state = "NOT_FOUND" }
-            }
+            if ($lastError -match "mismatch|unexpected name|failed to stop safely") { throw }
         }
         if ($attempt -lt $Attempts -and $SleepSeconds -gt 0) { Start-Sleep -Seconds $SleepSeconds }
     }
-    throw "Job $JobId did not stop. Last state: $lastState. Last error: $lastError"
+    throw "Production JobID=$JobId did not reach FINISHED. last_state=$lastState savepoint evidence=$SavepointPath last_error=$lastError"
+}
+
+function Wait-RollbackCleanCanceled {
+    param(
+        [string]$JobId,
+        [string]$ExpectedName,
+        [int]$Attempts = 60,
+        [int]$SleepSeconds = 2
+    )
+    $lastState = "NOT_FOUND"
+    $lastError = $null
+    for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
+        try {
+            $job = Get-FlinkJob -JobId $JobId
+            $returnedId = [string]$job.jid
+            if ($returnedId -ne $JobId) {
+                throw "Clean Job ID mismatch: requested=$JobId returned=$returnedId."
+            }
+            if ([string]$job.name -ne $ExpectedName) {
+                throw "Clean Job $JobId has unexpected name $($job.name)."
+            }
+            $lastState = [string]$job.state
+            if ($lastState -eq "CANCELED") {
+                return [pscustomobject]@{
+                    RequestedJobId = $JobId
+                    ReturnedJobId = $returnedId
+                    Name = [string]$job.name
+                    State = $lastState
+                    Job = $job
+                }
+            }
+            if ($lastState -in @("FAILED", "FINISHED", "SUSPENDED")) {
+                throw "Clean JobID=$JobId cancel failed. last_state=$lastState"
+            }
+        } catch {
+            $lastError = $_.Exception.Message
+            if ($lastError -match "mismatch|unexpected name|cancel failed") { throw }
+        }
+        if ($attempt -lt $Attempts -and $SleepSeconds -gt 0) { Start-Sleep -Seconds $SleepSeconds }
+    }
+    throw "Clean JobID=$JobId did not reach CANCELED. last_state=$lastState last_error=$lastError"
+}
+
+function Write-RollbackDryRunPlan {
+    param(
+        [string]$ProductionJobId,
+        [string]$DorisJobId,
+        [string]$IcebergJobId,
+        [string]$DorisGroup,
+        [string]$IcebergGroup,
+        [string]$DorisPath,
+        [string]$IcebergPath
+    )
+    Write-Host "[rollback] DRY_RUN no stop/cancel/submit; production jobs remain unchanged."
+    Write-Host "[plan] stop production $ProductionJobId with --savepointPath file:///workspace/tmp/savepoints/chapter-9"
+    Write-Host "[plan] stop Doris clean $DorisJobId"
+    Write-Host "[plan] stop Iceberg clean $IcebergJobId"
+    Write-Host "[plan] start Doris rollback job by submitting $DorisPath as $DorisGroup"
+    Write-Host "[plan] start Iceberg rollback job by submitting $IcebergPath as $IcebergGroup"
+    Write-Host "[plan] require both rollback jobs RUNNING; traffic resume remains operator-controlled"
+}
+
+function Invoke-RollbackRealMode {
+    param(
+        [object]$Manifest,
+        [string]$DorisJobName,
+        [string]$IcebergJobName,
+        [string]$DorisSqlPath,
+        [string]$IcebergSqlPath,
+        [string[]]$DorisConnectors,
+        [string[]]$IcebergConnectors,
+        [string]$IcebergClasspath,
+        [string]$JobManager = "ecom-flink-jobmanager",
+        [string]$SqlClient = "ecom-flink-sql-client",
+        [int]$Attempts = 60,
+        [int]$SleepSeconds = 2
+    )
+
+    Write-Host "[rollback] stopping production DataStream with Savepoint"
+    $stopOutput = @(Invoke-DockerCommand -Arguments @(
+        "exec", $JobManager, "/opt/flink/bin/flink", "stop", "--savepointPath",
+        "file:///workspace/tmp/savepoints/chapter-9", $Manifest.production_job_id
+    ) -FailureMessage "Production DataStream Stop-with-Savepoint failed.")
+    $stopOutput | ForEach-Object { Write-Host $_ }
+    $savepointPath = Get-RollbackSavepointPath -Lines $stopOutput
+    $productionResult = Wait-RollbackProductionFinished -JobId $Manifest.production_job_id `
+        -ExpectedName "chapter-9-datastream-quality-production" -SavepointPath $savepointPath `
+        -Attempts $Attempts -SleepSeconds $SleepSeconds
+    Write-Host "[rollback] production stopped requested_job_id=$($productionResult.RequestedJobId) returned_job_id=$($productionResult.ReturnedJobId) state=$($productionResult.State) savepoint=$savepointPath"
+
+    Write-Host "[rollback] stopping exact Doris clean job"
+    Invoke-DockerCommand -Arguments @(
+        "exec", $JobManager, "/opt/flink/bin/flink", "cancel", $Manifest.doris_job_id
+    ) -FailureMessage "Doris clean job cancel failed." | ForEach-Object { Write-Host $_ }
+    $dorisResult = Wait-RollbackCleanCanceled -JobId $Manifest.doris_job_id `
+        -ExpectedName "chapter-9-doris-clean" -Attempts $Attempts -SleepSeconds $SleepSeconds
+    Write-Host "[rollback] Doris canceled requested_job_id=$($dorisResult.RequestedJobId) returned_job_id=$($dorisResult.ReturnedJobId) state=$($dorisResult.State)"
+
+    Write-Host "[rollback] stopping exact Iceberg clean job"
+    Invoke-DockerCommand -Arguments @(
+        "exec", $JobManager, "/opt/flink/bin/flink", "cancel", $Manifest.iceberg_job_id
+    ) -FailureMessage "Iceberg clean job cancel failed." | ForEach-Object { Write-Host $_ }
+    $icebergResult = Wait-RollbackCleanCanceled -JobId $Manifest.iceberg_job_id `
+        -ExpectedName "chapter-9-iceberg-clean" -Attempts $Attempts -SleepSeconds $SleepSeconds
+    Write-Host "[rollback] Iceberg canceled requested_job_id=$($icebergResult.RequestedJobId) returned_job_id=$($icebergResult.ReturnedJobId) state=$($icebergResult.State)"
+
+    Write-Host "[rollback] submitting raw Doris rollback SQL"
+    $dorisOutput = @(Submit-RollbackSqlJob -SqlClient $SqlClient -ContainerSqlPath $DorisSqlPath `
+        -ConnectorPaths $DorisConnectors)
+    $dorisOutput | ForEach-Object { Write-Host $_ }
+
+    Write-Host "[rollback] submitting raw Iceberg rollback SQL"
+    $icebergOutput = @(Submit-RollbackSqlJob -SqlClient $SqlClient -ContainerSqlPath $IcebergSqlPath `
+        -ConnectorPaths $IcebergConnectors -ParentClasspath $IcebergClasspath)
+    $icebergOutput | ForEach-Object { Write-Host $_ }
+
+    $rollbackDoris = Wait-RollbackJobRunning -JobId (Get-SubmittedRollbackJobId -Lines $dorisOutput) `
+        -ExpectedName $DorisJobName -Attempts $Attempts -SleepSeconds $SleepSeconds
+    $rollbackIceberg = Wait-RollbackJobRunning -JobId (Get-SubmittedRollbackJobId -Lines $icebergOutput) `
+        -ExpectedName $IcebergJobName -Attempts $Attempts -SleepSeconds $SleepSeconds
+    Write-Host "[rollback] RUNNING requested_job_id=$($rollbackDoris.RequestedJobId) returned_job_id=$($rollbackDoris.ReturnedJobId) name=$($rollbackDoris.Name)"
+    Write-Host "[rollback] RUNNING requested_job_id=$($rollbackIceberg.RequestedJobId) returned_job_id=$($rollbackIceberg.ReturnedJobId) name=$($rollbackIceberg.Name)"
+    return [pscustomobject]@{
+        SavepointPath = $savepointPath
+        DorisJob = $rollbackDoris
+        IcebergJob = $rollbackIceberg
+    }
 }
 
 function Get-RollbackCheckpointSummary([string]$JobId) {
@@ -363,43 +565,16 @@ Write-Host "[rollback] rendered_doris=$dorisPath group=$($rendered.DorisGroup)"
 Write-Host "[rollback] rendered_iceberg=$icebergPath group=$($rendered.IcebergGroup)"
 
 if ($DryRun) {
-    Write-Host "[rollback] DRY_RUN no stop/cancel/submit; production jobs remain unchanged."
-    Write-Host "[plan] stop production $($manifest.production_job_id) with --savepointPath file:///workspace/tmp/savepoints/chapter-9"
-    Write-Host "[plan] stop Doris clean $($manifest.doris_job_id)"
-    Write-Host "[plan] stop Iceberg clean $($manifest.iceberg_job_id)"
-    Write-Host "[plan] start Doris rollback job by submitting $dorisPath as $($rendered.DorisGroup)"
-    Write-Host "[plan] start Iceberg rollback job by submitting $icebergPath as $($rendered.IcebergGroup)"
-    Write-Host "[plan] require both rollback jobs RUNNING; traffic resume remains operator-controlled"
+    Write-RollbackDryRunPlan -ProductionJobId $manifest.production_job_id -DorisJobId $manifest.doris_job_id `
+        -IcebergJobId $manifest.iceberg_job_id -DorisGroup $rendered.DorisGroup -IcebergGroup $rendered.IcebergGroup `
+        -DorisPath $dorisPath -IcebergPath $icebergPath
     return
 }
 
 $jobManager = "ecom-flink-jobmanager"
 $sqlClient = "ecom-flink-sql-client"
-$savepointRoot = "file:///workspace/tmp/savepoints/chapter-9"
 $dorisJobName = $rendered.DorisGroup
 $icebergJobName = $rendered.IcebergGroup
-
-Write-Host "[rollback] revalidating exact production jobs before mutation"
-Assert-RollbackLiveJobs -Manifest $manifest -Jobs (Get-FlinkJobs) | Out-Null
-
-Write-Host "[rollback] stopping production DataStream with Savepoint"
-Invoke-DockerCommand -Arguments @(
-    "exec", $jobManager, "/opt/flink/bin/flink", "stop", "--savepointPath", $savepointRoot,
-    $manifest.production_job_id
-) -FailureMessage "Production DataStream Stop-with-Savepoint failed." | ForEach-Object { Write-Host $_ }
-Wait-RollbackJobStopped -JobId $manifest.production_job_id | Out-Null
-
-Write-Host "[rollback] stopping exact Doris clean job"
-Invoke-DockerCommand -Arguments @(
-    "exec", $jobManager, "/opt/flink/bin/flink", "cancel", $manifest.doris_job_id
-) -FailureMessage "Doris clean job cancel failed." | ForEach-Object { Write-Host $_ }
-Wait-RollbackJobStopped -JobId $manifest.doris_job_id | Out-Null
-
-Write-Host "[rollback] stopping exact Iceberg clean job"
-Invoke-DockerCommand -Arguments @(
-    "exec", $jobManager, "/opt/flink/bin/flink", "cancel", $manifest.iceberg_job_id
-) -FailureMessage "Iceberg clean job cancel failed." | ForEach-Object { Write-Host $_ }
-Wait-RollbackJobStopped -JobId $manifest.iceberg_job_id | Out-Null
 
 $dorisConnectors = @(
     "/workspace/tmp/chapter-9/lib/flink-sql-connector-kafka-3.3.0-1.19.jar",
@@ -415,19 +590,10 @@ $icebergConnectors = @(
     "/workspace/tmp/chapter-9/lib/aws-java-sdk-bundle-1.12.262.jar"
 )
 $icebergClasspath = $icebergConnectors -join ":"
-
-Write-Host "[rollback] submitting raw Doris rollback SQL"
-$dorisOutput = Submit-RollbackSqlJob -SqlClient $sqlClient -ContainerSqlPath "/workspace/tmp/chapter-9/rollback-doris-raw.sql" `
-    -ConnectorPaths $dorisConnectors
-$dorisOutput | ForEach-Object { Write-Host $_ }
-
-Write-Host "[rollback] submitting raw Iceberg rollback SQL"
-$icebergOutput = Submit-RollbackSqlJob -SqlClient $sqlClient -ContainerSqlPath "/workspace/tmp/chapter-9/rollback-iceberg-raw.sql" `
-    -ConnectorPaths $icebergConnectors -ParentClasspath $icebergClasspath
-$icebergOutput | ForEach-Object { Write-Host $_ }
-
-$rollbackDorisId = Wait-RollbackJobRunning -JobId (Get-SubmittedRollbackJobId -Lines $dorisOutput) -ExpectedName $dorisJobName
-$rollbackIcebergId = Wait-RollbackJobRunning -JobId (Get-SubmittedRollbackJobId -Lines $icebergOutput) -ExpectedName $icebergJobName
-Write-Host "[rollback] RUNNING doris_job_id=$($rollbackDorisId.jid) name=$($rollbackDorisId.name)"
-Write-Host "[rollback] RUNNING iceberg_job_id=$($rollbackIcebergId.jid) name=$($rollbackIcebergId.name)"
+Write-Host "[rollback] revalidating exact production jobs before mutation"
+Assert-RollbackLiveJobs -Manifest $manifest -Jobs (Get-FlinkJobs) | Out-Null
+Invoke-RollbackRealMode -Manifest $manifest -DorisJobName $dorisJobName -IcebergJobName $icebergJobName `
+    -DorisSqlPath "/workspace/tmp/chapter-9/rollback-doris-raw.sql" `
+    -IcebergSqlPath "/workspace/tmp/chapter-9/rollback-iceberg-raw.sql" `
+    -DorisConnectors $dorisConnectors -IcebergConnectors $icebergConnectors -IcebergClasspath $icebergClasspath | Out-Null
 Write-Host "[rollback] traffic may be resumed by the operator; generator was not started."
