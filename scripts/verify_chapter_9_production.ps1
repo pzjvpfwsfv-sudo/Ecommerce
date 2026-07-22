@@ -456,6 +456,43 @@ function Wait-NewProductionCheckpoint {
     throw "Job $ExpectedName did not complete a new checkpoint. Last error: $lastError"
 }
 
+function Get-ProductionCurrentWatermarkMetric {
+    param(
+        [Parameter(Mandatory = $true)][string]$JobId,
+        [Parameter(Mandatory = $true)][string]$ExpectedName,
+        [string]$FlinkBaseUrl = "http://localhost:8081"
+    )
+
+    $job = Invoke-RestMethod -Uri "$FlinkBaseUrl/jobs/$JobId" -TimeoutSec 5
+    if ([string]$job.jid -ne $JobId -or [string]$job.name -ne $ExpectedName -or
+        [string]$job.state -ne "RUNNING") {
+        throw "Flink Job ID/name/state mismatch while reading watermark."
+    }
+    $vertices = @($job.vertices | Where-Object { [string]$_.name -like "*route-late-events*" })
+    if ($vertices.Count -ne 1) { throw "Expected one route-late-events vertex."
+    }
+    $metricsUrl = "$FlinkBaseUrl/jobs/$JobId/vertices/$($vertices[0].id)/metrics"
+    $metricResponse = Invoke-RestMethod -Uri $metricsUrl -TimeoutSec 5
+    $metrics = @($metricResponse)
+    $metricIds = @($metrics | Where-Object {
+        [string]$_.id -match "^\d+\.route-late-events\.currentInputWatermark$"
+    })
+    if ($metricIds.Count -ne 1) { throw "Expected one late-event input watermark metric."
+    }
+    $metricId = [string]$metricIds[0].id
+    $encodedMetric = [Uri]::EscapeDataString($metricId)
+    $valueResponse = Invoke-RestMethod -Uri "$metricsUrl`?get=$encodedMetric" -TimeoutSec 5
+    $values = @($valueResponse)
+    if ($values.Count -ne 1 -or [string]$values[0].id -ne $metricId) {
+        throw "Flink watermark metric returned a malformed value."
+    }
+    return [pscustomobject]@{
+        VertexId = [string]$vertices[0].id
+        MetricId = $metricId
+        Watermark = [int64]$values[0].value
+    }
+}
+
 function Wait-ProductionWatermarkPast {
     param(
         [Parameter(Mandatory = $true)][string]$JobId,
@@ -470,34 +507,13 @@ function Wait-ProductionWatermarkPast {
     $lastWatermark = $null
     for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
         try {
-            $job = Invoke-RestMethod -Uri "$FlinkBaseUrl/jobs/$JobId" -TimeoutSec 5
-            if ([string]$job.jid -ne $JobId -or [string]$job.name -ne $ExpectedName -or
-                [string]$job.state -ne "RUNNING") {
-                throw "Flink Job ID/name/state mismatch while waiting for watermark."
-            }
-            $vertices = @($job.vertices | Where-Object { [string]$_.name -like "*route-late-events*" })
-            if ($vertices.Count -ne 1) { throw "Expected one route-late-events vertex."
-            }
-            $metricsUrl = "$FlinkBaseUrl/jobs/$JobId/vertices/$($vertices[0].id)/metrics"
-            $metricResponse = Invoke-RestMethod -Uri $metricsUrl -TimeoutSec 5
-            $metrics = @($metricResponse)
-            $metricIds = @($metrics | Where-Object {
-                [string]$_.id -match "^\d+\.route-late-events\.currentInputWatermark$"
-            })
-            if ($metricIds.Count -ne 1) { throw "Expected one late-event input watermark metric."
-            }
-            $metricId = [string]$metricIds[0].id
-            $encodedMetric = [Uri]::EscapeDataString($metricId)
-            $valueResponse = Invoke-RestMethod -Uri "$metricsUrl`?get=$encodedMetric" -TimeoutSec 5
-            $values = @($valueResponse)
-            if ($values.Count -ne 1 -or [string]$values[0].id -ne $metricId) {
-                throw "Flink watermark metric returned a malformed value."
-            }
-            $lastWatermark = [int64]$values[0].value
+            $metric = Get-ProductionCurrentWatermarkMetric -JobId $JobId `
+                -ExpectedName $ExpectedName -FlinkBaseUrl $FlinkBaseUrl
+            $lastWatermark = $metric.Watermark
             if ($lastWatermark -gt $ThresholdEpochMs) {
                 return [pscustomobject]@{
-                    VertexId = [string]$vertices[0].id
-                    MetricId = $metricId
+                    VertexId = $metric.VertexId
+                    MetricId = $metric.MetricId
                     Watermark = $lastWatermark
                     ThresholdEpochMs = $ThresholdEpochMs
                 }
@@ -585,6 +601,13 @@ function Assert-ProductionOutputMatrix {
     $lateId = Get-ProductionRecordEventId $LateRecords[0]
     if ($lateId -ne "$RunId-late") { throw "Late event ID mismatch: $lateId."
     }
+    $lateCleanCount = @($cleanIds | Where-Object { $_ -eq "$RunId-late" }).Count
+    $lateDlqCount = @($DlqRecords | Where-Object {
+        (Get-ProductionRecordEventId $_) -eq "$RunId-late"
+    }).Count
+    if ($lateCleanCount -ne 0 -or $lateDlqCount -ne 0) {
+        throw "Late event ID must exist only in the late output."
+    }
     if (8 -ne ($CleanRecords.Count + $DlqRecords.Count + $LateRecords.Count)) {
         throw "raw = clean + dlq + late reconciliation failed."
     }
@@ -596,6 +619,12 @@ function Assert-ProductionOutputMatrix {
         DuplicateClean = $duplicateClean
         Reasons = $expectedReasons
         ReasonCounts = [pscustomobject]$reasonCounts
+        LateOutputProof = [pscustomobject]@{
+            EventId = "$RunId-late"
+            LateTopicCount = 1
+            CleanCount = $lateCleanCount
+            DlqCount = $lateDlqCount
+        }
     }
 }
 
@@ -684,14 +713,15 @@ function Assert-ProductionResumeMatrix {
         if ($lateRawTime -ne $lateEventTime) {
             throw "Resume existing late raw event does not match reconstructed event_time."
         }
-        Assert-ProductionOutputMatrix -RunId $RunId -RawValues $RawValues `
+        $matrix = Assert-ProductionOutputMatrix -RunId $RunId -RawValues $RawValues `
             -CleanRecords $CleanRecords -DlqRecords $DlqRecords `
-            -LateRecords $LateRecords | Out-Null
+            -LateRecords $LateRecords
     } else {
         $syntheticLate = $lateJson | ConvertFrom-Json
-        Assert-ProductionOutputMatrix -RunId $RunId -RawValues @($RawValues + $lateJson) `
+        $matrix = Assert-ProductionOutputMatrix -RunId $RunId `
+            -RawValues @($RawValues + $lateJson) `
             -CleanRecords $CleanRecords -DlqRecords $DlqRecords `
-            -LateRecords @($syntheticLate) | Out-Null
+            -LateRecords @($syntheticLate)
     }
     return [pscustomobject]@{
         Raw = $RawValues.Count
@@ -699,12 +729,68 @@ function Assert-ProductionResumeMatrix {
         Dlq = 5
         Late = $LateRecords.Count
         ResumeAction = $resumeAction
+        LateOutputProof = $matrix.LateOutputProof
         BatchStart = $batchStart
         BatchStartBasis = "duplicate_raw_event_time_upper_bound"
         AdvancerEventTime = $advancerTime
         LateEventTime = $lateEventTime
         LateEventTimeBasis = "advancer_raw_event_time_minus_60_seconds"
         LateJson = $lateJson
+    }
+}
+
+function Get-ProductionReadOnlyWatermarkProof {
+    param(
+        [Parameter(Mandatory = $true)][object]$ResumeState,
+        [Parameter(Mandatory = $true)][object[]]$ResumeChain,
+        [Parameter(Mandatory = $true)][string]$JobId,
+        [Parameter(Mandatory = $true)][string]$ExpectedName,
+        [Parameter(Mandatory = $true)][int64]$ThresholdEpochMs,
+        [string]$FlinkBaseUrl = "http://localhost:8081"
+    )
+
+    if ([string]$ResumeState.ResumeAction -ne "read_only_finalize" -or
+        [int]$ResumeState.Raw -ne 8 -or [int]$ResumeState.Clean -ne 2 -or
+        [int]$ResumeState.Dlq -ne 5 -or [int]$ResumeState.Late -ne 1) {
+        throw "Only a strict 8/2/5/1 read-only finalize may use persisted watermark proof."
+    }
+    $lateProof = $ResumeState.LateOutputProof
+    if ($null -eq $lateProof -or [int]$lateProof.LateTopicCount -ne 1 -or
+        [int]$lateProof.CleanCount -ne 0 -or [int]$lateProof.DlqCount -ne 0) {
+        throw "Read-only finalize requires exclusive persisted late output proof."
+    }
+    $priorApiFailures = @($ResumeChain | Where-Object {
+        [string]$_.path -match "\.resume-[0-9a-f]{32}\.failed\.json$" -and
+        $_.events_sent -eq $true -and
+        [string]$_.error -match "^Chapter 8 API production evidence did not converge\. Last error: .+$"
+    } | ForEach-Object {
+        try {
+            $failedAt = [DateTimeOffset]::Parse([string]$_.failed_at_utc)
+        } catch {
+            throw "Prior API-gate failed evidence has an invalid timestamp."
+        }
+        [pscustomobject]@{ FailedAt = $failedAt; Evidence = $_ }
+    } | Sort-Object FailedAt)
+    if ($priorApiFailures.Count -eq 0) {
+        throw "Read-only finalize requires prior resume evidence that reached only the API gate."
+    }
+
+    $currentMetric = $null
+    try {
+        $observed = Get-ProductionCurrentWatermarkMetric -JobId $JobId `
+            -ExpectedName $ExpectedName -FlinkBaseUrl $FlinkBaseUrl
+        if ([int64]$observed.Watermark -ne [int64]::MinValue) {
+            $currentMetric = $observed
+        }
+    } catch {
+        $currentMetric = $null
+    }
+    return [pscustomobject]@{
+        WatermarkProofSource = "observed_late_output_after_prior_gate"
+        ThresholdEpochMs = $ThresholdEpochMs
+        LateOutputProof = $lateProof
+        PriorGateEvidence = $priorApiFailures[-1].Evidence
+        CurrentMetric = $currentMetric
     }
 }
 
@@ -1529,15 +1615,19 @@ try {
     }
 
     $productionJob = @($expectedJobs | Where-Object { $_.Key -eq "production" })[0]
-    $watermarkEvidence = Wait-ProductionWatermarkPast -JobId $productionJob.Id `
-        -ExpectedName $productionJob.Name `
-        -ThresholdEpochMs $lateEventTime.ToUnixTimeMilliseconds()
     if ($logicalRunResumed -and $resumeState.ResumeAction -eq "read_only_finalize") {
+        $watermarkEvidence = Get-ProductionReadOnlyWatermarkProof `
+            -ResumeState $resumeState -ResumeChain $resumeAuthorization.ResumeChain `
+            -JobId $productionJob.Id -ExpectedName $productionJob.Name `
+            -ThresholdEpochMs $lateEventTime.ToUnixTimeMilliseconds()
         $productionFinalCheckpoint = Wait-NewProductionCheckpoint -JobId $productionJob.Id `
             -ExpectedName $productionJob.Name `
             -Baseline $checkpointBaselines.production.Completed `
             -TimeoutSeconds $TimeoutSeconds
     } else {
+        $watermarkEvidence = Wait-ProductionWatermarkPast -JobId $productionJob.Id `
+            -ExpectedName $productionJob.Name `
+            -ThresholdEpochMs $lateEventTime.ToUnixTimeMilliseconds()
         $preLateCheckpoint = Get-ProductionCheckpointEvidence -JobId $productionJob.Id `
             -ExpectedName $productionJob.Name
         Invoke-ProductionSendOnce -RunState $runState -Stage Late -Action {
@@ -1692,10 +1782,36 @@ try {
             }
             jobs = $jobEvidence
             watermark_gate = [ordered]@{
-                vertex_id = $watermarkEvidence.VertexId
-                metric_id = $watermarkEvidence.MetricId
-                watermark = $watermarkEvidence.Watermark
+                watermark_proof_source = if ($logicalRunResumed -and
+                    $resumeState.ResumeAction -eq "read_only_finalize") {
+                    $watermarkEvidence.WatermarkProofSource
+                } else { "live_operator_watermark" }
+                vertex_id = if ($watermarkEvidence.CurrentMetric) {
+                    $watermarkEvidence.CurrentMetric.VertexId
+                } else { $watermarkEvidence.VertexId }
+                metric_id = if ($watermarkEvidence.CurrentMetric) {
+                    $watermarkEvidence.CurrentMetric.MetricId
+                } else { $watermarkEvidence.MetricId }
+                watermark = if ($watermarkEvidence.CurrentMetric) {
+                    $watermarkEvidence.CurrentMetric.Watermark
+                } else { $watermarkEvidence.Watermark }
                 late_event_timestamp = $watermarkEvidence.ThresholdEpochMs
+                current_metric = if ($watermarkEvidence.CurrentMetric) {
+                    [ordered]@{
+                        vertex_id = $watermarkEvidence.CurrentMetric.VertexId
+                        metric_id = $watermarkEvidence.CurrentMetric.MetricId
+                        watermark = $watermarkEvidence.CurrentMetric.Watermark
+                    }
+                } elseif ($logicalRunResumed -and
+                    $resumeState.ResumeAction -eq "read_only_finalize") { $null } else {
+                    [ordered]@{
+                        vertex_id = $watermarkEvidence.VertexId
+                        metric_id = $watermarkEvidence.MetricId
+                        watermark = $watermarkEvidence.Watermark
+                    }
+                }
+                late_output_proof = $watermarkEvidence.LateOutputProof
+                prior_api_gate_failed_evidence = $watermarkEvidence.PriorGateEvidence
             }
         }
         kafka_groups = $groupEvidence

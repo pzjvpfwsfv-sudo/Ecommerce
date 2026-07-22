@@ -710,6 +710,8 @@ try {
             "derived_recovered",
             "read_only_finalize",
             "resume_chain",
+            "observed_late_output_after_prior_gate",
+            "watermark_proof_source",
         ):
             self.assertIn(marker, text)
         watermark_gate = text.index("$watermarkEvidence = Wait-ProductionWatermarkPast")
@@ -1429,6 +1431,32 @@ $dlq = @(
 $lateRecord = [pscustomobject]@{ event_id = "$runId-late" }
 $resume = Assert-ProductionResumeMatrix -RunId $runId -RawValues $raw `
     -CleanRecords $clean -DlqRecords $dlq -LateRecords @($lateRecord)
+$resumeChain = @([pscustomobject]@{
+    path = "production-verification.$runId.resume-0123456789abcdef0123456789abcdef.failed.json"
+    failed_at_utc = "2026-07-22T10:05:00Z"
+    events_sent = $true
+    error = "Chapter 8 API production evidence did not converge. Last error: timeout"
+})
+function Get-ProductionCurrentWatermarkMetric {
+    return [pscustomobject]@{
+        VertexId = "vertex-1"
+        MetricId = "0.route-late-events.currentInputWatermark"
+        Watermark = [int64]::MinValue
+    }
+}
+$proof = Get-ProductionReadOnlyWatermarkProof -ResumeState $resume `
+    -ResumeChain $resumeChain -JobId "0123456789abcdef0123456789abcdef" `
+    -ExpectedName "chapter-9-datastream-quality-production" `
+    -ThresholdEpochMs $resume.LateEventTime.ToUnixTimeMilliseconds()
+$partialRejected = $false
+try {
+    Get-ProductionReadOnlyWatermarkProof -ResumeState ([pscustomobject]@{
+        ResumeAction = "send_late"; Raw = 7; Clean = 2; Dlq = 5; Late = 0
+        LateOutputProof = $resume.LateOutputProof
+    }) -ResumeChain $resumeChain -JobId "0123456789abcdef0123456789abcdef" `
+        -ExpectedName "chapter-9-datastream-quality-production" `
+        -ThresholdEpochMs $resume.LateEventTime.ToUnixTimeMilliseconds() | Out-Null
+} catch { $partialRejected = $true }
 $root = Join-Path ([IO.Path]::GetTempPath()) ("chapter9-read-only-resume-" + [guid]::NewGuid())
 New-Item -ItemType Directory -Path $root | Out-Null
 try {
@@ -1458,6 +1486,13 @@ try {
     late_sent_state = $state.LateSent
     late_rejected = $lateRejected
     late_calls = $script:lateCalls
+    proof_source = $proof.WatermarkProofSource
+    current_metric = $proof.CurrentMetric
+    prior_gate_error = $proof.PriorGateEvidence.error
+    late_topic_count = $resume.LateOutputProof.LateTopicCount
+    late_clean_count = $resume.LateOutputProof.CleanCount
+    late_dlq_count = $resume.LateOutputProof.DlqCount
+    partial_rejected = $partialRejected
 } | ConvertTo-Json -Compress
 '''
         result = self._run_powershell(command)
@@ -1468,3 +1503,10 @@ try {
         self.assertTrue(payload["late_sent_state"])
         self.assertTrue(payload["late_rejected"])
         self.assertEqual(0, payload["late_calls"])
+        self.assertEqual("observed_late_output_after_prior_gate", payload["proof_source"])
+        self.assertIsNone(payload["current_metric"])
+        self.assertIn("Chapter 8 API production evidence did not converge", payload["prior_gate_error"])
+        self.assertEqual((1, 0, 0), tuple(payload[key] for key in (
+            "late_topic_count", "late_clean_count", "late_dlq_count"
+        )))
+        self.assertTrue(payload["partial_rejected"])
