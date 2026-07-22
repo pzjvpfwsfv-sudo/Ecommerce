@@ -73,7 +73,8 @@ Flink SQL -> Doris / Iceberg
 - 回归 Doris、Iceberg、Trino 和第 8 章 API。
 - 验证失败时恢复原始 Topic Source。
 
-Phase A 完成后必须先展示对账证据，再由用户确认是否进入 Phase B，不自动连续执行。
+Phase A 完成后先展示对账证据，再由用户确认进入 Phase B；该人工确认已经完成，Phase B
+也已按受控流程执行完毕。
 
 ### 4.3 后续章节再做
 
@@ -358,7 +359,8 @@ Phase A 完成需同时满足：
 5. Checkpoint 成功，TaskManager 重启后作业恢复。
 6. 影子阶段满足数量对账。
 
-完成以上 6 项后，文档状态必须写成“影子链路已完成、主链路尚未切换”，不能把旁路验证描述成正式上线。Phase B 的独立验收标准是：正式切流经过人工确认、回滚入口可用，并且 Doris、Iceberg、Trino 和第 8 章 API 回归通过。
+完成以上 6 项后，Phase A 的历史验收证据应单独保留；本章最终状态还必须记录 Phase B
+正式切流经过人工确认、回滚入口可用，并且 Doris、Iceberg、Trino 和第 8 章 API 回归通过。
 
 ## 15. 面试表达
 
@@ -374,6 +376,25 @@ Phase A 完成需同时满足：
 - 固定延迟重启从 5 秒调整为 15 秒，最大尝试次数仍为 3 次。
 - PowerShell 脚本保持 ASCII，避免 PowerShell 5 对 UTF-8 无 BOM 中文字符串的解析问题。
 
-详细 Job ID、Savepoint 路径和排障证据见 `docs/chapter-9-datastream-quality-runbook.md`。
+详细 Phase A 与 Phase B Job ID、Savepoint 路径、Checkpoint、验收和排障证据见
+`docs/chapter-9-datastream-quality-runbook.md`。
 
-**影子链路已完成、主链路尚未切换。Phase B 仍需用户二次确认。**
+## 17. Phase B 正式切流结果（2026-07-22）
+
+- 单 TaskManager 已从 2 slots 扩为 4 slots；影子 Job
+  `6f6e24deea18e22722bfd5e0a83895e4` 通过
+  `file:/workspace/tmp/savepoints/chapter-9/savepoint-6f6e24-cb1178e80c05` 交接到
+  production Job `0d8edd967461402a66e9672d2335ca6d`。
+- Doris clean Job 为 `bf10b31978af0ae53446535c41120870`，Iceberg clean Job 为
+  `ce7ec8a8d04e70f45f6c7806ed1ede28`；三者均 RUNNING，且均产生新的成功 Checkpoint。
+- Cutover raw 边界为 `partition:0,offset:212`；最终逻辑 run
+  `chapter9-production-ab626f6106d5462c8212cc15369e9255` 的结果为
+  `raw/clean/dlq/late=8/2/5/1`，五种 DLQ reason 各 1 次，duplicate clean 1。
+- Kafka production readable lag 为 0；两个 clean group 的 CLI lag 为 1、readable lag 为 0，
+  因 offset 是 `COMMIT` control record。Doris 为 2/2，Trino 最终 817，API historical
+  event_count 为 817，且回滚 dry-run 未改变任何运行作业。
+- 以上是同一逻辑 run 的分阶段恢复与最终 `read_only_finalize`，不是首次一次成功；最终只读阶段
+  `events_sent_this_attempt=false` 且没有再次发送事件。
+
+当前 Flink 容器仍挂载本 worktree，故不得删除该 worktree；Doris/Iceberg 的 connector
+Exactly-Once 仍按第 10 节边界解释，不扩展为跨系统端到端语义。

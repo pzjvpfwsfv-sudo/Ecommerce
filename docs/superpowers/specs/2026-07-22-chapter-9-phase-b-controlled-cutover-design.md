@@ -111,7 +111,8 @@ Flink SQL -> Doris             Flink SQL -> Iceberg
 - DataStream 作业在恢复流量后产生新的成功 Checkpoint。
 - 正常事件进入 `user_behavior_clean`，非法和重复事件进入 `user_behavior_dlq`，迟到事件进入 `user_behavior_late`。
 - 受控测试满足 `raw = clean + dlq + late`，重复事件只在 clean 中保留一次。
-- 正式 Consumer Group lag 最终归零。
+- production Group 的 CLI/readable lag 为 `0/0`；Doris 与 Iceberg clean Group 保留 CLI lag `1`，
+  但 readable data lag 为 `0`，因为未读 offset 是 `COMMIT` transaction-control record。
 
 ### 6.2 下游回归
 
@@ -162,6 +163,22 @@ Phase B 提供以下独立脚本：
 
 “影子验证通过后，我没有直接把 SQL Source 改到 clean Topic，而是先核算资源，发现本地 Flink 的 2 个 slots 无法同时承载 DataStream、Doris SQL 和 Iceberg SQL。于是我先将单 TaskManager 扩为 4 slots，并限制 Compose 只重建 TaskManager。切流时暂停生成器、等待 lag 清零，再通过 Stop-with-Savepoint 把影子作业状态交接给 production 作业，最后切换两个 SQL 下游。验收不仅看 RUNNING，还检查 Checkpoint、Kafka 守恒对账、Doris PV/UV、Iceberg 明细、Trino 和 AI API。整个过程保留原始 Topic、旧 Source 和 Savepoint，因此可以按明确步骤回滚。”
 
-## 10. 状态
+## 10. Phase B 实施结果与状态
 
-本设计已确认采用“单 TaskManager 4 slots”方案。当前仅完成 Phase B 设计，尚未执行资源扩容或正式切流。
+本设计采用的单 TaskManager 4 slots 方案已执行完成。影子 Job
+`6f6e24deea18e22722bfd5e0a83895e4` 通过
+`file:/workspace/tmp/savepoints/chapter-9/savepoint-6f6e24-cb1178e80c05` 恢复为
+production Job `0d8edd967461402a66e9672d2335ca6d`；Doris clean Job 为
+`bf10b31978af0ae53446535c41120870`，Iceberg clean Job 为
+`ce7ec8a8d04e70f45f6c7806ed1ede28`，raw 边界为
+`partition:0,offset:212`。
+
+最终逻辑 run `chapter9-production-ab626f6106d5462c8212cc15369e9255` 以分阶段恢复完成，
+不是首次一次成功：先完成 7 条发送、随后 late-only 恢复，最终由
+`read_only_finalize` 零发送收尾。最终 `raw/clean/dlq/late=8/2/5/1`、五个 DLQ reason
+各 1、Doris `2/2`、Trino `817`、API historical `817`；回滚 dry-run 按 manifest 渲染
+raw SQL 且未执行 stop/cancel/submit。详细 checkpoint baseline/final、Kafka control offset、
+Watermark 持久 late 证据和排障记录见运行手册。
+
+当前正式状态为 **Phase B 正式切流已完成**。原始 Topic、影子 Topic、旧 SQL Source、状态和
+Savepoint 均保留；当前 Flink 容器仍挂载本 worktree，未完成挂载迁移前不得删除它。

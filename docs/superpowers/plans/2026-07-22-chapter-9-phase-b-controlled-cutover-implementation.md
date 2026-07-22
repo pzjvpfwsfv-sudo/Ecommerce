@@ -56,7 +56,7 @@
 - Produces: SQL 表名 `user_behavior_source`，供现有 `05_pv_uv_to_doris.sql` 与 `07_sink_user_behavior_to_iceberg.sql` 直接复用。
 - Produces: 回滚模板占位符 `__ROLLBACK_GROUP_ID__` 与 `__SPECIFIC_OFFSETS__`。
 
-- [ ] **Step 1: 写失败的配置与 SQL 契约测试**
+- [x] **Step 1: 写失败的配置与 SQL 契约测试**
 
 ```python
 from pathlib import Path
@@ -93,13 +93,13 @@ class Chapter9PhaseBArtifactsTest(unittest.TestCase):
         self.assertIn("__SPECIFIC_OFFSETS__", text)
 ```
 
-- [ ] **Step 2: 运行测试确认失败**
+- [x] **Step 2: 运行测试确认失败**
 
 Run: `python -m unittest tests.test_chapter_9_phase_b_artifacts -v`
 
 Expected: FAIL，提示 Phase B SQL 文件不存在或 `FLINK_TASKMANAGER_SLOTS=4` 缺失。
 
-- [ ] **Step 3: 添加最小配置并创建三个 Source 文件**
+- [x] **Step 3: 添加最小配置并创建三个 Source 文件**
 
 两个 clean Source 均保持现有八字段 Schema 和 JSON 格式，但分别使用 `chapter9-doris-clean-v1` 与 `chapter9-iceberg-clean-v1`；startup mode 使用 `earliest-offset`，因为正式 clean Topic 在切流前不被下游消费。
 
@@ -113,7 +113,7 @@ Expected: FAIL，提示 Phase B SQL 文件不存在或 `FLINK_TASKMANAGER_SLOTS=
 'format' = 'json'
 ```
 
-- [ ] **Step 4: 运行配置测试与仓库基线**
+- [x] **Step 4: 运行配置测试与仓库基线**
 
 Run: `python -m unittest tests.test_chapter_9_phase_b_artifacts -v`
 
@@ -123,7 +123,7 @@ Run: `python -m unittest discover -s tests -v`
 
 Expected: 现有 110 项加新增测试全部 PASS。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```powershell
 git add -- infra/.env.example jobs/sql/13_source_user_behavior_clean_doris.sql jobs/sql/14_source_user_behavior_clean_iceberg.sql jobs/sql/15_source_user_behavior_raw_rollback.sql.template tests/test_chapter_9_phase_b_artifacts.py
@@ -143,7 +143,7 @@ git commit -m "feat: define chapter 9 production sources"
 - Produces: `Assert-FlinkCapacity([object]$Overview) -> void`。
 - Consumes: `infra/.env.example` 中的 `FLINK_TASKMANAGER_SLOTS=4`。
 
-- [ ] **Step 1: 写失败的安全边界测试**
+- [x] **Step 1: 写失败的安全边界测试**
 
 在 Python 测试中断言脚本包含以下标记：
 
@@ -163,13 +163,13 @@ def test_resize_script_recreates_only_taskmanager_and_checks_recovery(self):
     self.assertNotIn("docker compose down", text)
 ```
 
-- [ ] **Step 2: 运行测试确认失败**
+- [x] **Step 2: 运行测试确认失败**
 
 Run: `python -m unittest tests.test_chapter_9_phase_b_artifacts.Chapter9PhaseBArtifactsTest.test_resize_script_recreates_only_taskmanager_and_checks_recovery -v`
 
 Expected: FAIL，提示扩容脚本不存在。
 
-- [ ] **Step 3: 实现扩容脚本**
+- [x] **Step 3: 实现扩容脚本**
 
 脚本按以下顺序执行：
 
@@ -189,7 +189,7 @@ docker compose --env-file $envFile -f $compose --profile flink up -d `
 
 脚本增加 `-FunctionsOnly`，便于加载纯函数测试，不执行 Docker 命令。
 
-- [ ] **Step 4: 测试 PowerShell 语法和纯函数**
+- [x] **Step 4: 测试 PowerShell 语法和纯函数**
 
 Run:
 
@@ -207,13 +207,13 @@ Assert-FlinkCapacity ([pscustomobject]@{ taskmanagers=1; 'slots-total'=4 })
 
 Expected: 无语法错误、无异常。
 
-- [ ] **Step 5: 运行扩容并记录证据**
+- [x] **Step 5: 运行扩容并记录证据**
 
 Run: `./scripts/resize_chapter_9_flink_slots.ps1`
 
 Expected: 同一影子 Job ID 恢复 `RUNNING`，`slots-total=4`，出现新的成功 Checkpoint。
 
-- [ ] **Step 6: 提交**
+- [x] **Step 6: 提交**
 
 ```powershell
 git add -- scripts/resize_chapter_9_flink_slots.ps1 tests/test_chapter_9_phase_b_artifacts.py
@@ -233,7 +233,7 @@ git commit -m "ops: resize chapter 9 flink capacity"
 - Produces: 三个作业名 `chapter-9-datastream-quality-production`、`chapter-9-doris-clean`、`chapter-9-iceberg-clean`。
 - Consumes: Task 1 的两个 clean Source、现有 Doris/Iceberg Sink SQL 和 DataStream Fat JAR。
 
-- [ ] **Step 1: 写失败的切流脚本契约测试**
+- [x] **Step 1: 写失败的切流脚本契约测试**
 
 ```python
 def test_cutover_requires_traffic_gate_savepoint_manifest_and_three_jobs(self):
@@ -258,19 +258,19 @@ def test_cutover_requires_traffic_gate_savepoint_manifest_and_three_jobs(self):
     self.assertNotIn("kafka-topics --delete", text)
 ```
 
-- [ ] **Step 2: 运行测试确认失败**
+- [x] **Step 2: 运行测试确认失败**
 
 Run: `python -m unittest tests.test_chapter_9_phase_b_artifacts.Chapter9PhaseBArtifactsTest.test_cutover_requires_traffic_gate_savepoint_manifest_and_three_jobs -v`
 
 Expected: FAIL，提示切流脚本不存在。
 
-- [ ] **Step 3: 实现 fail-fast 预检和 offset manifest**
+- [x] **Step 3: 实现 fail-fast 预检和 offset manifest**
 
 脚本必须要求显式 `-TrafficPaused`。预检包括：Docker 服务可用、`slots-total=4`、只有一个影子 DataStream 作业、最近 Checkpoint 成功、正式作业名尚不存在、`user_behavior_clean` 通过 `--if-not-exists` 创建。
 
 使用 `kafka-get-offsets --topic user_behavior_events` 记录每个分区的 log-end offset；使用 `kafka-consumer-groups --describe --group chapter9-quality-shadow` 轮询总 lag 为 0。将 offset 以 Kafka SQL 格式保存，例如 `partition:0,offset:42`。
 
-- [ ] **Step 4: 实现 Savepoint 状态交接**
+- [x] **Step 4: 实现 Savepoint 状态交接**
 
 执行：
 
@@ -291,7 +291,7 @@ docker exec $jobManager /opt/flink/bin/flink run -d -s $savepointPath `
 
 要求解析新 Job ID、等待 `RUNNING` 并等待首个成功 Checkpoint。任何恢复错误立即退出，不提交 SQL 下游。
 
-- [ ] **Step 5: 分别提交 Doris 与 Iceberg SQL 作业**
+- [x] **Step 5: 分别提交 Doris 与 Iceberg SQL 作业**
 
 生成两个 UTF-8 无 BOM 临时 SQL：
 
@@ -305,7 +305,7 @@ tmp/chapter-9/iceberg-clean.sql
 
 通过 `ecom-flink-sql-client` 提交，并从 Flink REST 按精确作业名获取 Job ID。要求三个作业均为 `RUNNING` 后，原子写入 `cutover-manifest.json`；先写 `.partial`，再使用 `Move-Item -LiteralPath` 替换。
 
-- [ ] **Step 6: 运行静态测试和语法测试**
+- [x] **Step 6: 运行静态测试和语法测试**
 
 Run: `python -m unittest tests.test_chapter_9_phase_b_artifacts -v`
 
@@ -315,7 +315,7 @@ Run: 使用 PowerShell Parser 解析 `scripts/run_chapter_9_production_cutover.p
 
 Expected: `$errors.Count = 0`。
 
-- [ ] **Step 7: 提交**
+- [x] **Step 7: 提交**
 
 ```powershell
 git add -- scripts/run_chapter_9_production_cutover.ps1 tests/test_chapter_9_phase_b_artifacts.py
@@ -334,7 +334,7 @@ git commit -m "feat: orchestrate chapter 9 production cutover"
 - Consumes: `tmp/chapter-9/cutover-manifest.json` 和三个正式 Job ID。
 - Produces: 唯一批次 ID `chapter9-production-<guid>` 以及 raw/clean/DLQ/late、Doris、Iceberg、Trino、API 证据。
 
-- [ ] **Step 1: 写失败的验收契约测试**
+- [x] **Step 1: 写失败的验收契约测试**
 
 ```python
 def test_production_verifier_checks_quality_and_all_downstreams(self):
@@ -355,13 +355,13 @@ def test_production_verifier_checks_quality_and_all_downstreams(self):
         self.assertIn(marker, text)
 ```
 
-- [ ] **Step 2: 运行测试确认失败**
+- [x] **Step 2: 运行测试确认失败**
 
 Run: `python -m unittest tests.test_chapter_9_phase_b_artifacts.Chapter9PhaseBArtifactsTest.test_production_verifier_checks_quality_and_all_downstreams -v`
 
 Expected: FAIL，提示验收脚本不存在。
 
-- [ ] **Step 3: 实现八条事件质量矩阵**
+- [x] **Step 3: 实现八条事件质量矩阵**
 
 复用影子验收的 8 条矩阵，但使用 `chapter9-production-<guid>` 嵌入 `event_id/user_id/product_id`。两条 clean 事件使用不同 user ID，使预期为：
 
@@ -375,17 +375,17 @@ duplicate_clean=1
 
 读取 Kafka 输出时使用 `isolation.level=read_committed`，等待至少一个新 production Checkpoint 后再断言结果。
 
-- [ ] **Step 4: 验证三个 Flink 作业和 Kafka Group**
+- [x] **Step 4: 验证三个 Flink 作业和 Kafka Group**
 
-从 manifest 读取 Job ID，要求三个作业均为 `RUNNING`；Flink overview 要求 `taskmanagers=1`、`slots-total=4`、`jobs-running=3`。production、Doris clean、Iceberg clean 三个 Group 的 lag 最终均为 0。
+从 manifest 读取 Job ID，要求三个作业均为 `RUNNING`；Flink overview 要求 `taskmanagers=1`、`slots-total=4`、`jobs-running=3`。production Group 的 CLI/readable lag 为 `0/0`；Doris 与 Iceberg clean Group 的 CLI/readable lag 为 `1/0`，未读 offset 均为 `COMMIT` control record。
 
-- [ ] **Step 5: 验证 Doris、Iceberg、Trino 与 API**
+- [x] **Step 5: 验证 Doris、Iceberg、Trino 与 API**
 
 轮询 Doris `analytics.realtime_metrics`，要求本次 clean 作业状态最终产生 `pv=2`、`uv=2`。通过 Trino 对两个精确 event ID 查询，要求 Iceberg `event_count=2`、`distinct_event_id=2`、`distinct_user_id=2`，且五条 DLQ 与一条 late 事件均不存在于明细表。
 
 调用 `POST http://localhost:8000/analysis/realtime`，要求 HTTP 成功、`evidence` 非空，并且证据中的 Doris/Trino 查询时间晚于本次切流批次开始时间。这里验证 API 可用和证据落地，不要求模型模式，规则模式或自动降级均可。
 
-- [ ] **Step 6: 运行静态、语法和纯函数测试**
+- [x] **Step 6: 运行静态、语法和纯函数测试**
 
 Run: `python -m unittest tests.test_chapter_9_phase_b_artifacts -v`
 
@@ -395,7 +395,7 @@ Run: PowerShell Parser 解析验收脚本，并以 `-FunctionsOnly` 加载。
 
 Expected: 无语法错误且加载过程不发送 Kafka 数据。
 
-- [ ] **Step 7: 提交**
+- [x] **Step 7: 提交**
 
 ```powershell
 git add -- scripts/verify_chapter_9_production.ps1 tests/test_chapter_9_phase_b_artifacts.py
@@ -414,7 +414,7 @@ git commit -m "test: verify chapter 9 production pipeline"
 - Consumes: `tmp/chapter-9/cutover-manifest.json` 中的 raw partition offsets 和正式 Job ID。
 - Produces: `tmp/chapter-9/rollback-doris-raw.sql`、`tmp/chapter-9/rollback-iceberg-raw.sql` 与两个 raw 回滚 SQL 作业。
 
-- [ ] **Step 1: 写失败的回滚安全测试**
+- [x] **Step 1: 写失败的回滚安全测试**
 
 ```python
 def test_rollback_is_manifest_driven_and_non_destructive(self):
@@ -434,19 +434,19 @@ def test_rollback_is_manifest_driven_and_non_destructive(self):
         self.assertNotIn(forbidden, text)
 ```
 
-- [ ] **Step 2: 运行测试确认失败**
+- [x] **Step 2: 运行测试确认失败**
 
 Run: `python -m unittest tests.test_chapter_9_phase_b_artifacts.Chapter9PhaseBArtifactsTest.test_rollback_is_manifest_driven_and_non_destructive -v`
 
 Expected: FAIL，提示回滚脚本不存在。
 
-- [ ] **Step 3: 实现 dry-run 与模板渲染**
+- [x] **Step 3: 实现 dry-run 与模板渲染**
 
 脚本要求 `-TrafficPaused`，读取 manifest 并校验全部字段。将模板分别渲染为两个 SQL 文件，Group 为 `chapter9-doris-raw-rollback-<cutover_id>` 和 `chapter9-iceberg-raw-rollback-<cutover_id>`，specific offsets 使用 manifest 的原始边界。
 
 `-DryRun` 只验证 manifest、渲染 SQL 并输出将停止和启动的精确 Job ID/作业名，不调用 Flink stop/cancel，也不提交 SQL。
 
-- [ ] **Step 4: 实现真实回滚顺序**
+- [x] **Step 4: 实现真实回滚顺序**
 
 非 DryRun 模式：
 
@@ -458,13 +458,13 @@ Expected: FAIL，提示回滚脚本不存在。
 
 脚本不自动处理已经写入 Doris/Iceberg 的切流批次；输出批次 ID 和两个 clean event ID，供显式补偿或审计。
 
-- [ ] **Step 5: 验证 dry-run**
+- [x] **Step 5: 验证 dry-run**
 
 Run: `./scripts/rollback_chapter_9_production.ps1 -TrafficPaused -DryRun`
 
 Expected: 成功渲染 specific-offset Source，输出精确回滚计划，当前三个正式作业状态不变。
 
-- [ ] **Step 6: 提交**
+- [x] **Step 6: 提交**
 
 ```powershell
 git add -- scripts/rollback_chapter_9_production.ps1 tests/test_chapter_9_phase_b_artifacts.py
@@ -486,11 +486,11 @@ git commit -m "ops: add chapter 9 manifest rollback"
 - Consumes: Tasks 1-5 的脚本、SQL 和 manifest。
 - Produces: Phase B 最终 Job ID、Savepoint、offset、Checkpoint、对账和下游回归证据。
 
-- [ ] **Step 1: 运行全部自动化测试**
+- [x] **Step 1: 运行全部自动化测试**
 
 Run: `python -m unittest discover -s tests -v`
 
-Expected: 全部 PASS。
+实际结果：全量 Python 回归最终为 149/149 PASS；Java 17 Maven JUnit 为 15/15 PASS。
 
 Run:
 
@@ -499,9 +499,9 @@ docker run --rm -v "${PWD}:/workspace" -w /workspace/jobs/datastream-quality `
   maven:3.9.9-eclipse-temurin-17 mvn -q test
 ```
 
-Expected: 15 项 JUnit 全部 PASS。
+实际结果：15 项 JUnit 全部 PASS。
 
-- [ ] **Step 2: 扩容并执行正式切流**
+- [x] **Step 2: 扩容并执行正式切流**
 
 确认没有正在运行的 `generators/run_generator.py` 进程后执行：
 
@@ -510,20 +510,27 @@ Expected: 15 项 JUnit 全部 PASS。
 ./scripts/run_chapter_9_production_cutover.ps1 -TrafficPaused
 ```
 
-Expected: 影子作业通过 Savepoint 停止；DataStream production、Doris clean、Iceberg clean 三作业均为 `RUNNING`。
+实际结果：slots 由 2 扩为 4；影子作业通过 Savepoint 停止，production、Doris clean、Iceberg clean
+三作业均为 `RUNNING`。正式切流使用 manifest raw offset `partition:0,offset:212`，保存影子
+Job `6f6e24deea18e22722bfd5e0a83895e4` 的 Savepoint 后，三个最终 Job ID 分别为
+`0d8edd967461402a66e9672d2335ca6d`、`bf10b31978af0ae53446535c41120870`、
+`ce7ec8a8d04e70f45f6c7806ed1ede28`。
 
-- [ ] **Step 3: 执行正式验收与回滚 dry-run**
+- [x] **Step 3: 执行正式验收与回滚 dry-run**
 
 Run:
 
 ```powershell
-./scripts/verify_chapter_9_production.ps1
 ./scripts/rollback_chapter_9_production.ps1 -TrafficPaused -DryRun
 ```
 
-Expected: `raw=8 clean=2 dlq=5 late=1`；Doris `pv=2 uv=2`；Trino 精确读取 2 条 clean 明细；API 返回可信证据；回滚 dry-run 不改变当前作业。
+原始单次验收命令按真实恢复流程调整：逻辑 run `ab626...` 先经历 7 条发送的 watermark
+失败、late-only resume 的 API 超时，再由 `read_only_finalize` 以零发送完成最终 JSON；未声称首次一次成功，
+也未重发前 7 条。最终为 `raw=8 clean=2 dlq=5 late=1`、Doris `2/2`、Trino `817`、API
+historical `817`。rollback dry-run 使用 offset `212` 渲染两个 raw SQL，前后运行作业身份不变，
+未调用 stop/cancel/submit。
 
-- [ ] **Step 4: 记录真实证据和排障，不伪造结果**
+- [x] **Step 4: 记录真实证据和排障，不伪造结果**
 
 在 runbook 中记录实际：
 
@@ -538,8 +545,12 @@ Expected: `raw=8 clean=2 dlq=5 late=1`；Doris `pv=2 uv=2`；Trino 精确读取 
 - 执行过程中真实发生的错误、根因和修复。
 
 将两个设计文档状态更新为“Phase B 正式切流已完成”，勾选原第 9 章计划的 Phase B 门禁和本计划所有已完成步骤。
+真实排障已记录：空 connector 挂载及 SHA-256 校验 JAR、旧 worktree MinIO 无损恢复与 Hive metadata
+指针修复、Flink 历史同名 job、Doris earliest 重放后 specific offset 4、Watermark REST 数组和
+idle `Int64.MinValue`、Kafka `COMMIT` control offset、Trino OOM/旧 Chapter 8 挂载、API offset-free
+时间按 UTC，以及 rollback I1-I4 修复与复审。
 
-- [ ] **Step 5: 最终回归与状态检查**
+- [x] **Step 5: 最终回归与状态检查**
 
 Run:
 
@@ -549,35 +560,40 @@ git diff --check
 git status --short
 ```
 
-Expected: 测试全部 PASS；无 whitespace error；仅出现本任务文档修改和用户原有 `.superpowers/sdd/task-1-report.md` 修改。
+实际结果：149/149 Python 测试、`git diff --check` 通过；变更范围审计只允许本任务五份文档，另有
+`.superpowers/sdd/chapter9-phase-b-task-6-report.md` 作为忽略文件，不进入提交。
 
-- [ ] **Step 6: 请求代码审查并修复 P0/P1/P2 问题**
+- [x] **Step 6: 请求代码审查并修复 P0/P1/P2 问题**
 
 重点审查：Compose 重建范围、挂载路径一致性、Consumer Group 隔离、Savepoint UID 兼容、offset manifest、回滚幂等性、SQL 重复写入和验收证据真实性。
+实际结果：Task 3/4/5 review 与 rereview 已完成；Task 5 I1-I4 已修复并以 0 Critical/Important
+复审通过。
 
-- [ ] **Step 7: 提交并推送**
+- [x] **Step 7: 提交五份文档**
 
 ```powershell
 git add -- docs/chapter-9-datastream-quality-runbook.md docs/superpowers/specs/2026-07-22-chapter-9-java-datastream-data-quality-design.md docs/superpowers/specs/2026-07-22-chapter-9-phase-b-controlled-cutover-design.md docs/superpowers/plans/2026-07-22-chapter-9-java-datastream-data-quality-implementation.md docs/superpowers/plans/2026-07-22-chapter-9-phase-b-controlled-cutover-implementation.md
 git commit -m "docs: close chapter 9 production cutover"
-Set-Location 'D:\桌面\实时湖仓电商行为数据平台 + AI 指标分析助手项目'
-git merge --ff-only codex/chapter-9-datastream-quality
-git push origin main
 ```
 
-合并后不得删除 `.worktrees/chapter-9-datastream-quality`，因为当前 Flink 容器仍将其挂载为 `/workspace`。Expected: `main` 快进到 Chapter 9 功能分支，GitHub `main` 包含 Phase B 全部提交；`.superpowers/sdd/task-1-report.md` 未进入任何提交。
+本 Task 只提交五份文档，不在本工作流中 merge 或 push。提交后仍不得删除
+`.worktrees/chapter-9-datastream-quality`，因为当前 Flink 容器仍将其挂载为 `/workspace`。
+`.superpowers/sdd/chapter9-phase-b-task-6-report.md` 仅作忽略的本地收尾记录。
 
 ---
 
 ## 最终验收门禁
 
-- [ ] 单 TaskManager 提供 4 slots，未级联重建其他有状态服务。
-- [ ] 影子作业通过 Savepoint 成功交接到 production，去重状态未被绕过或丢弃。
-- [ ] DataStream、Doris SQL、Iceberg SQL 三作业同时稳定运行并产生成功 Checkpoint。
-- [ ] Doris 与 Iceberg 使用不同 Kafka Consumer Group。
-- [ ] 正式质量矩阵满足 `raw=8 clean=2 dlq=5 late=1`。
-- [ ] Doris、Iceberg、Trino 和第 8 章 API 回归通过。
-- [ ] 回滚脚本能从 manifest 的 raw offset 渲染并 dry-run，且不删除数据或状态。
-- [ ] Python、JUnit、PowerShell 语法和最终仓库检查全部通过。
+- [x] 单 TaskManager 提供 4 slots，未级联重建其他有状态服务。
+- [x] 影子作业通过 Savepoint 成功交接到 production，去重状态未被绕过或丢弃。
+- [x] DataStream、Doris SQL、Iceberg SQL 三作业同时稳定运行并产生成功 Checkpoint。
+- [x] Doris 与 Iceberg 使用不同 Kafka Consumer Group。
+- [x] 正式质量矩阵满足 `raw=8 clean=2 dlq=5 late=1`。
+- [x] Doris、Iceberg、Trino 和第 8 章 API 回归通过。
+- [x] 回滚脚本能从 manifest 的 raw offset 渲染并 dry-run，且不删除数据或状态。
+- [x] Python、JUnit、PowerShell 语法和最终仓库检查全部通过。
 
-**执行边界：本计划文档完成时仍未扩容、未切流；只有进入实现工作流后才操作真实链路。**
+**执行边界实录（2026-07-22）：本计划所述 Phase B 已完成。原定“一次 verify 后直接
+dry-run”的命令因真实 watermark 数组、API 超时和 idle `Int64.MinValue` 证据，按恢复流程调整为
+失败证据保留、同逻辑 run 的 late-only resume、最终 `read_only_finalize` 零发送；最终 JSON 通过且
+回滚 dry-run 无 mutation。当前 Flink 仍挂载此 worktree，未完成挂载迁移前不得删除。**
