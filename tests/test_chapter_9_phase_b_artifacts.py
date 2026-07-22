@@ -108,15 +108,40 @@ class Chapter9PhaseBArtifactsTest(unittest.TestCase):
         for marker in (
             "http://localhost:9000/minio/health/ready",
             "test -d /data",
+            'Join-Path $root "infra/compose/minio/data"',
             "/dev/tcp/hive-metastore/9083",
             "/dev/tcp/doris-fe/8030",
             "/dev/tcp/minio/9000",
             "SHOW TABLES FROM analytics LIKE 'realtime_metrics'",
             "doris-preflight.sql",
             "iceberg-preflight.sql",
+            "SET 'execution.runtime-mode' = 'batch';",
+            "SELECT COUNT(*) FROM lakehouse.analytics.user_behavior_detail;",
         ):
             self.assertIn(marker, text)
             self.assertLess(text.index(marker), text.index("[cutover] stopping shadow job"))
+
+    def test_cutover_rejects_wrong_minio_data_bind_source(self):
+        command = r'''
+$ErrorActionPreference = "Stop"
+. (Resolve-Path "scripts/run_chapter_9_production_cutover.ps1") -FunctionsOnly
+function Invoke-DockerCommand {
+    param([string[]]$Arguments, [string]$FailureMessage)
+    return @('{"Mounts":[{"Type":"bind","Source":"C:\\wrong-worktree\\infra\\compose\\minio\\data","Destination":"/data"}]}')
+}
+$rejected = $false
+try {
+    Assert-ContainerBindMountSource -Container "ecom-minio" -Destination "/data" `
+        -ExpectedSource "C:\current-worktree\infra\compose\minio\data"
+} catch {
+    $rejected = $_.Exception.Message -match "mount source mismatch"
+}
+[ordered]@{ rejected = $rejected } | ConvertTo-Json -Compress
+'''
+        result = self._run_powershell(command)
+        self.assertEqual(0, result.returncode, result.stderr or result.stdout)
+        payload = json.loads(result.stdout.strip().splitlines()[-1])
+        self.assertTrue(payload["rejected"])
 
     def test_cutover_resume_partial_validates_exact_jobs_and_skips_completed_steps(self):
         text = (ROOT / "scripts/run_chapter_9_production_cutover.ps1").read_text(encoding="ascii")
@@ -180,6 +205,87 @@ $adoptedIcebergId = Assert-ResumeManifest -Manifest $manifest -Jobs $jobs
         self.assertTrue(payload["mismatch_rejected"])
         self.assertTrue(payload["populated_rejected"])
         self.assertEqual("33333333333333333333333333333333", payload["adopted_iceberg_id"])
+
+    def test_cutover_finalization_keeps_partial_resumable_and_writes_independent_final(self):
+        command = r'''
+$ErrorActionPreference = "Stop"
+. (Resolve-Path "scripts/run_chapter_9_production_cutover.ps1") -FunctionsOnly
+$tempRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("chapter9-finalize-" + [guid]::NewGuid())
+New-Item -ItemType Directory -Path $tempRoot | Out-Null
+try {
+    $productionId = "0123456789abcdef0123456789abcdef"
+    $dorisId = "fedcba9876543210fedcba9876543210"
+    $icebergId = "33333333333333333333333333333333"
+    $partial = [ordered]@{
+        cutover_id = "cutover-1"
+        created_at = "2026-07-22T00:00:00Z"
+        raw_offsets = @("partition:0,offset:212")
+        shadow_job_id = "11111111111111111111111111111111"
+        savepoint_path = "file:/workspace/tmp/savepoints/chapter-9/savepoint-1"
+        production_job_id = $productionId
+        doris_job_id = $dorisId
+        iceberg_job_id = $null
+    }
+    $checkpoints = [pscustomobject]@{
+        counts = [pscustomobject]@{ completed = 1 }
+        latest = [pscustomobject]@{ completed = [pscustomobject]@{ status = "COMPLETED" } }
+    }
+    $script:failIceberg = $false
+    function Wait-FlinkJobRunning {
+        param([string]$JobId, [string]$ExpectedName)
+        if ($script:failIceberg -and $ExpectedName -eq "chapter-9-iceberg-clean") {
+            throw "simulated terminal state"
+        }
+        return [pscustomobject]@{ jid = $JobId; name = $ExpectedName; state = "RUNNING" }
+    }
+
+    $successPartialPath = Join-Path $tempRoot "success.partial"
+    $successFinalPath = Join-Path $tempRoot "success.json"
+    Write-ManifestPartial -Manifest $partial -PartialPath $successPartialPath
+    Complete-CutoverManifest -PartialPath $successPartialPath -FinalPath $successFinalPath `
+        -ProductionJobId $productionId -DorisJobId $dorisId -IcebergJobId $icebergId `
+        -ProductionCheckpoints $checkpoints -DorisCheckpoints $checkpoints -IcebergCheckpoints $checkpoints
+    $partialAfter = Get-Content -Raw $successPartialPath | ConvertFrom-Json
+    $finalAfter = Get-Content -Raw $successFinalPath | ConvertFrom-Json
+
+    $failurePartialPath = Join-Path $tempRoot "failure.partial"
+    $failureFinalPath = Join-Path $tempRoot "failure.json"
+    Write-ManifestPartial -Manifest $partial -PartialPath $failurePartialPath
+    $script:failIceberg = $true
+    try {
+        Complete-CutoverManifest -PartialPath $failurePartialPath -FinalPath $failureFinalPath `
+            -ProductionJobId $productionId -DorisJobId $dorisId -IcebergJobId $icebergId `
+            -ProductionCheckpoints $checkpoints -DorisCheckpoints $checkpoints -IcebergCheckpoints $checkpoints
+    } catch {}
+    $failurePartial = Get-Content -Raw $failurePartialPath | ConvertFrom-Json
+
+    [ordered]@{
+        success_partial_iceberg_is_null = $null -eq $partialAfter.iceberg_job_id
+        final_iceberg_id = $finalAfter.iceberg_job_id
+        failure_partial_iceberg_is_null = $null -eq $failurePartial.iceberg_job_id
+        failure_final_exists = Test-Path $failureFinalPath
+    } | ConvertTo-Json -Compress
+} finally {
+    Remove-Item -LiteralPath $tempRoot -Recurse -Force
+}
+'''
+        result = self._run_powershell(command)
+        self.assertEqual(0, result.returncode, result.stderr or result.stdout)
+        payload = json.loads(result.stdout.strip().splitlines()[-1])
+        self.assertTrue(payload["success_partial_iceberg_is_null"])
+        self.assertEqual("33333333333333333333333333333333", payload["final_iceberg_id"])
+        self.assertTrue(payload["failure_partial_iceberg_is_null"])
+        self.assertFalse(payload["failure_final_exists"])
+
+    def test_cutover_uses_one_shared_finalizer_per_path_and_never_populates_partial_iceberg(self):
+        text = (ROOT / "scripts/run_chapter_9_production_cutover.ps1").read_text(encoding="ascii")
+        self.assertEqual(3, text.count("Complete-CutoverManifest"))
+        self.assertNotIn('$manifest["iceberg_job_id"] = $icebergJobId', text)
+        self.assertIn('if (Test-Path -LiteralPath $manifestPath)', text)
+        resume_start = text.index("if ($ResumePartial) {")
+        resume_end = text.index("# ResumePartial ends before normal cutover.")
+        self.assertEqual(1, text[resume_start:resume_end].count("Complete-CutoverManifest"))
+        self.assertEqual(1, text[resume_end:].count("Complete-CutoverManifest"))
 
     def test_cutover_iceberg_submission_unifies_client_classpath_and_uploads_jars(self):
         command = r'''
@@ -253,11 +359,13 @@ $output = @(Invoke-DockerCommand -Arguments @("example") -FailureMessage "unexpe
         command = r'''
 $ErrorActionPreference = "Stop"
 . (Resolve-Path "scripts/run_chapter_9_production_cutover.ps1") -FunctionsOnly
-$offsets = ConvertFrom-KafkaOffsets @("user_behavior_events:1:43", "user_behavior_events:0:212")
+$offsets = ConvertFrom-KafkaOffsets `
+    -Lines @("user_behavior_events:1:43", "user_behavior_events:0:212") `
+    -ExpectedTopic "user_behavior_events"
 $group = ConvertFrom-KafkaGroupDescription @(
     "GROUP TOPIC PARTITION CURRENT-OFFSET LOG-END-OFFSET LAG CONSUMER-ID HOST CLIENT-ID",
     "chapter9-quality-shadow user_behavior_events 0 212 212 0 - - -"
-)
+) -ExpectedGroup "chapter9-quality-shadow" -ExpectedTopic "user_behavior_events"
 $jobId = Get-SubmittedJobId @("Job has been submitted with JobID 0123456789abcdef0123456789abcdef")
 $savepoint = Get-SavepointPath @("Savepoint completed. Path: file:/workspace/tmp/savepoints/chapter-9/savepoint-1")
 $ambiguousRejected = $false
@@ -288,6 +396,107 @@ try {
         self.assertEqual("file:/workspace/tmp/savepoints/chapter-9/savepoint-1", payload["savepoint"])
         self.assertTrue(payload["ambiguous_rejected"])
 
+    def test_cutover_kafka_parsers_accept_exact_single_and_multi_partition_inputs(self):
+        command = r'''
+$ErrorActionPreference = "Stop"
+. (Resolve-Path "scripts/run_chapter_9_production_cutover.ps1") -FunctionsOnly
+$single = ConvertFrom-KafkaOffsets -Lines @("user_behavior_events:0:212") `
+    -ExpectedTopic "user_behavior_events"
+$multi = ConvertFrom-KafkaOffsets `
+    -Lines @("user_behavior_events:2:9", "user_behavior_events:0:7", "user_behavior_events:1:8") `
+    -ExpectedTopic "user_behavior_events"
+$group = ConvertFrom-KafkaGroupDescription -Lines @(
+    "chapter9-quality-shadow user_behavior_events 1 8 8 0 - - -",
+    "chapter9-quality-shadow user_behavior_events 0 7 7 0 - - -"
+) -ExpectedGroup "chapter9-quality-shadow" -ExpectedTopic "user_behavior_events"
+[ordered]@{
+    single = $single -join ";"
+    multi = $multi -join ";"
+    group_partitions = @($group.Rows | Sort-Object Partition | ForEach-Object { $_.Partition }) -join ","
+    lag = $group.TotalLag
+} | ConvertTo-Json -Compress
+'''
+        result = self._run_powershell(command)
+        self.assertEqual(0, result.returncode, result.stderr or result.stdout)
+        payload = json.loads(result.stdout.strip().splitlines()[-1])
+        self.assertEqual("partition:0,offset:212", payload["single"])
+        self.assertEqual(
+            "partition:0,offset:7;partition:1,offset:8;partition:2,offset:9",
+            payload["multi"],
+        )
+        self.assertEqual("0,1", payload["group_partitions"])
+        self.assertEqual(0, payload["lag"])
+
+    def test_cutover_kafka_parsers_reject_wrong_identity_and_duplicate_partitions(self):
+        command = r'''
+$ErrorActionPreference = "Stop"
+. (Resolve-Path "scripts/run_chapter_9_production_cutover.ps1") -FunctionsOnly
+function Test-Rejected([scriptblock]$Action) {
+    try { & $Action | Out-Null; return $false } catch { return $true }
+}
+$wrongOffsetTopic = Test-Rejected {
+    ConvertFrom-KafkaOffsets -Lines @("other_topic:0:212") -ExpectedTopic "user_behavior_events"
+}
+$duplicateOffset = Test-Rejected {
+    ConvertFrom-KafkaOffsets `
+        -Lines @("user_behavior_events:0:211", "user_behavior_events:0:212") `
+        -ExpectedTopic "user_behavior_events"
+}
+$wrongGroup = Test-Rejected {
+    ConvertFrom-KafkaGroupDescription `
+        -Lines @("other-group user_behavior_events 0 212 212 0 - - -") `
+        -ExpectedGroup "chapter9-quality-shadow" -ExpectedTopic "user_behavior_events"
+}
+$wrongGroupTopic = Test-Rejected {
+    ConvertFrom-KafkaGroupDescription `
+        -Lines @("chapter9-quality-shadow other_topic 0 212 212 0 - - -") `
+        -ExpectedGroup "chapter9-quality-shadow" -ExpectedTopic "user_behavior_events"
+}
+$duplicateGroupPartition = Test-Rejected {
+    ConvertFrom-KafkaGroupDescription -Lines @(
+        "chapter9-quality-shadow user_behavior_events 0 211 212 1 - - -",
+        "chapter9-quality-shadow user_behavior_events 0 212 212 0 - - -"
+    ) -ExpectedGroup "chapter9-quality-shadow" -ExpectedTopic "user_behavior_events"
+}
+[ordered]@{
+    wrong_offset_topic = $wrongOffsetTopic
+    duplicate_offset = $duplicateOffset
+    wrong_group = $wrongGroup
+    wrong_group_topic = $wrongGroupTopic
+    duplicate_group_partition = $duplicateGroupPartition
+} | ConvertTo-Json -Compress
+'''
+        result = self._run_powershell(command)
+        self.assertEqual(0, result.returncode, result.stderr or result.stdout)
+        payload = json.loads(result.stdout.strip().splitlines()[-1])
+        self.assertTrue(all(payload.values()))
+
+    def test_cutover_kafka_gate_rejects_partition_set_mismatch(self):
+        command = r'''
+$ErrorActionPreference = "Stop"
+. (Resolve-Path "scripts/run_chapter_9_production_cutover.ps1") -FunctionsOnly
+function Invoke-DockerCommand {
+    param([string[]]$Arguments, [string]$FailureMessage)
+    $script:describeCalls++
+    return @("chapter9-quality-shadow user_behavior_events 0 6 7 1 - - -")
+}
+$script:describeCalls = 0
+$rejected = $false
+try {
+    Wait-ShadowLagZero `
+        -ExpectedOffsets @("partition:0,offset:7", "partition:1,offset:8") `
+        -KafkaContainer "ecom-kafka" -Attempts 2 -SleepSeconds 0
+} catch {
+    $rejected = $_.Exception.Message -match "partition set"
+}
+[ordered]@{ rejected = $rejected; describe_calls = $script:describeCalls } | ConvertTo-Json -Compress
+'''
+        result = self._run_powershell(command)
+        self.assertEqual(0, result.returncode, result.stderr or result.stdout)
+        payload = json.loads(result.stdout.strip().splitlines()[-1])
+        self.assertTrue(payload["rejected"])
+        self.assertEqual(1, payload["describe_calls"])
+
     def test_cutover_named_job_wait_allows_nonterminal_registration_states(self):
         command = r'''
 $ErrorActionPreference = "Stop"
@@ -310,6 +519,94 @@ $jobId = Wait-NewNamedJob -Name "chapter-9-doris-clean" -Attempts 2 -SleepSecond
         payload = json.loads(result.stdout.strip().splitlines()[-1])
         self.assertEqual(2, payload["calls"])
         self.assertEqual("0123456789abcdef0123456789abcdef", payload["job_id"])
+
+    def test_cutover_checkpoint_waiter_tolerates_failed_startup_checkpoint_while_running(self):
+        command = r'''
+$ErrorActionPreference = "Stop"
+. (Resolve-Path "scripts/run_chapter_9_production_cutover.ps1") -FunctionsOnly
+$script:jobCalls = 0
+$script:checkpointCalls = 0
+function Invoke-RestMethod {
+    param([string]$Uri, [int]$TimeoutSec)
+    if ($Uri -match "/checkpoints$") {
+        $script:checkpointCalls++
+        if ($script:checkpointCalls -eq 1) {
+            return [pscustomobject]@{
+                counts = [pscustomobject]@{ completed = 0; failed = 1 }
+                latest = [pscustomobject]@{ completed = $null }
+            }
+        }
+        return [pscustomobject]@{
+            counts = [pscustomobject]@{ completed = 1; failed = 1 }
+            latest = [pscustomobject]@{
+                completed = [pscustomobject]@{ status = "COMPLETED" }
+            }
+        }
+    }
+    $script:jobCalls++
+    return [pscustomobject]@{
+        jid = "0123456789abcdef0123456789abcdef"
+        name = "chapter-9-iceberg-clean"
+        state = "RUNNING"
+    }
+}
+$result = Wait-NewCompletedCheckpoint `
+    -JobId "0123456789abcdef0123456789abcdef" `
+    -ExpectedName "chapter-9-iceberg-clean" -Attempts 2 -SleepSeconds 0
+[ordered]@{
+    job_calls = $script:jobCalls
+    checkpoint_calls = $script:checkpointCalls
+    completed = $result.counts.completed
+    failed = $result.counts.failed
+} | ConvertTo-Json -Compress
+'''
+        result = self._run_powershell(command)
+        self.assertEqual(0, result.returncode, result.stderr or result.stdout)
+        payload = json.loads(result.stdout.strip().splitlines()[-1])
+        self.assertEqual(2, payload["job_calls"])
+        self.assertEqual(2, payload["checkpoint_calls"])
+        self.assertEqual(1, payload["completed"])
+        self.assertEqual(1, payload["failed"])
+
+    def test_cutover_checkpoint_waiter_fails_immediately_on_terminal_job(self):
+        command = r'''
+$ErrorActionPreference = "Stop"
+. (Resolve-Path "scripts/run_chapter_9_production_cutover.ps1") -FunctionsOnly
+$script:jobCalls = 0
+$script:checkpointCalls = 0
+function Invoke-RestMethod {
+    param([string]$Uri, [int]$TimeoutSec)
+    if ($Uri -match "/checkpoints$") {
+        $script:checkpointCalls++
+        throw "checkpoint endpoint must not be called"
+    }
+    $script:jobCalls++
+    return [pscustomobject]@{
+        jid = "0123456789abcdef0123456789abcdef"
+        name = "chapter-9-iceberg-clean"
+        state = "FAILED"
+    }
+}
+$terminalRejected = $false
+try {
+    Wait-NewCompletedCheckpoint `
+        -JobId "0123456789abcdef0123456789abcdef" `
+        -ExpectedName "chapter-9-iceberg-clean" -Attempts 2 -SleepSeconds 0
+} catch {
+    $terminalRejected = $_.Exception.Message -match "terminal state FAILED"
+}
+[ordered]@{
+    terminal_rejected = $terminalRejected
+    job_calls = $script:jobCalls
+    checkpoint_calls = $script:checkpointCalls
+} | ConvertTo-Json -Compress
+'''
+        result = self._run_powershell(command)
+        self.assertEqual(0, result.returncode, result.stderr or result.stdout)
+        payload = json.loads(result.stdout.strip().splitlines()[-1])
+        self.assertTrue(payload["terminal_rejected"])
+        self.assertEqual(1, payload["job_calls"])
+        self.assertEqual(0, payload["checkpoint_calls"])
 
     def test_resize_script_recreates_only_taskmanager_and_checks_recovery(self):
         text = (ROOT / "scripts/resize_chapter_9_flink_slots.ps1").read_text(encoding="utf-8")

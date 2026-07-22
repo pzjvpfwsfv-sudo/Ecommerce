@@ -47,6 +47,27 @@ function Get-WorkspaceMountSource([string]$Container) {
     return [string]$workspaceMount.Source
 }
 
+function Assert-ContainerBindMountSource {
+    param(
+        [string]$Container,
+        [string]$Destination,
+        [string]$ExpectedSource
+    )
+
+    $output = Invoke-DockerCommand -Arguments @("inspect", $Container) `
+        -FailureMessage "Docker inspect failed for $Container."
+    $inspection = @($output -join "`n" | ConvertFrom-Json)
+    $mounts = @($inspection[0].Mounts | Where-Object { $_.Destination -eq $Destination })
+    if ($mounts.Count -ne 1 -or $mounts[0].Type -ne "bind") {
+        throw "Container $Container must have exactly one bind mount at $Destination."
+    }
+    $actual = [System.IO.Path]::GetFullPath([string]$mounts[0].Source).TrimEnd("\", "/")
+    $expected = [System.IO.Path]::GetFullPath($ExpectedSource).TrimEnd("\", "/")
+    if (-not [string]::Equals($actual, $expected, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "Container $Container mount source mismatch at $Destination. Expected $expected, got $actual."
+    }
+}
+
 function Assert-ContainerRunning([string]$Container) {
     $output = Invoke-DockerCommand -Arguments @("inspect", "--format", "{{.State.Running}}", $Container) `
         -FailureMessage "Required container is unavailable: $Container."
@@ -62,17 +83,28 @@ function Assert-FlinkCapacity([object]$Overview) {
     }
 }
 
-function ConvertFrom-KafkaOffsets([string[]]$Lines) {
+function ConvertFrom-KafkaOffsets {
+    param([string[]]$Lines, [string]$ExpectedTopic)
+
     $rows = @()
+    $partitions = @{}
     foreach ($line in $Lines) {
         $value = ([string]$line).Trim()
         if (-not $value) { continue }
         if ($value -notmatch "^([^:\s]+):(\d+):(\d+)$") {
             throw "Unexpected kafka-get-offsets row: $value"
         }
+        if ($Matches[1] -ne $ExpectedTopic) {
+            throw "Unexpected Kafka topic $($Matches[1]); expected $ExpectedTopic."
+        }
+        $partition = [int]$Matches[2]
+        if ($partitions.ContainsKey($partition)) {
+            throw "Duplicate Kafka offset partition: $partition."
+        }
+        $partitions[$partition] = $true
         $rows += [pscustomobject]@{
             Topic = $Matches[1]
-            Partition = [int]$Matches[2]
+            Partition = $partition
             Offset = [int64]$Matches[3]
         }
     }
@@ -82,8 +114,11 @@ function ConvertFrom-KafkaOffsets([string[]]$Lines) {
     })
 }
 
-function ConvertFrom-KafkaGroupDescription([string[]]$Lines) {
+function ConvertFrom-KafkaGroupDescription {
+    param([string[]]$Lines, [string]$ExpectedGroup, [string]$ExpectedTopic)
+
     $rows = @()
+    $partitions = @{}
     foreach ($line in $Lines) {
         $value = ([string]$line).Trim()
         if (-not $value -or $value -match "^GROUP\s+TOPIC" -or $value -match "^Consumer group ") {
@@ -92,10 +127,21 @@ function ConvertFrom-KafkaGroupDescription([string[]]$Lines) {
         if ($value -notmatch "^(\S+)\s+(\S+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+\S+\s+\S+\s+\S+$") {
             throw "Unexpected kafka-consumer-groups row: $value"
         }
+        if ($Matches[1] -ne $ExpectedGroup) {
+            throw "Unexpected Kafka consumer group $($Matches[1]); expected $ExpectedGroup."
+        }
+        if ($Matches[2] -ne $ExpectedTopic) {
+            throw "Unexpected Kafka topic $($Matches[2]); expected $ExpectedTopic."
+        }
+        $partition = [int]$Matches[3]
+        if ($partitions.ContainsKey($partition)) {
+            throw "Duplicate Kafka consumer group partition: $partition."
+        }
+        $partitions[$partition] = $true
         $rows += [pscustomobject]@{
             Group = $Matches[1]
             Topic = $Matches[2]
-            Partition = [int]$Matches[3]
+            Partition = $partition
             CurrentOffset = [int64]$Matches[4]
             LogEndOffset = [int64]$Matches[5]
             Lag = [int64]$Matches[6]
@@ -187,6 +233,60 @@ function Write-ManifestPartial([System.Collections.IDictionary]$Manifest, [strin
     Move-Item -LiteralPath $nextPath -Destination $PartialPath -Force
 }
 
+function Complete-CutoverManifest {
+    param(
+        [string]$PartialPath,
+        [string]$FinalPath,
+        [string]$ProductionJobId,
+        [string]$DorisJobId,
+        [string]$IcebergJobId,
+        [object]$ProductionCheckpoints,
+        [object]$DorisCheckpoints,
+        [object]$IcebergCheckpoints
+    )
+
+    if (Test-Path -LiteralPath $FinalPath) { throw "Final cutover manifest already exists: $FinalPath" }
+    $partial = Get-Content -Raw -Encoding UTF8 $PartialPath | ConvertFrom-Json
+    if (-not [string]::IsNullOrWhiteSpace([string]$partial.iceberg_job_id)) {
+        throw "Resumable partial manifest must keep iceberg_job_id null."
+    }
+    if ([string]$partial.production_job_id -ne $ProductionJobId -or
+        [string]$partial.doris_job_id -ne $DorisJobId) {
+        throw "Partial manifest Job IDs changed before finalization."
+    }
+
+    foreach ($job in @(
+        @{ Id = $ProductionJobId; Name = "chapter-9-datastream-quality-production"; Checkpoints = $ProductionCheckpoints },
+        @{ Id = $DorisJobId; Name = "chapter-9-doris-clean"; Checkpoints = $DorisCheckpoints },
+        @{ Id = $IcebergJobId; Name = "chapter-9-iceberg-clean"; Checkpoints = $IcebergCheckpoints }
+    )) {
+        if ([int64]$job.Checkpoints.counts.completed -le 0 -or
+            $job.Checkpoints.latest.completed.status -ne "COMPLETED") {
+            throw "Job $($job.Id) has no successful checkpoint evidence for finalization."
+        }
+        Wait-FlinkJobRunning -JobId $job.Id -ExpectedName $job.Name | Out-Null
+    }
+
+    $final = [ordered]@{
+        cutover_id = [string]$partial.cutover_id
+        created_at = [string]$partial.created_at
+        raw_offsets = @($partial.raw_offsets)
+        shadow_job_id = [string]$partial.shadow_job_id
+        savepoint_path = [string]$partial.savepoint_path
+        production_job_id = $ProductionJobId
+        doris_job_id = $DorisJobId
+        iceberg_job_id = $IcebergJobId
+    }
+    $nextPath = "$FinalPath.next"
+    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText($nextPath, (($final | ConvertTo-Json -Depth 5) + "`n"), $utf8NoBom)
+    Move-Item -LiteralPath $nextPath -Destination $FinalPath
+    Write-Host "[complete] manifest=$FinalPath"
+    Write-Host "[complete] production_job_id=$ProductionJobId checkpoints=$($ProductionCheckpoints.counts.completed)"
+    Write-Host "[complete] doris_job_id=$DorisJobId checkpoints=$($DorisCheckpoints.counts.completed)"
+    Write-Host "[complete] iceberg_job_id=$IcebergJobId checkpoints=$($IcebergCheckpoints.counts.completed)"
+}
+
 function Get-FlinkJobs {
     return Invoke-RestMethod -Uri "http://localhost:8081/jobs/overview" -TimeoutSec 5
 }
@@ -272,7 +372,9 @@ function Wait-ShadowLagZero {
         if ($offset -notmatch "^partition:(\d+),offset:(\d+)$") {
             throw "Invalid expected Kafka SQL offset: $offset"
         }
-        $expected[[int]$Matches[1]] = [int64]$Matches[2]
+        $partition = [int]$Matches[1]
+        if ($expected.ContainsKey($partition)) { throw "Duplicate expected Kafka partition: $partition." }
+        $expected[$partition] = [int64]$Matches[2]
     }
 
     $lastLag = $null
@@ -282,12 +384,15 @@ function Wait-ShadowLagZero {
             "--bootstrap-server", "kafka:29092", "--describe",
             "--group", "chapter9-quality-shadow"
         ) -FailureMessage "Failed to describe shadow Kafka consumer group."
-        $description = ConvertFrom-KafkaGroupDescription $output
+        $description = ConvertFrom-KafkaGroupDescription -Lines $output `
+            -ExpectedGroup "chapter9-quality-shadow" -ExpectedTopic "user_behavior_events"
         $lastLag = $description.TotalLag
+        $expectedPartitions = @($expected.Keys | Sort-Object)
+        $actualPartitions = @($description.Rows.Partition | Sort-Object)
+        if (($actualPartitions -join ",") -ne ($expectedPartitions -join ",")) {
+            throw "Shadow group partition set does not match raw offsets."
+        }
         if ($description.TotalLag -eq 0) {
-            if ($description.Rows.Count -ne $expected.Count) {
-                throw "Shadow group partition count does not match raw offsets."
-            }
             foreach ($row in $description.Rows) {
                 if (-not $expected.ContainsKey($row.Partition) -or
                     $row.CurrentOffset -ne $expected[$row.Partition] -or
@@ -335,29 +440,41 @@ function Wait-FlinkJobRunning {
 function Wait-NewCompletedCheckpoint {
     param(
         [string]$JobId,
+        [string]$ExpectedName,
         [int64]$Baseline = 0,
         [int]$Attempts = 60,
         [int]$SleepSeconds = 2
     )
 
     $lastError = $null
+    $lastState = "NOT_FOUND"
     for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
         try {
-            $checkpoints = Invoke-RestMethod -Uri "http://localhost:8081/jobs/$JobId/checkpoints" -TimeoutSec 5
-            if ([int64]$checkpoints.counts.failed -gt 0 -and [int64]$checkpoints.counts.completed -le $Baseline) {
-                throw "Job $JobId reported a failed checkpoint before its first completion."
+            $job = Invoke-RestMethod -Uri "http://localhost:8081/jobs/$JobId" -TimeoutSec 5
+            if ($job.name -ne $ExpectedName) {
+                throw "Job ID $JobId has unexpected name $($job.name)."
             }
-            if ([int64]$checkpoints.counts.completed -gt $Baseline -and
-                $checkpoints.latest.completed.status -eq "COMPLETED") {
-                return $checkpoints
+            if ($job.jid -and [string]$job.jid -ne $JobId) {
+                throw "Flink REST returned unexpected Job ID $($job.jid); expected $JobId."
+            }
+            $lastState = [string]$job.state
+            if ($lastState -in @("FAILED", "CANCELED", "FINISHED", "SUSPENDED")) {
+                throw "Job $JobId entered terminal state $lastState while waiting for a checkpoint."
+            }
+            if ($lastState -eq "RUNNING") {
+                $checkpoints = Invoke-RestMethod -Uri "http://localhost:8081/jobs/$JobId/checkpoints" -TimeoutSec 5
+                if ([int64]$checkpoints.counts.completed -gt $Baseline -and
+                    $checkpoints.latest.completed.status -eq "COMPLETED") {
+                    return $checkpoints
+                }
             }
         } catch {
             $lastError = $_.Exception.Message
-            if ($lastError -match "reported a failed checkpoint") { throw }
+            if ($lastError -match "unexpected name|unexpected Job ID|terminal state") { throw }
         }
         if ($attempt -lt $Attempts -and $SleepSeconds -gt 0) { Start-Sleep -Seconds $SleepSeconds }
     }
-    throw "No completed checkpoint appeared for job $JobId. Last error: $lastError"
+    throw "No completed checkpoint appeared for job $JobId. Last state: $lastState. Last error: $lastError"
 }
 
 function Wait-NewNamedJob {
@@ -474,6 +591,9 @@ foreach ($container in @($jobManager, $taskManager, $sqlClient)) {
         throw "Workspace mount mismatch for $container. Current root: $root. Container /workspace: $mount."
     }
 }
+$expectedMinioData = Join-Path $root "infra/compose/minio/data"
+Assert-ContainerBindMountSource -Container "ecom-minio" -Destination "/data" `
+    -ExpectedSource $expectedMinioData
 $minioReady = Invoke-WebRequest -UseBasicParsing -Uri "http://localhost:9000/minio/health/ready" -TimeoutSec 5
 if ($minioReady.StatusCode -ne 200) { throw "MinIO readiness endpoint did not return HTTP 200." }
 Invoke-DockerCommand -Arguments @(
@@ -530,7 +650,11 @@ $icebergConnectors = @($connectors | Where-Object { $_.Name -notin @(
 $icebergParentClasspath = ($icebergConnectors | ForEach-Object { $_.ContainerPath }) -join ":"
 
 Write-SqlFile -Path (Join-Path $tmpRoot "doris-preflight.sql") -Parts @($dorisSourceSql, $dorisSinkSql)
-Write-SqlFile -Path (Join-Path $tmpRoot "iceberg-preflight.sql") -Parts @($icebergSourceSql, $icebergCatalogSql)
+Write-SqlFile -Path (Join-Path $tmpRoot "iceberg-preflight.sql") -Parts @(
+    $icebergSourceSql, $icebergCatalogSql,
+    "SET 'execution.runtime-mode' = 'batch';",
+    "SELECT COUNT(*) FROM lakehouse.analytics.user_behavior_detail;"
+)
 Write-Host "[preflight] validating Doris and Iceberg SQL connectors"
 if (-not $ResumePartial) {
     Submit-SqlJob -SqlClient $sqlClient -ContainerSqlPath "/workspace/tmp/chapter-9/doris-preflight.sql" `
@@ -553,8 +677,8 @@ if ($ResumePartial) {
     $existingIcebergJobId = Assert-ResumeManifest -Manifest $savedManifest -Jobs (Get-FlinkJobs)
     $productionJobId = [string]$savedManifest.production_job_id
     $dorisJobId = [string]$savedManifest.doris_job_id
-    $productionCheckpoints = Wait-NewCompletedCheckpoint -JobId $productionJobId
-    $dorisCheckpoints = Wait-NewCompletedCheckpoint -JobId $dorisJobId
+    $productionCheckpoints = Wait-NewCompletedCheckpoint -JobId $productionJobId -ExpectedName $productionJobName
+    $dorisCheckpoints = Wait-NewCompletedCheckpoint -JobId $dorisJobId -ExpectedName $dorisJobName
 
     if ($existingIcebergJobId) {
         $icebergJobId = [string]$existingIcebergJobId
@@ -567,31 +691,12 @@ if ($ResumePartial) {
         $icebergJobId = Wait-NewNamedJob -Name $icebergJobName
     }
     Wait-FlinkJobRunning -JobId $icebergJobId -ExpectedName $icebergJobName | Out-Null
-    $icebergCheckpoints = Wait-NewCompletedCheckpoint -JobId $icebergJobId
+    $icebergCheckpoints = Wait-NewCompletedCheckpoint -JobId $icebergJobId -ExpectedName $icebergJobName
 
-    $manifest = [ordered]@{
-        cutover_id = [string]$savedManifest.cutover_id
-        created_at = [string]$savedManifest.created_at
-        raw_offsets = @($savedManifest.raw_offsets)
-        shadow_job_id = [string]$savedManifest.shadow_job_id
-        savepoint_path = [string]$savedManifest.savepoint_path
-        production_job_id = $productionJobId
-        doris_job_id = $dorisJobId
-        iceberg_job_id = $icebergJobId
-    }
-    Write-ManifestPartial -Manifest $manifest -PartialPath $manifestPartialPath
-    foreach ($job in @(
-        @{ Id = $productionJobId; Name = $productionJobName },
-        @{ Id = $dorisJobId; Name = $dorisJobName },
-        @{ Id = $icebergJobId; Name = $icebergJobName }
-    )) {
-        Wait-FlinkJobRunning -JobId $job.Id -ExpectedName $job.Name | Out-Null
-    }
-    Move-Item -LiteralPath $manifestPartialPath -Destination $manifestPath
-    Write-Host "[complete] manifest=$manifestPath"
-    Write-Host "[complete] production_job_id=$productionJobId checkpoints=$($productionCheckpoints.counts.completed)"
-    Write-Host "[complete] doris_job_id=$dorisJobId checkpoints=$($dorisCheckpoints.counts.completed)"
-    Write-Host "[complete] iceberg_job_id=$icebergJobId checkpoints=$($icebergCheckpoints.counts.completed)"
+    Complete-CutoverManifest -PartialPath $manifestPartialPath -FinalPath $manifestPath `
+        -ProductionJobId $productionJobId -DorisJobId $dorisJobId -IcebergJobId $icebergJobId `
+        -ProductionCheckpoints $productionCheckpoints -DorisCheckpoints $dorisCheckpoints `
+        -IcebergCheckpoints $icebergCheckpoints
     return
 }
 # ResumePartial ends before normal cutover.
@@ -622,12 +727,12 @@ $rawOffsetOutput = Invoke-DockerCommand -Arguments @(
     "exec", $kafka, "kafka-get-offsets", "--bootstrap-server", "kafka:29092",
     "--topic", "user_behavior_events"
 ) -FailureMessage "Failed to read raw Kafka log-end offsets."
-$rawOffsets = @(ConvertFrom-KafkaOffsets $rawOffsetOutput)
+$rawOffsets = @(ConvertFrom-KafkaOffsets -Lines $rawOffsetOutput -ExpectedTopic "user_behavior_events")
 $shadowGroup = Wait-ShadowLagZero -ExpectedOffsets $rawOffsets -KafkaContainer $kafka
-$rawOffsetConfirmation = @(ConvertFrom-KafkaOffsets (Invoke-DockerCommand -Arguments @(
+$rawOffsetConfirmation = @(ConvertFrom-KafkaOffsets -Lines (Invoke-DockerCommand -Arguments @(
     "exec", $kafka, "kafka-get-offsets", "--bootstrap-server", "kafka:29092",
     "--topic", "user_behavior_events"
-) -FailureMessage "Failed to confirm paused raw Kafka offsets."))
+) -FailureMessage "Failed to confirm paused raw Kafka offsets.") -ExpectedTopic "user_behavior_events")
 if (($rawOffsets -join ";") -ne ($rawOffsetConfirmation -join ";")) {
     throw "Raw Kafka offsets changed after the zero-lag check. Traffic is not paused."
 }
@@ -672,7 +777,7 @@ $productionOutput = Invoke-DockerCommand -Arguments @(
 $productionOutput | ForEach-Object { Write-Host $_ }
 $productionJobId = Get-SubmittedJobId $productionOutput
 Wait-FlinkJobRunning -JobId $productionJobId -ExpectedName $productionJobName | Out-Null
-$productionCheckpoints = Wait-NewCompletedCheckpoint -JobId $productionJobId
+$productionCheckpoints = Wait-NewCompletedCheckpoint -JobId $productionJobId -ExpectedName $productionJobName
 $manifest["production_job_id"] = $productionJobId
 Write-ManifestPartial -Manifest $manifest -PartialPath $manifestPartialPath
 
@@ -681,7 +786,7 @@ Submit-SqlJob -SqlClient $sqlClient -ContainerSqlPath "/workspace/tmp/chapter-9/
     ForEach-Object { Write-Host $_ }
 $dorisJobId = Wait-NewNamedJob -Name $dorisJobName
 Wait-FlinkJobRunning -JobId $dorisJobId -ExpectedName $dorisJobName | Out-Null
-$dorisCheckpoints = Wait-NewCompletedCheckpoint -JobId $dorisJobId
+$dorisCheckpoints = Wait-NewCompletedCheckpoint -JobId $dorisJobId -ExpectedName $dorisJobName
 $manifest["doris_job_id"] = $dorisJobId
 Write-ManifestPartial -Manifest $manifest -PartialPath $manifestPartialPath
 
@@ -691,20 +796,8 @@ Submit-SqlJob -SqlClient $sqlClient -ContainerSqlPath "/workspace/tmp/chapter-9/
     ForEach-Object { Write-Host $_ }
 $icebergJobId = Wait-NewNamedJob -Name $icebergJobName
 Wait-FlinkJobRunning -JobId $icebergJobId -ExpectedName $icebergJobName | Out-Null
-$icebergCheckpoints = Wait-NewCompletedCheckpoint -JobId $icebergJobId
-$manifest["iceberg_job_id"] = $icebergJobId
-Write-ManifestPartial -Manifest $manifest -PartialPath $manifestPartialPath
-
-foreach ($job in @(
-    @{ Id = $productionJobId; Name = $productionJobName },
-    @{ Id = $dorisJobId; Name = $dorisJobName },
-    @{ Id = $icebergJobId; Name = $icebergJobName }
-)) {
-    Wait-FlinkJobRunning -JobId $job.Id -ExpectedName $job.Name | Out-Null
-}
-
-Move-Item -LiteralPath $manifestPartialPath -Destination $manifestPath
-Write-Host "[complete] manifest=$manifestPath"
-Write-Host "[complete] production_job_id=$productionJobId checkpoints=$($productionCheckpoints.counts.completed)"
-Write-Host "[complete] doris_job_id=$dorisJobId checkpoints=$($dorisCheckpoints.counts.completed)"
-Write-Host "[complete] iceberg_job_id=$icebergJobId checkpoints=$($icebergCheckpoints.counts.completed)"
+$icebergCheckpoints = Wait-NewCompletedCheckpoint -JobId $icebergJobId -ExpectedName $icebergJobName
+Complete-CutoverManifest -PartialPath $manifestPartialPath -FinalPath $manifestPath `
+    -ProductionJobId $productionJobId -DorisJobId $dorisJobId -IcebergJobId $icebergJobId `
+    -ProductionCheckpoints $productionCheckpoints -DorisCheckpoints $dorisCheckpoints `
+    -IcebergCheckpoints $icebergCheckpoints
