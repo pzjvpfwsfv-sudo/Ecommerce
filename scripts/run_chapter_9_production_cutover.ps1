@@ -547,6 +547,38 @@ function Ensure-CutoverRecoveryState {
     return $State
 }
 
+function Sync-CutoverResolvedJobId {
+    param(
+        [Parameter(Mandatory = $true)][object]$State,
+        [Parameter(Mandatory = $true)][string]$Stage,
+        [Parameter(Mandatory = $true)][string]$JobId,
+        [Parameter(Mandatory = $true)][string]$Path
+    )
+
+    $field = switch ($Stage) {
+        "production_submit" { "production_job_id"; break }
+        "doris_submit" { "doris_job_id"; break }
+        "iceberg_submit" { "iceberg_job_id"; break }
+        default { throw "Unknown cutover submission stage: $Stage" }
+    }
+    if ($JobId -notmatch '^[0-9a-f]{32}$') {
+        throw "Resolved cutover Job ID is invalid for ${Stage}: $JobId"
+    }
+    $current = [string]$State.$field
+    if ($current -and $current -ne $JobId) {
+        throw "Partial manifest $field conflicts with resolved Job ID $JobId."
+    }
+    if ($State -is [System.Collections.IDictionary]) {
+        $State[$field] = $JobId
+    } elseif ($State.PSObject.Properties.Name -contains $field) {
+        $State.$field = $JobId
+    } else {
+        $State | Add-Member -NotePropertyName $field -NotePropertyValue $JobId
+    }
+    Write-CutoverStateAtomic -State $State -Path $Path
+    return $JobId
+}
+
 function Resolve-CutoverJobReference {
     param(
         [Parameter(Mandatory = $true)][object]$State,
@@ -568,7 +600,8 @@ function Resolve-CutoverJobReference {
             [string]$byId[0].state -ne "RUNNING") {
             throw "Persisted cutover job is not the exact RUNNING $ExpectedName."
         }
-        return [string]$jobId
+        return Sync-CutoverResolvedJobId -State $State -Stage $Stage `
+            -JobId $jobId -Path $Path
     }
     $namedJobs = @($Jobs.jobs | Where-Object {
         [string]$_.name -eq $ExpectedName -and [string]$_.state -eq "RUNNING"
@@ -588,8 +621,8 @@ function Resolve-CutoverJobReference {
         adopted = $true
         completed_at_utc = [DateTimeOffset]::UtcNow.ToString("o")
     })
-    Write-CutoverStateAtomic -State $State -Path $Path
-    return [string]$jobId
+    return Sync-CutoverResolvedJobId -State $State -Stage $Stage `
+        -JobId $jobId -Path $Path
 }
 
 function Complete-CutoverManifest {
@@ -606,8 +639,9 @@ function Complete-CutoverManifest {
 
     if (Test-Path -LiteralPath $FinalPath) { throw "Final cutover manifest already exists: $FinalPath" }
     $partial = Get-Content -Raw -Encoding UTF8 $PartialPath | ConvertFrom-Json
-    if (-not [string]::IsNullOrWhiteSpace([string]$partial.iceberg_job_id)) {
-        throw "Resumable partial manifest must keep iceberg_job_id null."
+    if (-not [string]::IsNullOrWhiteSpace([string]$partial.iceberg_job_id) -and
+        [string]$partial.iceberg_job_id -ne $IcebergJobId) {
+        throw "Partial manifest Iceberg Job ID conflicts with finalization."
     }
     if ([string]$partial.production_job_id -ne $ProductionJobId -or
         [string]$partial.doris_job_id -ne $DorisJobId) {
@@ -848,14 +882,21 @@ function Wait-NewNamedJob {
 
     for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
         $jobs = Get-FlinkJobs
-        $matches = @($jobs.jobs | Where-Object { $_.name -eq $Name })
-        if ($matches.Count -gt 1) { throw "Multiple Flink jobs have the exact name $Name." }
-        if ($matches.Count -eq 1) {
-            $state = [string]$matches[0].state
-            if ($state -eq "RUNNING") { return [string]$matches[0].jid }
-            if ($state -in @("FAILED", "CANCELED", "FINISHED", "SUSPENDED")) {
-                throw "Flink job $Name entered terminal state $state before RUNNING."
+        $running = @($jobs.jobs | Where-Object {
+            [string]$_.name -eq $Name -and [string]$_.state -eq "RUNNING"
+        })
+        if ($running.Count -gt 1) {
+            throw "Multiple RUNNING Flink jobs have the exact name $Name."
+        }
+        if ($running.Count -eq 1) {
+            $candidate = $running[0]
+            $jobId = [string]$candidate.jid
+            $byId = @($jobs.jobs | Where-Object { [string]$_.jid -eq $jobId })
+            if ($jobId -notmatch '^[0-9a-f]{32}$' -or $byId.Count -ne 1 -or
+                [string]$candidate.name -ne $Name -or [string]$candidate.state -ne "RUNNING") {
+                throw "Unique RUNNING Flink job $Name has inconsistent ID/name/state evidence."
             }
+            return $jobId
         }
         if ($attempt -lt $Attempts -and $SleepSeconds -gt 0) { Start-Sleep -Seconds $SleepSeconds }
     }

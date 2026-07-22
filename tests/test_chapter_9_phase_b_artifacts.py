@@ -604,10 +604,11 @@ try {
         self.assertTrue(payload["failure_partial_iceberg_is_null"])
         self.assertFalse(payload["failure_final_exists"])
 
-    def test_cutover_uses_one_shared_finalizer_per_path_and_never_populates_partial_iceberg(self):
+    def test_cutover_uses_one_shared_finalizer_and_reconciles_resume_iceberg_id(self):
         text = (ROOT / "scripts/run_chapter_9_production_cutover.ps1").read_text(encoding="ascii")
         self.assertEqual(3, text.count("Complete-CutoverManifest"))
-        self.assertNotIn('$manifest["iceberg_job_id"] = $icebergJobId', text)
+        self.assertIn('"iceberg_submit" { "iceberg_job_id"; break }', text)
+        self.assertIn("Sync-CutoverResolvedJobId", text)
         self.assertIn('if (Test-Path -LiteralPath $manifestPath)', text)
         resume_start = text.index("if ($ResumePartial) {")
         resume_end = text.index("# ResumePartial ends before normal cutover.")
@@ -847,6 +848,56 @@ $jobId = Wait-NewNamedJob -Name "chapter-9-doris-clean" -Attempts 2 -SleepSecond
         self.assertEqual(2, payload["calls"])
         self.assertEqual("0123456789abcdef0123456789abcdef", payload["job_id"])
 
+    def test_cutover_named_job_wait_ignores_terminal_history_but_rejects_running_conflicts(self):
+        command = r'''
+$ErrorActionPreference = "Stop"
+. (Resolve-Path "scripts/run_chapter_9_production_cutover.ps1") -FunctionsOnly
+$name = "chapter-9-doris-clean"
+$runningId = "0123456789abcdef0123456789abcdef"
+$script:jobs = [pscustomobject]@{ jobs = @(
+    [pscustomobject]@{ name = $name; jid = "11111111111111111111111111111111"; state = "CANCELED" },
+    [pscustomobject]@{ name = $name; jid = "22222222222222222222222222222222"; state = "FINISHED" },
+    [pscustomobject]@{ name = $name; jid = $runningId; state = "RUNNING" }
+) }
+function Get-FlinkJobs { return $script:jobs }
+$accepted = Wait-NewNamedJob -Name $name -Attempts 1 -SleepSeconds 0
+
+$script:jobs = [pscustomobject]@{ jobs = @(
+    [pscustomobject]@{ name = $name; jid = $runningId; state = "RUNNING" },
+    [pscustomobject]@{ name = $name; jid = "33333333333333333333333333333333"; state = "RUNNING" },
+    [pscustomobject]@{ name = $name; jid = "44444444444444444444444444444444"; state = "FAILED" }
+) }
+$multipleRunningRejected = $false
+try { Wait-NewNamedJob -Name $name -Attempts 1 -SleepSeconds 0 | Out-Null } catch { $multipleRunningRejected = $true }
+
+$script:jobs = [pscustomobject]@{ jobs = @(
+    [pscustomobject]@{ name = $name; jid = $runningId; state = "RUNNING" },
+    [pscustomobject]@{ name = $name; jid = $runningId; state = "CANCELED" }
+) }
+$terminalSameIdRejected = $false
+try { Wait-NewNamedJob -Name $name -Attempts 1 -SleepSeconds 0 | Out-Null } catch { $terminalSameIdRejected = $true }
+
+$script:jobs = [pscustomobject]@{ jobs = @(
+    [pscustomobject]@{ name = $name; jid = "not-a-job-id"; state = "RUNNING" }
+) }
+$invalidIdRejected = $false
+try { Wait-NewNamedJob -Name $name -Attempts 1 -SleepSeconds 0 | Out-Null } catch { $invalidIdRejected = $true }
+
+[ordered]@{
+    accepted_id = $accepted
+    multiple_running_rejected = $multipleRunningRejected
+    terminal_same_id_rejected = $terminalSameIdRejected
+    invalid_id_rejected = $invalidIdRejected
+} | ConvertTo-Json -Compress
+'''
+        result = self._run_powershell(command)
+        self.assertEqual(0, result.returncode, result.stderr or result.stdout)
+        payload = json.loads(result.stdout.strip().splitlines()[-1])
+        self.assertEqual("0123456789abcdef0123456789abcdef", payload["accepted_id"])
+        self.assertTrue(payload["multiple_running_rejected"])
+        self.assertTrue(payload["terminal_same_id_rejected"])
+        self.assertTrue(payload["invalid_id_rejected"])
+
     def test_cutover_checkpoint_waiter_tolerates_failed_startup_checkpoint_while_running(self):
         command = r'''
 $ErrorActionPreference = "Stop"
@@ -1000,6 +1051,133 @@ try {
         self.assertEqual("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", payload["adopted_persisted"])
         self.assertTrue(payload["no_intent_rejected"])
         self.assertTrue(payload["ambiguous_rejected"])
+
+    def test_cutover_resume_reconciles_all_resolved_job_ids_before_finalization(self):
+        command = r'''
+$ErrorActionPreference = "Stop"
+. (Resolve-Path "scripts/run_chapter_9_production_cutover.ps1") -FunctionsOnly
+$root = Join-Path ([IO.Path]::GetTempPath()) ("chapter9-cutover-reconcile-" + [guid]::NewGuid())
+New-Item -ItemType Directory -Path $root | Out-Null
+try {
+    $productionId = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    $dorisId = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    $icebergId = "cccccccccccccccccccccccccccccccc"
+    $mappings = @(
+        [pscustomobject]@{ Stage = "production_submit"; Field = "production_job_id"; Id = $productionId; Name = "chapter-9-datastream-quality-production" },
+        [pscustomobject]@{ Stage = "doris_submit"; Field = "doris_job_id"; Id = $dorisId; Name = "chapter-9-doris-clean" },
+        [pscustomobject]@{ Stage = "iceberg_submit"; Field = "iceberg_job_id"; Id = $icebergId; Name = "chapter-9-iceberg-clean" }
+    )
+    $jobs = [pscustomobject]@{ jobs = @(
+        [pscustomobject]@{ jid = $productionId; name = "chapter-9-datastream-quality-production"; state = "RUNNING" },
+        [pscustomobject]@{ jid = $dorisId; name = "chapter-9-doris-clean"; state = "RUNNING" },
+        [pscustomobject]@{ jid = $icebergId; name = "chapter-9-iceberg-clean"; state = "RUNNING" },
+        [pscustomobject]@{ jid = "11111111111111111111111111111111"; name = "chapter-9-datastream-quality-production"; state = "CANCELED" },
+        [pscustomobject]@{ jid = "22222222222222222222222222222222"; name = "chapter-9-doris-clean"; state = "FAILED" },
+        [pscustomobject]@{ jid = "33333333333333333333333333333333"; name = "chapter-9-iceberg-clean"; state = "FINISHED" }
+    ) }
+    $checkpoints = [pscustomobject]@{
+        counts = [pscustomobject]@{ completed = 1 }
+        latest = [pscustomobject]@{ completed = [pscustomobject]@{ status = "COMPLETED" } }
+    }
+    function Wait-FlinkJobRunning {
+        param([string]$JobId, [string]$ExpectedName)
+        return [pscustomobject]@{ jid = $JobId; name = $ExpectedName; state = "RUNNING" }
+    }
+    $script:submitCalls = 0
+    $results = [ordered]@{}
+    foreach ($target in $mappings) {
+        $path = Join-Path $root "$($target.Stage).partial"
+        $finalPath = Join-Path $root "$($target.Stage).json"
+        $state = [ordered]@{
+            schema_version = 2; cutover_id = "cutover-$($target.Stage)"; phase = $target.Stage
+            created_at = "2026-07-22T00:00:00Z"; raw_offsets = @("partition:0,offset:212")
+            shadow_job_id = "dddddddddddddddddddddddddddddddd"
+            savepoint_path = "file:/workspace/tmp/savepoints/chapter-9/savepoint-1"
+            production_job_id = $productionId; doris_job_id = $dorisId; iceberg_job_id = $null
+            mutations = [ordered]@{
+                shadow_stop = [ordered]@{ status = "result"; intent = @{ operation = "stop" }; result = @{ status = "result" } }
+                production_submit = [ordered]@{ status = "result"; intent = @{ operation = "submit" }; result = @{ status = "result"; job_id = $productionId } }
+                doris_submit = [ordered]@{ status = "result"; intent = @{ operation = "submit" }; result = @{ status = "result"; job_id = $dorisId } }
+                iceberg_submit = [ordered]@{ status = "result"; intent = @{ operation = "submit" }; result = @{ status = "result"; job_id = $icebergId } }
+                finalization = [ordered]@{ status = "not_started"; intent = $null; result = $null }
+            }
+        }
+        $state[$target.Field] = $null
+        Write-CutoverStateAtomic -State $state -Path $path
+        $resolved = Resolve-CutoverJobReference -State $state -Stage $target.Stage `
+            -ExpectedName $target.Name -Jobs $jobs -Path $path
+        if (-not $resolved) { $script:submitCalls++ }
+        $persisted = Get-Content -Raw $path | ConvertFrom-Json
+        $finalized = $true
+        try {
+            Complete-CutoverManifest -PartialPath $path -FinalPath $finalPath `
+                -ProductionJobId $productionId -DorisJobId $dorisId -IcebergJobId $icebergId `
+                -ProductionCheckpoints $checkpoints -DorisCheckpoints $checkpoints `
+                -IcebergCheckpoints $checkpoints
+        } catch { $finalized = $false }
+        $results[$target.Stage] = [ordered]@{
+            resolved = $resolved
+            persisted = [string]$persisted.($target.Field)
+            no_next_file = -not (Test-Path "$path.next")
+            finalized = $finalized
+            final_exists = Test-Path $finalPath
+        }
+    }
+
+    $conflicts = [ordered]@{}
+    foreach ($target in $mappings) {
+        $conflictPath = Join-Path $root "$($target.Stage)-conflict.partial"
+        $conflict = [ordered]@{
+            mutations = [ordered]@{}
+        }
+        $conflict[$target.Field] = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+        $conflict.mutations[$target.Stage] = [ordered]@{
+            status = "result"; intent = @{ operation = "submit" }
+            result = @{ status = "result"; job_id = $target.Id }
+        }
+        Write-CutoverStateAtomic -State $conflict -Path $conflictPath
+        $rejected = $false
+        try {
+            Resolve-CutoverJobReference -State $conflict -Stage $target.Stage `
+                -ExpectedName $target.Name -Jobs $jobs -Path $conflictPath | Out-Null
+        } catch { $rejected = $true }
+        $conflictAfter = Get-Content -Raw $conflictPath | ConvertFrom-Json
+        $conflicts[$target.Stage] = [ordered]@{
+            rejected = $rejected
+            preserved = [string]$conflictAfter.($target.Field)
+        }
+    }
+
+    [ordered]@{
+        submit_calls = $script:submitCalls
+        production = $results.production_submit
+        doris = $results.doris_submit
+        iceberg = $results.iceberg_submit
+        conflicts = $conflicts
+    } | ConvertTo-Json -Depth 8 -Compress
+} finally { Remove-Item -LiteralPath $root -Recurse -Force }
+'''
+        result = self._run_powershell(command)
+        self.assertEqual(0, result.returncode, result.stderr or result.stdout)
+        payload = json.loads(result.stdout.strip().splitlines()[-1])
+        self.assertEqual(0, payload["submit_calls"])
+        expected_ids = {
+            "production": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "doris": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "iceberg": "cccccccccccccccccccccccccccccccc",
+        }
+        for stage, expected_id in expected_ids.items():
+            self.assertEqual(expected_id, payload[stage]["resolved"])
+            self.assertEqual(expected_id, payload[stage]["persisted"])
+            self.assertTrue(payload[stage]["no_next_file"])
+            self.assertTrue(payload[stage]["finalized"])
+            self.assertTrue(payload[stage]["final_exists"])
+        for conflict in payload["conflicts"].values():
+            self.assertTrue(conflict["rejected"])
+            self.assertEqual(
+                "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+                conflict["preserved"],
+            )
 
     def test_rollback_progress_reconciles_mutation_windows_and_persists_ids(self):
         command = r'''
