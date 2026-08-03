@@ -41,8 +41,10 @@
 - 第 3 章：Flink SQL 最小实时计算链路
 - 第 4 章：Doris + FastAPI 最小查询链路骨架
 - 第 5 章：MinIO + Iceberg 行为明细落湖骨架
+- 第 6 章：Trino + Iceberg 湖表查询
 - 第 7 章：Kafka 从 ZooKeeper 演进到 KRaft `controller + broker` 双角色拓扑
 - 第 8 章：基于 Doris 与 Trino 可信证据的 AI 指标分析助手
+- 第 9 章：Java DataStream 数据质量治理、影子验证、受控切流与安全回滚
 
 其中第 3 章当前已经验证到：
 
@@ -227,6 +229,14 @@ MinIO 版当前已经通过真实验证，关键修复点是把 S3A 配置下沉
 
 第 8 章先完成“预定义查询 -> 可信 evidence -> 规则或模型解读 -> 同证据返回”的最小闭环，避免一开始把数据库权限交给模型。后续按“趋势与异常 -> 受控工具调用 -> 受控 NL2SQL -> 产品化评测”演进，每一步继续保留查询白名单、审计、成本和证据边界。
 
+## 第 9 章：Java DataStream 数据质量治理
+
+第 9 章已完成从影子验证到正式受控切流的收口：三条正式 Flink 作业保持 `RUNNING`，Doris 与 Iceberg 正式作业消费 `user_behavior_clean`。原始 Topic、影子 Topic、旧 raw Source、Checkpoint、Savepoint 与回滚现场均保留。
+
+- Phase A 已完成影子对账、五类 DLQ 原因码、重复事件去重与 TaskManager 故障恢复验证。
+- Phase B 使用 manifest 固化原始 Topic 的停流边界，完成受控切流与生产验收。
+- 安全回滚先暂停流量并按 manifest 核验 Job ID、名称与状态；回滚 dry-run 已验证入口和边界，但不把已写入 Doris/Iceberg 的数据宣称为可自动撤销。
+
 ## 章节路线
 
 1. 第 0 章：项目认知 + 环境准备 + 最小主链路设计
@@ -238,7 +248,12 @@ MinIO 版当前已经通过真实验证，关键修复点是把 S3A 配置下沉
 7. 第 6 章：Trino + Iceberg 湖表查询
 8. 第 7 章：ZooKeeper -> KRaft 架构演进
 9. 第 8 章：可信指标 AI 分析助手
-10. 后续：压测、调优、数据质量和产品化评测
+10. 第 9 章：Java DataStream 数据质量治理、影子验证、受控切流与安全回滚
+11. 第 10 章：受控工具调用与审计
+12. 第 11 章：受控 NL2SQL
+13. 后续：产品化评测、可观测性、压测与状态调优
+
+第 10 章仍不生成或执行 SQL；模型只能选择后端注册的只读工具。
 
 详细流程见 [docs/PROJECT_FLOW.md](/D:/桌面/实时湖仓电商行为数据平台 + AI 指标分析助手项目/docs/PROJECT_FLOW.md)。
 
