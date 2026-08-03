@@ -23,6 +23,26 @@ class ApiSettings:
     ai_model: str = ""
     ai_request_timeout_seconds: float = 15
     ai_max_question_length: int = 500
+    flink_rest_url: str = "http://localhost:8081"
+    chapter9_production_job_name: str = "chapter-9-datastream-quality-production"
+    ai_tool_planner_mode: str = "rule_based"
+    ai_tool_max_calls: int = 3
+    ai_tool_total_timeout_seconds: float = 20
+    ai_tool_max_event_types: int = 20
+
+    def __post_init__(self) -> None:
+        if self.ai_tool_planner_mode not in {"rule_based", "openai_compatible"}:
+            raise ValueError(f"unsupported AI_TOOL_PLANNER_MODE: {self.ai_tool_planner_mode}")
+        if not 1 <= self.ai_tool_max_calls <= 3:
+            raise ValueError("AI_TOOL_MAX_CALLS must be between 1 and 3")
+        if not 0 < self.ai_tool_total_timeout_seconds <= 60:
+            raise ValueError("AI_TOOL_TOTAL_TIMEOUT_SECONDS must be between 0 and 60")
+        if not 1 <= self.ai_tool_max_event_types <= 100:
+            raise ValueError("AI_TOOL_MAX_EVENT_TYPES must be between 1 and 100")
+        if not self.flink_rest_url:
+            raise ValueError("FLINK_REST_URL must not be empty")
+        if not self.chapter9_production_job_name:
+            raise ValueError("CHAPTER9_PRODUCTION_JOB_NAME must not be empty")
 
 
 def load_settings(environ: Mapping[str, str] | None = None) -> ApiSettings:
@@ -44,4 +64,12 @@ def load_settings(environ: Mapping[str, str] | None = None) -> ApiSettings:
         ai_model=values.get("AI_MODEL", ""),
         ai_request_timeout_seconds=float(values.get("AI_REQUEST_TIMEOUT_SECONDS", "15")),
         ai_max_question_length=int(values.get("AI_MAX_QUESTION_LENGTH", "500")),
+        flink_rest_url=values.get("FLINK_REST_URL", "http://localhost:8081"),
+        chapter9_production_job_name=values.get(
+            "CHAPTER9_PRODUCTION_JOB_NAME", "chapter-9-datastream-quality-production"
+        ),
+        ai_tool_planner_mode=values.get("AI_TOOL_PLANNER_MODE", "rule_based"),
+        ai_tool_max_calls=int(values.get("AI_TOOL_MAX_CALLS", "3")),
+        ai_tool_total_timeout_seconds=float(values.get("AI_TOOL_TOTAL_TIMEOUT_SECONDS", "20")),
+        ai_tool_max_event_types=int(values.get("AI_TOOL_MAX_EVENT_TYPES", "20")),
     )

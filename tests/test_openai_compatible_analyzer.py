@@ -207,6 +207,8 @@ class OpenAICompatibleAnalyzerTest(unittest.TestCase):
 
         self.assertEqual("rule_based", settings.ai_analyzer_mode)
         self.assertEqual(500, settings.ai_max_question_length)
+        self.assertEqual("rule_based", settings.ai_tool_planner_mode)
+        self.assertEqual(20, settings.ai_tool_max_event_types)
 
     def test_build_analysis_service_uses_configured_openai_analyzer(self):
         from app.dependencies import build_analysis_service
