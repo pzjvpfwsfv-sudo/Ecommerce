@@ -1,0 +1,108 @@
+from datetime import UTC, datetime
+from decimal import Decimal
+from pathlib import Path
+import sys
+import unittest
+
+from pydantic import ValidationError
+
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str((ROOT / "services" / "api").resolve()))
+
+from app.analysis_models import AnalysisNarrative
+from app.analysis_service import NarrativeProvenanceError, validate_narrative_numbers
+from app.tool_models import (
+    DataQualityEvidence,
+    HistoricalEvidence,
+    RealtimeEvidence,
+    ToolAnalysisContext,
+    ToolAnalysisSelection,
+    ToolEvidence,
+)
+from app.tool_narratives import RuleBasedToolNarrativeAnalyzer, render_tool_selection
+
+
+COUNTERS = {
+    "valid_events_total": 2,
+    "dlq_events_total": 1,
+    "late_events_total": 0,
+    "duplicate_events_total": 0,
+    "parse_errors_total": 0,
+    "validation_errors_total": 0,
+}
+
+
+def complete_context() -> ToolAnalysisContext:
+    return ToolAnalysisContext(
+        question="综合分析",
+        generated_at=datetime(2026, 8, 3, tzinfo=UTC),
+        evidence=ToolEvidence(
+            realtime=RealtimeEvidence(pv=4, uv=2),
+            historical=HistoricalEvidence(event_count=2, event_type_counts={"view": 2}),
+            data_quality=DataQualityEvidence(
+                job_id="a" * 32,
+                job_state="RUNNING",
+                completed_checkpoints=2,
+                failed_checkpoints=0,
+                latest_completed_at=datetime(2026, 8, 3, tzinfo=UTC),
+                counters=COUNTERS,
+            ),
+        ),
+    )
+
+
+def realtime_only_context() -> ToolAnalysisContext:
+    return ToolAnalysisContext(
+        question="当前指标",
+        generated_at=datetime(2026, 8, 3, tzinfo=UTC),
+        evidence=ToolEvidence(realtime=RealtimeEvidence(pv=2, uv=1)),
+    )
+
+
+def quality_claim_selection() -> ToolAnalysisSelection:
+    return ToolAnalysisSelection(
+        summary="quality_only",
+        insights=["checkpoint_status"],
+        risks=[],
+        actions=[],
+    )
+
+
+class ToolNarrativesTest(unittest.TestCase):
+    def test_rule_narrative_uses_only_available_tool_evidence(self):
+        narrative = RuleBasedToolNarrativeAnalyzer().analyze(complete_context())
+
+        self.assertIn("2", narrative.summary)
+        self.assertTrue(any("checkpoint" in item.lower() for item in narrative.insights))
+
+    def test_model_selection_cannot_claim_missing_evidence_or_invent_numbers(self):
+        with self.assertRaises(ValueError):
+            render_tool_selection(quality_claim_selection(), realtime_only_context())
+        with self.assertRaises(NarrativeProvenanceError):
+            validate_narrative_numbers(
+                AnalysisNarrative(summary="当前有 999 个异常事件。"),
+                allowed_numbers={Decimal(2)},
+            )
+
+    def test_selection_rejects_unknown_or_duplicate_claim_ids_as_a_whole(self):
+        for payload in (
+            {
+                "summary": "unknown",
+                "insights": [],
+                "risks": [],
+                "actions": [],
+            },
+            {
+                "summary": "realtime_only",
+                "insights": ["visits_per_user", "visits_per_user"],
+                "risks": [],
+                "actions": [],
+            },
+        ):
+            with self.subTest(payload=payload), self.assertRaises(ValidationError):
+                ToolAnalysisSelection.model_validate(payload)
+
+
+if __name__ == "__main__":
+    unittest.main()

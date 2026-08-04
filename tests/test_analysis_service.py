@@ -10,7 +10,13 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str((ROOT / "services" / "api").resolve()))
 
 from app.analysis_models import AnalysisNarrative, HistoricalEvidence
-from app.analysis_service import AnalysisService, AnalysisUnavailableError, RealtimeDataUnavailableError
+from app.analysis_service import (
+    AnalysisService,
+    AnalysisUnavailableError,
+    NarrativeProvenanceError,
+    RealtimeDataUnavailableError,
+    validate_narrative_numbers,
+)
 from app.analyzers import RuleBasedAnalyzer
 
 
@@ -96,6 +102,10 @@ class AnalysisServiceTest(unittest.TestCase):
         record = captured.records[0]
         self.assertEqual("analysis_model_degraded", getattr(record, "event", None))
         self.assertEqual("NarrativeProvenanceError", record.error_type)
+
+    def test_shared_number_guard_rejects_ungrounded_number(self):
+        with self.assertRaises(NarrativeProvenanceError):
+            validate_narrative_numbers(AnalysisNarrative(summary="有 999 条事件。"), {12})
 
     def test_primary_sql_or_code_output_falls_back_without_keyword_substring_false_positives(self):
         rejected_outputs = (

@@ -178,9 +178,16 @@ def _validate_narrative(narrative: AnalysisNarrative, context: AnalysisContext) 
     ):
         raise NarrativeProvenanceError("Narrative contains prohibited SQL or code output")
 
-    allowed = _allowed_narrative_numbers(context)
+    validate_narrative_numbers(narrative, _allowed_narrative_numbers(context))
+
+
+def validate_narrative_numbers(
+    narrative: AnalysisNarrative,
+    allowed_numbers: set[Decimal],
+) -> None:
+    fields = [narrative.summary, *narrative.insights, *narrative.risks, *narrative.actions]
     narrative_numbers = _numbers_in(fields, fail_closed=True)
-    if not narrative_numbers.issubset(allowed):
+    if not narrative_numbers.issubset(allowed_numbers):
         raise NarrativeProvenanceError("Narrative contains an ungrounded number")
 
 
