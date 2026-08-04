@@ -80,12 +80,12 @@ class ToolExecutor:
     def execute(self, plan: ToolPlan, audit_id: str) -> ToolExecutionResult:
         calls = self._validate_plan(plan)
         safe_audit_id = self._safe_audit_id(audit_id)
-        started_at = self._timer()
+        started_at = self._now()
         evidence: dict[str, EvidencePartition] = {}
         summaries: list[ToolCallSummary] = []
 
         for call in calls:
-            call_started_at = self._timer()
+            call_started_at = self._now()
             if self._elapsed(started_at, call_started_at) >= self._total_timeout_seconds:
                 self._log_call(safe_audit_id, call.tool_id, "failed", 0.0, "budget_exceeded")
                 raise ToolExecutionUnavailableError("tool execution unavailable") from None
@@ -93,8 +93,11 @@ class ToolExecutor:
             try:
                 partition = self._registry[call.tool_id]()
             except Exception:
-                completed_at = self._timer()
+                completed_at = self._now()
                 duration_ms = self._duration_ms(call_started_at, completed_at)
+                if self._elapsed(started_at, completed_at) >= self._total_timeout_seconds:
+                    self._log_call(safe_audit_id, call.tool_id, "failed", duration_ms, "budget_exceeded")
+                    raise ToolExecutionUnavailableError("tool execution unavailable") from None
                 summaries.append(
                     ToolCallSummary(
                         tool_id=call.tool_id,
@@ -106,7 +109,7 @@ class ToolExecutor:
                 self._log_call(safe_audit_id, call.tool_id, "failed", duration_ms, "tool_failure")
                 continue
 
-            completed_at = self._timer()
+            completed_at = self._now()
             duration_ms = self._duration_ms(call_started_at, completed_at)
             if self._elapsed(started_at, completed_at) >= self._total_timeout_seconds:
                 self._log_call(safe_audit_id, call.tool_id, "failed", duration_ms, "budget_exceeded")
@@ -205,6 +208,12 @@ class ToolExecutor:
     @staticmethod
     def _safe_audit_id(audit_id: str) -> str:
         return audit_id if isinstance(audit_id, str) and _SAFE_AUDIT_ID.fullmatch(audit_id) else "redacted"
+
+    def _now(self) -> float:
+        try:
+            return self._timer()
+        except Exception:
+            raise ToolExecutionUnavailableError("tool execution unavailable") from None
 
     @staticmethod
     def _elapsed(started_at: float, current_at: float) -> float:

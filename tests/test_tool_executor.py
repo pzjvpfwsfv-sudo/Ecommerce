@@ -55,9 +55,16 @@ def composite_plan() -> ToolPlan:
     )
 
 
-def timer_for(*values: float) -> Callable[[], float]:
+def timer_for(*values: object) -> Callable[[], float]:
     ticks = iter(values)
-    return lambda: next(ticks)
+
+    def timer() -> float:
+        value = next(ticks)
+        if isinstance(value, BaseException):
+            raise value
+        return value  # type: ignore[return-value]
+
+    return timer
 
 
 def make_executor(
@@ -170,6 +177,44 @@ class ToolExecutorTest(unittest.TestCase):
         with self.assertRaisesRegex(ToolExecutionUnavailableError, "^tool execution unavailable$"):
             executor.execute(realtime_plan(), "audit-5")
 
+        realtime.fetch_all_metrics.assert_called_once_with()
+
+    def test_executor_discards_prior_evidence_when_a_failed_call_reaches_the_total_budget(self):
+        executor, realtime, historical, _ = make_executor(timer=timer_for(0.0, 0.0, 0.0, 0.0, 21.0))
+        historical.fetch_summary.side_effect = RuntimeError("secret failure detail")
+        plan = ToolPlan(
+            calls=[
+                ToolCall(tool_id=ToolId.REALTIME),
+                ToolCall(tool_id=ToolId.HISTORICAL),
+            ]
+        )
+
+        with self.assertRaisesRegex(ToolExecutionUnavailableError, "^tool execution unavailable$") as error:
+            executor.execute(plan, "audit-5a")
+
+        self.assertIsNone(error.exception.__cause__)
+        self.assertNotIn("secret", "".join(traceback.format_exception(error.exception)))
+        realtime.fetch_all_metrics.assert_called_once_with()
+        historical.fetch_summary.assert_called_once_with()
+
+    def test_executor_scrubs_a_failure_from_the_first_timer_call(self):
+        executor, realtime, _, _ = make_executor(timer=timer_for(RuntimeError("timer secret")))
+
+        with self.assertRaisesRegex(ToolExecutionUnavailableError, "^tool execution unavailable$") as error:
+            executor.execute(realtime_plan(), "audit-5b")
+
+        self.assertIsNone(error.exception.__cause__)
+        self.assertNotIn("timer secret", "".join(traceback.format_exception(error.exception)))
+        realtime.fetch_all_metrics.assert_not_called()
+
+    def test_executor_scrubs_a_timer_failure_after_a_repository_call(self):
+        executor, realtime, _, _ = make_executor(timer=timer_for(0.0, 0.0, RuntimeError("timer secret")))
+
+        with self.assertRaisesRegex(ToolExecutionUnavailableError, "^tool execution unavailable$") as error:
+            executor.execute(realtime_plan(), "audit-5c")
+
+        self.assertIsNone(error.exception.__cause__)
+        self.assertNotIn("timer secret", "".join(traceback.format_exception(error.exception)))
         realtime.fetch_all_metrics.assert_called_once_with()
 
     def test_executor_rejects_the_entire_mutated_or_over_limit_plan_before_any_call(self):
