@@ -35,6 +35,44 @@ class Chapter10ArtifactsTest(unittest.TestCase):
         for name in (value.split("=", 1)[0] for value in expected):
             self.assertIn(f"      {name}: ${{{name}}}", compose)
 
+    def test_verifier_covers_three_tools_composite_and_prompt_injection(self):
+        text = (ROOT / "scripts/verify_chapter_10_tool_analysis.ps1").read_text(
+            encoding="utf-8"
+        )
+        for expected in (
+            "/analysis/tools",
+            "get_realtime_metrics",
+            "get_historical_behavior_summary",
+            "get_data_quality_health",
+            "audit_id",
+            "ignore whitelist",
+            "analysis tools are temporarily unavailable",
+        ):
+            self.assertIn(expected, text)
+        for forbidden in ("cancel", "stop-with-savepoint", "run_sql"):
+            self.assertNotIn(forbidden, text.lower())
+        self.assertIn(
+            '"(?i)\\b(SELECT|INSERT|UPDATE|DELETE)\\b|https?://"',
+            text,
+        )
+
+    def test_runbook_documents_safe_operation_and_strict_verification(self):
+        text = (
+            ROOT / "docs/chapter-10-controlled-tool-calling-runbook.md"
+        ).read_text(encoding="utf-8")
+        for expected in (
+            "安全边界",
+            "实时指标",
+            "历史行为",
+            "数据质量",
+            "综合分析",
+            "降级",
+            "audit_id",
+            "verify_chapter_10_tool_analysis.ps1",
+            "不是 NL2SQL",
+        ):
+            self.assertIn(expected, text)
+
 
 if __name__ == "__main__":
     unittest.main()

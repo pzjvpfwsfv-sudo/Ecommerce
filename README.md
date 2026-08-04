@@ -237,6 +237,18 @@ MinIO 版当前已经通过真实验证，关键修复点是把 S3A 配置下沉
 - Phase B 使用 manifest 固化原始 Topic 的停流边界，完成受控切流与生产验收。
 - 安全回滚先暂停流量并按 manifest 核验 Job ID、名称与状态；回滚 dry-run 已验证入口和边界，但不把已写入 Doris/Iceberg 的数据宣称为可自动撤销。
 
+## 第 10 章：受控工具调用与审计
+
+`POST /analysis/tools` 默认使用无需 API Key 的 `rule_based` planner 和叙事模式，只能调用 Doris 实时指标、Trino 历史行为和 Flink 数据质量三个后端注册的只读工具。可选 `openai_compatible` 模型模式仅能选择这三个工具和受控 claim，不能生成或执行 SQL；第 10 章仍不是 NL2SQL。
+
+真实验收只读调用 5 次接口，严格检查工具白名单、顺序、evidence、唯一 `audit_id`、`degraded=false` 和提示注入边界：
+
+```powershell
+./scripts/verify_chapter_10_tool_analysis.ps1
+```
+
+运行前须让已有的 FastAPI、Doris、Trino、Flink REST 和第 9 章唯一生产质量 Job 处于可用状态。验收通过时最后一行输出 `{"status":"PASS","requests":5,"tools_verified":3,"prompt_injection_blocked":true}`；完整前提、失败排障和面试叙事见 [第 10 章运行手册](docs/chapter-10-controlled-tool-calling-runbook.md)。
+
 ## 章节路线
 
 1. 第 0 章：项目认知 + 环境准备 + 最小主链路设计
