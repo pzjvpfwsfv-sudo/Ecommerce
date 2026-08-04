@@ -1,5 +1,6 @@
 from collections.abc import Iterator
 from datetime import UTC, datetime
+import logging
 from pathlib import Path
 import sys
 import unittest
@@ -11,8 +12,8 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str((ROOT / "services" / "api").resolve()))
 
 from app.analysis_models import HistoricalEvidence, RealtimeEvidence
-from app.tool_analysis_service import ToolAnalysisService, ToolAnalysisUnavailableError
 from app.tool_executor import ToolExecutor
+from app.tool_analysis_service import ToolAnalysisService, ToolAnalysisUnavailableError
 from app.tool_models import (
     ToolCall,
     ToolCallSummary,
@@ -41,6 +42,57 @@ def successful_execution() -> ToolExecutionResult:
             )
         ],
     )
+
+
+class CapturingHandler(logging.Handler):
+    def __init__(self) -> None:
+        super().__init__()
+        self.records: list[logging.LogRecord] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.records.append(record)
+
+
+def real_executor(
+    historical_failure: bool = False,
+    all_fail: bool = False,
+) -> ToolExecutor:
+    realtime = Mock()
+    realtime.fetch_all_metrics.return_value = {
+        "pv": 2,
+        "uv": 1,
+        "updated_at": "2026-08-03T00:00:00Z",
+    }
+    historical = Mock()
+    historical.fetch_summary.return_value = HistoricalEvidence(
+        event_count=2,
+        event_type_counts={"view": 2},
+        latest_event_time="2026-08-03T00:00:00Z",
+    )
+    quality = Mock()
+    if historical_failure:
+        historical.fetch_summary.side_effect = RuntimeError(
+            "SELECT secret FROM https://internal.invalid"
+        )
+    if all_fail:
+        realtime.fetch_all_metrics.side_effect = RuntimeError("password=secret")
+        historical.fetch_summary.side_effect = RuntimeError("SELECT secret")
+        quality.fetch_health.side_effect = RuntimeError("https://internal.invalid")
+    return ToolExecutor(realtime, historical, quality, 3, 1, 20)
+
+
+def capture_app_logs(action):
+    logger = logging.getLogger("app")
+    handler = CapturingHandler()
+    old_level = logger.level
+    logger.setLevel(logging.INFO)
+    logger.addHandler(handler)
+    try:
+        action()
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(old_level)
+    return handler.records
 
 
 def historical_execution(event_type: str) -> ToolExecutionResult:
@@ -98,6 +150,107 @@ def service_with(
 
 
 class ToolAnalysisServiceTest(unittest.TestCase):
+    def test_audit_events_are_stable_for_normal_and_planner_degraded_requests(self):
+        normal_service, _ = service_with(executor=real_executor())
+        normal_records = capture_app_logs(lambda: normal_service.analyze("password=secret"))
+        self.assertEqual(
+            [
+                "tool_analysis_started",
+                "tool_plan_selected",
+                "tool_call_completed",
+                "tool_analysis_completed",
+            ],
+            [record.getMessage() for record in normal_records],
+        )
+
+        primary = Mock(spec=ToolPlanner)
+        primary.name = "openai_compatible"
+        primary.plan.side_effect = ValueError("SELECT secret https://internal.invalid")
+        degraded_service, _ = service_with(
+            primary_planner=primary,
+            executor=real_executor(),
+        )
+        degraded_records = capture_app_logs(
+            lambda: degraded_service.analyze("password=secret")
+        )
+        self.assertEqual(
+            [
+                "tool_analysis_started",
+                "tool_planner_degraded",
+                "tool_plan_selected",
+                "tool_call_completed",
+                "tool_analysis_completed",
+            ],
+            [record.getMessage() for record in degraded_records],
+        )
+        selected = next(
+            record for record in degraded_records
+            if record.getMessage() == "tool_plan_selected"
+        )
+        self.assertEqual([ToolId.REALTIME.value], selected.selected_tools)
+        rendered = "\n".join(
+            f"{record.getMessage()} {record.__dict__}" for record in degraded_records
+        )
+        for forbidden in ("password=secret", "SELECT secret", "https://internal.invalid"):
+            self.assertNotIn(forbidden, rendered)
+
+    def test_audit_events_cover_partial_and_total_tool_failure(self):
+        plan = ToolPlan(
+            calls=[
+                ToolCall(tool_id=ToolId.REALTIME),
+                ToolCall(tool_id=ToolId.HISTORICAL),
+            ]
+        )
+        primary = Mock(spec=ToolPlanner)
+        primary.name = "openai_compatible"
+        primary.plan.return_value = plan
+        partial_service, _ = service_with(
+            primary_planner=primary,
+            executor=real_executor(historical_failure=True),
+        )
+        partial_records = capture_app_logs(
+            lambda: partial_service.analyze("综合 password=secret")
+        )
+        partial_selected = next(
+            record for record in partial_records
+            if record.getMessage() == "tool_plan_selected"
+        )
+        self.assertEqual(
+            [ToolId.REALTIME.value, ToolId.HISTORICAL.value],
+            partial_selected.selected_tools,
+        )
+        self.assertEqual(
+            [
+                "tool_analysis_started",
+                "tool_plan_selected",
+                "tool_call_completed",
+                "tool_call_failed",
+                "tool_analysis_completed",
+            ],
+            [record.getMessage() for record in partial_records],
+        )
+
+        all_failed_service, _ = service_with(
+            primary_planner=primary,
+            executor=real_executor(all_fail=True),
+        )
+
+        def fail_analysis() -> None:
+            with self.assertRaises(ToolAnalysisUnavailableError):
+                all_failed_service.analyze("综合 password=secret")
+
+        failed_records = capture_app_logs(fail_analysis)
+        self.assertEqual(
+            [
+                "tool_analysis_started",
+                "tool_plan_selected",
+                "tool_call_failed",
+                "tool_call_failed",
+                "tool_analysis_failed",
+            ],
+            [record.getMessage() for record in failed_records],
+        )
+
     def test_service_rejects_primary_plan_before_execution_and_uses_rule_plan(self):
         primary = Mock(spec=ToolPlanner)
         primary.name = "openai_compatible"
@@ -117,12 +270,23 @@ class ToolAnalysisServiceTest(unittest.TestCase):
         primary_analyzer.select.side_effect = ValueError("SELECT secret FROM https://internal.invalid")
         service, _ = service_with(primary_analyzer=primary_analyzer)
 
-        with self.assertLogs("app.tool_analysis_service", level="WARNING") as captured:
-            response = service.analyze("当前指标")
+        responses = []
+        records = capture_app_logs(lambda: responses.append(service.analyze("当前指标")))
+        response = responses[0]
 
-        rendered = response.model_dump_json() + "\n".join(captured.output)
+        rendered = response.model_dump_json() + "\n".join(
+            f"{record.getMessage()} {record.__dict__}" for record in records
+        )
         self.assertEqual("rule_based", response.analyzer)
         self.assertTrue(response.degraded)
+        self.assertEqual(
+            [
+                "tool_analysis_started",
+                "tool_plan_selected",
+                "tool_analysis_completed",
+            ],
+            [record.getMessage() for record in records],
+        )
         for forbidden in ("SELECT", "secret", "https://", "internal.invalid"):
             self.assertNotIn(forbidden, rendered)
 
@@ -145,8 +309,7 @@ class ToolAnalysisServiceTest(unittest.TestCase):
             fallback_analyzer=fallback_analyzer,
         )
 
-        with self.assertLogs("app.tool_analysis_service", level="WARNING"):
-            response = service.analyze("历史行为")
+        response = service.analyze("历史行为")
 
         self.assertEqual("rule_based", response.analyzer)
         self.assertTrue(response.degraded)

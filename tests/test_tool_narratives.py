@@ -80,6 +80,28 @@ class ToolNarrativesTest(unittest.TestCase):
         self.assertIn("2", narrative.summary)
         self.assertTrue(any("checkpoint" in item.lower() for item in narrative.insights))
 
+    def test_quality_event_count_does_not_double_count_overlapping_counters(self):
+        context = complete_context()
+        context.evidence.data_quality.counters.update(
+            {
+                "dlq_events_total": 6,
+                "late_events_total": 2,
+                "duplicate_events_total": 3,
+                "parse_errors_total": 1,
+                "validation_errors_total": 2,
+            }
+        )
+        selection = ToolAnalysisSelection(
+            summary="quality_only",
+            insights=["quality_event_counts"],
+            risks=[],
+            actions=[],
+        )
+
+        narrative = render_tool_selection(selection, context)
+
+        self.assertEqual(["数据质量计数中累计异常或拒绝事件为 8 条。"], narrative.insights)
+
     def test_model_selection_cannot_claim_missing_evidence_or_invent_numbers(self):
         with self.assertRaises(ValueError):
             render_tool_selection(quality_claim_selection(), realtime_only_context())

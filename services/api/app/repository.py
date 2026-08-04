@@ -2,9 +2,11 @@
 
 from collections.abc import Callable
 from datetime import datetime
+import math
 from typing import Any
 
 from app.config import ApiSettings
+from app.tool_deadline import remaining_timeout
 
 
 ConnectionFactory = Callable[[], Any]
@@ -19,6 +21,9 @@ class RealtimeMetricsRepository:
         def connect() -> Any:
             import pymysql
 
+            timeout_seconds = math.ceil(
+                remaining_timeout(settings.ai_tool_total_timeout_seconds)
+            )
             return pymysql.connect(
                 host=settings.doris_host,
                 port=settings.doris_port,
@@ -27,6 +32,9 @@ class RealtimeMetricsRepository:
                 database=settings.doris_database,
                 charset="utf8mb4",
                 cursorclass=pymysql.cursors.DictCursor,
+                connect_timeout=timeout_seconds,
+                read_timeout=timeout_seconds,
+                write_timeout=timeout_seconds,
             )
 
         return cls(connect)

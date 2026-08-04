@@ -6,6 +6,7 @@ from app.trino_repository import (
     SUMMARY_SQL,
     TrinoAnalyticsRepository,
 )
+from app.tool_deadline import use_tool_deadline
 
 
 class TrinoAnalyticsRepositoryTest(unittest.TestCase):
@@ -84,6 +85,36 @@ class TrinoAnalyticsRepositoryTest(unittest.TestCase):
         self.assertEqual(
             {"connect": 5, "read": 5, "write": 5, "pool": 5},
             next_request.extensions["timeout"],
+        )
+
+    def test_fetch_summary_caps_each_page_to_the_remaining_budget(self):
+        requests: list[httpx.Request] = []
+        ticks = iter((0.0, 1.0, 2.0))
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            if request.method == "POST":
+                return httpx.Response(
+                    200,
+                    json={"data": [], "nextUri": "http://trino:8080/v1/next/1"},
+                )
+            return httpx.Response(
+                200,
+                json={"data": [[0, None, None, None]]},
+            )
+
+        repository = TrinoAnalyticsRepository(
+            base_url="http://trino:8080",
+            timeout_seconds=10,
+            client_factory=lambda: httpx.Client(transport=httpx.MockTransport(handler)),
+        )
+
+        with use_tool_deadline(4, timer=lambda: next(ticks)):
+            repository.fetch_summary()
+
+        self.assertEqual(
+            [3, 2],
+            [request.extensions["timeout"]["read"] for request in requests],
         )
 
     def test_fetch_summary_rejects_inconsistent_or_negative_counts(self):

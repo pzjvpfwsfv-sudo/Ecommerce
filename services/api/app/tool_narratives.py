@@ -254,7 +254,10 @@ def _quality_rejections(context: ToolAnalysisContext) -> int | None:
     quality = context.evidence.data_quality
     if quality is None:
         return None
-    return sum(count for name, count in quality.counters.items() if name != "valid_events_total")
+    return (
+        quality.counters["dlq_events_total"]
+        + quality.counters["late_events_total"]
+    )
 
 
 class OpenAICompatibleToolNarrativeAnalyzer:

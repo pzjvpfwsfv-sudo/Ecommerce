@@ -26,6 +26,10 @@ class AnalysisRequest(BaseModel):
         return normalized
 
 
+class ToolAnalysisRequest(AnalysisRequest):
+    model_config = ConfigDict(extra="forbid")
+
+
 class RealtimeEvidence(BaseModel):
     pv: int | None = None
     uv: int | None = None

@@ -32,8 +32,22 @@ class Chapter10ArtifactsTest(unittest.TestCase):
         )
         for value in expected:
             self.assertIn(value, env_example)
-        for name in (value.split("=", 1)[0] for value in expected):
-            self.assertIn(f"      {name}: ${{{name}}}", compose)
+        for value in expected:
+            name, default = value.split("=", 1)
+            self.assertIn(f"      {name}: ${{{name}:-{default}}}", compose)
+
+    def test_application_and_compose_defaults_match_the_documented_safe_values(self):
+        config = (ROOT / "services/api/app/config.py").read_text(encoding="utf-8")
+        expected = {
+            "FLINK_REST_URL": "http://flink-jobmanager:8081",
+            "CHAPTER9_PRODUCTION_JOB_NAME": "chapter-9-datastream-quality-production",
+            "AI_TOOL_PLANNER_MODE": "rule_based",
+            "AI_TOOL_MAX_CALLS": "3",
+            "AI_TOOL_TOTAL_TIMEOUT_SECONDS": "20",
+            "AI_TOOL_MAX_EVENT_TYPES": "20",
+        }
+        for name, default in expected.items():
+            self.assertIn(f'"{name}", "{default}"', config)
 
     def test_verifier_covers_three_tools_composite_and_prompt_injection(self):
         text = (ROOT / "scripts/verify_chapter_10_tool_analysis.ps1").read_text(
@@ -70,6 +84,9 @@ class Chapter10ArtifactsTest(unittest.TestCase):
             "audit_id",
             "verify_chapter_10_tool_analysis.ps1",
             "不是 NL2SQL",
+            "整体作废",
+            "规则 planner",
+            "fallback 计划也失败",
         ):
             self.assertIn(expected, text)
 

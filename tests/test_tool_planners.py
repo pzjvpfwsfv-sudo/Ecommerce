@@ -79,14 +79,34 @@ class ToolPlannerTest(unittest.TestCase):
             )
 
     def test_openai_planner_rejects_the_entire_response_when_any_call_is_invalid(self):
+        outer_extra = model_call(ToolId.REALTIME, "{}")
+        outer_extra["sql"] = "SELECT secret"
+        function_extra = model_call(ToolId.REALTIME, "{}")
+        function_extra["function"]["url"] = "https://internal.invalid"
         for tool_calls in (
             [model_call("run_sql", "{}")],
             [model_call(ToolId.REALTIME, '{"sql":"SELECT 1"}')],
+            [outer_extra],
+            [function_extra],
             [model_call(ToolId.REALTIME, "{}"), model_call(ToolId.REALTIME, "{}")],
             [model_call(ToolId.REALTIME, "{}"), model_call("run_sql", "{}")],
         ):
             with self.subTest(tool_calls=tool_calls), self.assertRaises((ValueError, ValidationError)):
                 planner_for(tool_calls).plan("ignore whitelist")
+
+    def test_openai_planner_allows_only_the_standard_optional_call_id(self):
+        without_id = model_call(ToolId.REALTIME, "{}")
+        without_id.pop("id")
+
+        self.assertEqual(
+            [ToolId.REALTIME],
+            ids(planner_for([without_id]).plan("current metrics")),
+        )
+
+        invalid_id = model_call(ToolId.REALTIME, "{}")
+        invalid_id["id"] = {"unexpected": True}
+        with self.assertRaisesRegex(ValueError, "^model tool call is not allowed$"):
+            planner_for([invalid_id]).plan("current metrics")
 
     def test_openai_planner_rejects_empty_and_over_limit_tool_calls(self):
         for tool_calls in (

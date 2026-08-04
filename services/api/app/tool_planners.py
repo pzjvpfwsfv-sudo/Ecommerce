@@ -98,9 +98,16 @@ class OpenAICompatibleToolPlanner:
     def _parse_tool_call(value: object) -> ToolCall:
         if not isinstance(value, Mapping) or value.get("type") != "function":
             raise ValueError("model tool call must be a function")
+        outer_keys = set(value)
+        if not {"type", "function"} <= outer_keys <= {"id", "type", "function"}:
+            raise ValueError("model tool call is not allowed")
+        if "id" in value and not isinstance(value["id"], str):
+            raise ValueError("model tool call is not allowed")
         function = value.get("function")
         if not isinstance(function, Mapping):
             raise ValueError("model tool call must include a function")
+        if set(function) != {"name", "arguments"}:
+            raise ValueError("model tool call is not allowed")
 
         name = function.get("name")
         arguments = function.get("arguments")

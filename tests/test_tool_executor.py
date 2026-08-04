@@ -3,15 +3,19 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 import sys
+import threading
+import time
 import traceback
 import unittest
 from unittest.mock import Mock
 
+import httpx
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str((ROOT / "services" / "api").resolve()))
 
 from app.analysis_models import HistoricalEvidence
+from app.flink_quality_repository import FlinkQualityRepository
 from app.tool_executor import ToolExecutionPlanError, ToolExecutionUnavailableError, ToolExecutor
 from app.tool_models import DataQualityEvidence, ToolCall, ToolId, ToolPlan
 
@@ -72,6 +76,7 @@ def make_executor(
     historical_result: object | None = None,
     quality_result: object | None = None,
     max_calls: int = 3,
+    total_timeout_seconds: float = 20,
     timer: Callable[[], float] = lambda: 0.0,
 ) -> tuple[ToolExecutor, Mock, Mock, Mock]:
     realtime = Mock()
@@ -88,7 +93,15 @@ def make_executor(
     )
     quality = Mock()
     quality.fetch_health.return_value = quality_result or valid_quality_evidence()
-    return ToolExecutor(realtime, historical, quality, max_calls, 20, 20, timer=timer), realtime, historical, quality
+    return ToolExecutor(
+        realtime,
+        historical,
+        quality,
+        max_calls,
+        total_timeout_seconds,
+        20,
+        timer=timer,
+    ), realtime, historical, quality
 
 
 class CapturingHandler(logging.Handler):
@@ -196,6 +209,44 @@ class ToolExecutorTest(unittest.TestCase):
         self.assertNotIn("secret", "".join(traceback.format_exception(error.exception)))
         realtime.fetch_all_metrics.assert_called_once_with()
         historical.fetch_summary.assert_called_once_with()
+
+    def test_executor_enforces_a_wall_clock_deadline_on_blocking_tools(self):
+        executor, realtime, historical, quality = make_executor(total_timeout_seconds=0.05)
+        blocked = threading.Event()
+        realtime.fetch_all_metrics.side_effect = lambda **_: blocked.wait(0.5)
+
+        started_at = time.perf_counter()
+        with self.assertRaisesRegex(ToolExecutionUnavailableError, "^tool execution unavailable$"):
+            executor.execute(composite_plan(), "audit-blocked")
+        elapsed = time.perf_counter() - started_at
+
+        self.assertLess(elapsed, 0.2)
+        historical.fetch_summary.assert_not_called()
+        quality.fetch_health.assert_not_called()
+
+    def test_executor_deadline_interrupts_a_blocking_http_transport(self):
+        def blocking_handler(request: httpx.Request) -> httpx.Response:
+            time.sleep(0.5)
+            return httpx.Response(500)
+
+        quality = FlinkQualityRepository(
+            base_url="http://flink:8081",
+            production_job_name="chapter-9-datastream-quality-production",
+            timeout_seconds=1,
+            client_factory=lambda: httpx.Client(
+                transport=httpx.MockTransport(blocking_handler)
+            ),
+        )
+        executor = ToolExecutor(Mock(), Mock(), quality, 3, 0.05, 20)
+
+        started_at = time.perf_counter()
+        with self.assertRaisesRegex(ToolExecutionUnavailableError, "^tool execution unavailable$"):
+            executor.execute(
+                ToolPlan(calls=[ToolCall(tool_id=ToolId.DATA_QUALITY)]),
+                "audit-blocked-transport",
+            )
+
+        self.assertLess(time.perf_counter() - started_at, 0.2)
 
     def test_executor_scrubs_a_failure_from_the_first_timer_call(self):
         executor, realtime, _, _ = make_executor(timer=timer_for(RuntimeError("timer secret")))

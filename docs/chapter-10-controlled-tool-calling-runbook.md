@@ -63,7 +63,7 @@ Invoke-RestMethod -Method Post -Uri http://localhost:8000/analysis/tools `
 
 结构化日志用 `audit_id` 串联请求。允许的审计字段包括 planner/analyzer 名称、工具 ID、调用状态、阶段、耗时、`degraded` 和异常类型；不得记录 API Key、密码、Authorization、完整 prompt、SQL、URL、原始模型输出、异常消息或 stack。
 
-单工具不可用时，服务可以返回其余 evidence 并设置 `degraded=true`；所有工具不可用、计划非法或响应无法安全校验时，接口返回固定 `503`：`analysis tools are temporarily unavailable`。真实验收不接受任何降级响应，必须修复依赖后重跑，不得跳过断言。
+单工具不可用时，服务可以返回其余 evidence 并设置 `degraded=true`。主模型 planner 返回非法结构、未知/重复工具或额外字段时，主计划整体作废，不执行其中任何工具，并降级到规则 planner；只有规则 fallback 计划也失败时才返回固定 `503`。所有工具不可用或响应无法安全校验时同样返回固定 `503`：`analysis tools are temporarily unavailable`。真实验收不接受任何降级响应，必须修复依赖后重跑，不得跳过断言。
 
 ## 严格验收
 

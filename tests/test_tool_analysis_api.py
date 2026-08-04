@@ -12,7 +12,7 @@ from fastapi.testclient import TestClient
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str((ROOT / "services" / "api").resolve()))
 
-from app.analysis_models import RealtimeEvidence
+from app.analysis_models import AnalysisRequest, RealtimeEvidence
 from app.config import ApiSettings
 from app.main import create_app
 from app.tool_analysis_service import ToolAnalysisUnavailableError
@@ -66,6 +66,21 @@ class ToolAnalysisApiTest(unittest.TestCase):
 
         self.assertEqual(422, response.status_code)
         self.service.analyze.assert_not_called()
+
+    def test_tools_endpoint_rejects_sql_extra_without_changing_legacy_request_model(self):
+        response = self.client.post(
+            "/analysis/tools",
+            json={"question": "综合分析", "sql": "SELECT secret"},
+        )
+
+        self.assertEqual(422, response.status_code)
+        self.service.analyze.assert_not_called()
+        self.assertEqual(
+            "综合分析",
+            AnalysisRequest.model_validate(
+                {"question": "综合分析", "sql": "SELECT secret"}
+            ).question,
+        )
 
     def test_endpoint_rejects_overlong_question_before_calling_service(self):
         response = self.client.post("/analysis/tools", json={"question": "x" * 11})

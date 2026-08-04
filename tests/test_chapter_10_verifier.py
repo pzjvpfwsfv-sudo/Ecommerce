@@ -79,6 +79,17 @@ def valid_sequence() -> list[tuple[int, object]]:
     ]
 
 
+def sequence_with_invalid_payload(
+    mutate,
+    response_index: int = 0,
+) -> list[tuple[int, object]]:
+    responses = valid_sequence()
+    payload = deepcopy(responses[response_index][1])
+    mutate(payload)
+    responses[response_index] = (200, payload)
+    return responses
+
+
 @contextmanager
 def mock_server(responses: list[tuple[int, object]]):
     class Handler(BaseHTTPRequestHandler):
@@ -131,6 +142,7 @@ class Chapter10VerifierTest(unittest.TestCase):
                 cwd=ROOT,
                 capture_output=True,
                 text=True,
+                errors="replace",
                 timeout=20,
                 check=False,
             )
@@ -172,6 +184,61 @@ class Chapter10VerifierTest(unittest.TestCase):
         del missing_payload["degraded"]
         missing[0] = (200, missing_payload)
         self.assert_rejected(missing)
+
+    def test_verifier_rejects_inexact_top_level_and_acceptance_metadata(self):
+        cases = (
+            lambda payload: payload.update({"unexpected": "field"}),
+            lambda payload: payload.pop("summary"),
+            lambda payload: payload.update({"summary": 7}),
+            lambda payload: payload.update({"insights": "not-an-array"}),
+            lambda payload: payload.update({"risks": [1]}),
+            lambda payload: payload.update({"actions": None}),
+            lambda payload: payload.update({"warnings": ["not strict"]}),
+            lambda payload: payload.update({"warnings": None}),
+            lambda payload: payload.update({"planner": "openai_compatible"}),
+            lambda payload: payload.update({"analyzer": "openai_compatible"}),
+            lambda payload: payload.update({"generated_at": "not-a-timestamp"}),
+            lambda payload: payload.update({"generated_at": None}),
+        )
+        for index, mutate in enumerate(cases):
+            with self.subTest(case=index):
+                self.assert_rejected(sequence_with_invalid_payload(mutate))
+
+    def test_verifier_rejects_inexact_or_invalid_successful_tool_summaries(self):
+        cases = (
+            lambda call: call.update({"sql": "SELECT secret"}),
+            lambda call: call.pop("error_type"),
+            lambda call: call.update({"error_type": "tool_failure"}),
+            lambda call: call.update({"status": "failed"}),
+            lambda call: call.update({"duration_ms": "1.0"}),
+            lambda call: call.update({"duration_ms": True}),
+            lambda call: call.update({"duration_ms": -0.1}),
+            lambda call: call.update({"duration_ms": None}),
+            lambda call: call.update({"duration_ms": float("inf")}),
+            lambda call: call.update({"duration_ms": float("nan")}),
+        )
+        for index, mutate_call in enumerate(cases):
+            with self.subTest(case=index):
+                self.assert_rejected(
+                    sequence_with_invalid_payload(
+                        lambda payload: mutate_call(payload["tool_calls"][0])
+                    )
+                )
+
+    def test_verifier_rejects_inexact_evidence_and_requires_a_successful_checkpoint(self):
+        cases = (
+            (0, lambda payload: payload["evidence"]["realtime"].update({"extra": 1})),
+            (1, lambda payload: payload["evidence"]["historical"].update({"extra": 1})),
+            (2, lambda payload: payload["evidence"]["data_quality"].update({"extra": 1})),
+            (2, lambda payload: payload["evidence"]["data_quality"].update({"completed_checkpoints": 0})),
+            (2, lambda payload: payload["evidence"]["data_quality"].update({"latest_completed_at": None})),
+            (2, lambda payload: payload["evidence"]["data_quality"].update({"latest_completed_at": "invalid"})),
+        )
+        for index, (response_index, mutate) in enumerate(cases):
+            with self.subTest(case=index):
+                self.assert_rejected(
+                    sequence_with_invalid_payload(mutate, response_index=response_index)
+                )
 
     def test_verifier_rejects_case_variant_required_property_names(self):
         responses = valid_sequence()

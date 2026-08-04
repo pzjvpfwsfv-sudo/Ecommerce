@@ -23,7 +23,7 @@ class ApiSettings:
     ai_model: str = ""
     ai_request_timeout_seconds: float = 15
     ai_max_question_length: int = 500
-    flink_rest_url: str = "http://localhost:8081"
+    flink_rest_url: str = "http://flink-jobmanager:8081"
     chapter9_production_job_name: str = "chapter-9-datastream-quality-production"
     ai_tool_planner_mode: str = "rule_based"
     ai_tool_max_calls: int = 3
@@ -64,7 +64,7 @@ def load_settings(environ: Mapping[str, str] | None = None) -> ApiSettings:
         ai_model=values.get("AI_MODEL", ""),
         ai_request_timeout_seconds=float(values.get("AI_REQUEST_TIMEOUT_SECONDS", "15")),
         ai_max_question_length=int(values.get("AI_MAX_QUESTION_LENGTH", "500")),
-        flink_rest_url=values.get("FLINK_REST_URL", "http://localhost:8081"),
+        flink_rest_url=values.get("FLINK_REST_URL", "http://flink-jobmanager:8081"),
         chapter9_production_job_name=values.get(
             "CHAPTER9_PRODUCTION_JOB_NAME", "chapter-9-datastream-quality-production"
         ),

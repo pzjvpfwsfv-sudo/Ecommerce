@@ -49,23 +49,67 @@ class ToolAnalysisService:
         warnings: list[str] = []
         degraded = False
         planner = self._primary_planner
+        self._audit(
+            "tool_analysis_started",
+            audit_id,
+            planner,
+            self._primary_analyzer,
+            False,
+            None,
+            logging.INFO,
+        )
         try:
             plan = self._validated_plan(planner.plan(question))
         except Exception:
             degraded = True
             warnings.append("规划模型不可用，已降级为规则规划。")
-            self._audit(audit_id, "plan", planner, None, True, "plan_failure", logging.WARNING)
+            self._audit(
+                "tool_planner_degraded",
+                audit_id,
+                planner,
+                None,
+                True,
+                "plan_failure",
+                logging.WARNING,
+            )
             planner = self._fallback_planner
             try:
                 plan = self._validated_plan(planner.plan(question))
             except Exception:
-                self._audit(audit_id, "plan", planner, None, True, "plan_failure", logging.ERROR)
+                self._audit(
+                    "tool_analysis_failed",
+                    audit_id,
+                    planner,
+                    None,
+                    True,
+                    "plan_failure",
+                    logging.ERROR,
+                )
                 raise ToolAnalysisUnavailableError("tool analysis is unavailable") from None
+
+        self._audit(
+            "tool_plan_selected",
+            audit_id,
+            planner,
+            None,
+            degraded,
+            None,
+            logging.INFO,
+            selected_tools=[call.tool_id.value for call in plan.calls],
+        )
 
         try:
             execution = self._executor.execute(plan, str(audit_id))
         except Exception:
-            self._audit(audit_id, "execute", planner, None, degraded, "execution_failure", logging.ERROR)
+            self._audit(
+                "tool_analysis_failed",
+                audit_id,
+                planner,
+                None,
+                degraded,
+                "execution_failure",
+                logging.ERROR,
+            )
             raise ToolAnalysisUnavailableError("tool analysis is unavailable") from None
         if execution.degraded:
             degraded = True
@@ -79,7 +123,15 @@ class ToolAnalysisService:
                 warnings=warnings,
             )
         except Exception:
-            self._audit(audit_id, "claims", planner, None, degraded, "context_failure", logging.ERROR)
+            self._audit(
+                "tool_analysis_failed",
+                audit_id,
+                planner,
+                None,
+                degraded,
+                "context_failure",
+                logging.ERROR,
+            )
             raise ToolAnalysisUnavailableError("tool analysis is unavailable") from None
 
         analyzer = self._primary_analyzer
@@ -88,26 +140,54 @@ class ToolAnalysisService:
         except Exception:
             degraded = True
             warnings.append("叙事模型不可用，已降级为规则叙事。")
-            self._audit(audit_id, "claims", planner, analyzer, True, "narrative_failure", logging.WARNING)
             analyzer = self._fallback_analyzer
             try:
                 narrative = self._render_selected_claims(analyzer, context)
             except Exception:
-                self._audit(audit_id, "narrative", planner, analyzer, True, "narrative_failure", logging.ERROR)
+                self._audit(
+                    "tool_analysis_failed",
+                    audit_id,
+                    planner,
+                    analyzer,
+                    True,
+                    "narrative_failure",
+                    logging.ERROR,
+                )
                 raise ToolAnalysisUnavailableError("tool analysis is unavailable") from None
 
-        self._audit(audit_id, "complete", planner, analyzer, degraded, None, logging.INFO)
-        return ToolAnalysisResponse(
-            **narrative.model_dump(),
-            evidence=execution.evidence,
-            tool_calls=execution.tool_calls,
-            warnings=warnings,
-            planner=self._safe_name(planner),
-            analyzer=self._safe_name(analyzer),
-            degraded=degraded,
-            audit_id=audit_id,
-            generated_at=context.generated_at,
+        try:
+            response = ToolAnalysisResponse(
+                **narrative.model_dump(),
+                evidence=execution.evidence,
+                tool_calls=execution.tool_calls,
+                warnings=warnings,
+                planner=self._safe_name(planner),
+                analyzer=self._safe_name(analyzer),
+                degraded=degraded,
+                audit_id=audit_id,
+                generated_at=context.generated_at,
+            )
+        except Exception:
+            self._audit(
+                "tool_analysis_failed",
+                audit_id,
+                planner,
+                analyzer,
+                degraded,
+                "response_failure",
+                logging.ERROR,
+            )
+            raise ToolAnalysisUnavailableError("tool analysis is unavailable") from None
+        self._audit(
+            "tool_analysis_completed",
+            audit_id,
+            planner,
+            analyzer,
+            degraded,
+            None,
+            logging.INFO,
         )
+        return response
 
     @staticmethod
     def _validated_plan(plan: ToolPlan) -> ToolPlan:
@@ -148,23 +228,26 @@ class ToolAnalysisService:
 
     def _audit(
         self,
+        event: str,
         audit_id: UUID,
-        stage: str,
         planner: ToolPlanner,
         analyzer: ToolNarrativeAnalyzer | None,
         degraded: bool,
         error_type: str | None,
         level: int,
+        selected_tools: list[str] | None = None,
     ) -> None:
+        details: dict[str, object] = {
+            "audit_id": str(audit_id),
+            "planner": self._safe_name(planner),
+            "analyzer": self._safe_name(analyzer),
+            "degraded": degraded,
+            "error_type": error_type,
+        }
+        if selected_tools is not None:
+            details["selected_tools"] = selected_tools
         LOGGER.log(
             level,
-            "tool analysis event",
-            extra={
-                "audit_id": str(audit_id),
-                "stage": stage,
-                "planner": self._safe_name(planner),
-                "analyzer": self._safe_name(analyzer),
-                "degraded": degraded,
-                "error_type": error_type,
-            },
+            event,
+            extra=details,
         )

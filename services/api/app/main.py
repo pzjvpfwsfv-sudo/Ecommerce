@@ -5,7 +5,7 @@ from typing import Any
 
 from fastapi import FastAPI, HTTPException, status
 
-from app.analysis_models import AnalysisRequest, AnalysisResponse
+from app.analysis_models import AnalysisRequest, AnalysisResponse, ToolAnalysisRequest
 from app.analysis_service import (
     AnalysisService,
     AnalysisUnavailableError,
@@ -67,7 +67,7 @@ def create_app(
             ) from None
 
     @app.post("/analysis/tools", response_model=ToolAnalysisResponse)
-    def analyze_with_tools(request: AnalysisRequest) -> ToolAnalysisResponse:
+    def analyze_with_tools(request: ToolAnalysisRequest) -> ToolAnalysisResponse:
         if len(request.question) > settings.ai_max_question_length:
             raise HTTPException(status_code=422, detail="question is too long")
         stage = "tool_analysis_route"

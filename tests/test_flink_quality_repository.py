@@ -3,6 +3,7 @@ import unittest
 import httpx
 
 from app.flink_quality_repository import FlinkQualityRepository, QUALITY_COUNTERS
+from app.tool_deadline import use_tool_deadline
 
 
 JOB_ID = "a" * 32
@@ -60,11 +61,12 @@ def repository_for(responses: dict[str, object]):
         payload = responses.get(request.url.path)
         if payload is None:
             return httpx.Response(404, text="unexpected Flink endpoint")
-        if request.url.path.endswith("/metrics") and request.url.params.get_list("get"):
+        metric_get = request.url.params.get("get")
+        if request.url.path.endswith("/metrics") and metric_get:
             if isinstance(payload, list) and payload and "sum" in payload[0]:
                 return httpx.Response(200, json=payload)
             vertex_id = request.url.path.split("/")[-2]
-            return httpx.Response(200, json=metric_values(vertex_id, request.url.params.get_list("get")))
+            return httpx.Response(200, json=metric_values(vertex_id, metric_get.split(",")))
         return httpx.Response(200, json=payload)
 
     repository = FlinkQualityRepository(
@@ -106,9 +108,10 @@ class FlinkQualityRepositoryTest(unittest.TestCase):
                 (
                     f"/jobs/{JOB_ID}/vertices/v1/metrics",
                     [
-                        ("get", "operator.valid_events_total"),
-                        ("get", "operator.dlq_events_total"),
-                        ("get", "operator.late_events_total"),
+                        (
+                            "get",
+                            "operator.valid_events_total,operator.dlq_events_total,operator.late_events_total",
+                        ),
                         ("agg", "sum"),
                     ],
                 ),
@@ -116,14 +119,44 @@ class FlinkQualityRepositoryTest(unittest.TestCase):
                 (
                     f"/jobs/{JOB_ID}/vertices/v2/metrics",
                     [
-                        ("get", "operator.duplicate_events_total"),
-                        ("get", "operator.parse_errors_total"),
-                        ("get", "operator.validation_errors_total"),
+                        (
+                            "get",
+                            "operator.duplicate_events_total,operator.parse_errors_total,operator.validation_errors_total",
+                        ),
                         ("agg", "sum"),
                     ],
                 ),
             ],
             [(request.url.path, list(request.url.params.multi_items())) for request in requests],
+        )
+
+    def test_fetch_health_caps_every_http_request_to_the_remaining_budget(self):
+        requests: list[httpx.Request] = []
+        ticks = iter((0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0))
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            payload = valid_flink_responses()[request.url.path]
+            metric_get = request.url.params.get("get")
+            if metric_get:
+                vertex_id = request.url.path.split("/")[-2]
+                payload = metric_values(vertex_id, metric_get.split(","))
+            return httpx.Response(200, json=payload)
+
+        repository = FlinkQualityRepository(
+            base_url="http://flink:8081",
+            production_job_name=JOB_NAME,
+            timeout_seconds=5,
+            client_factory=lambda: httpx.Client(transport=httpx.MockTransport(handler)),
+        )
+
+        with use_tool_deadline(10, timer=lambda: next(ticks)):
+            repository.fetch_health()
+
+        self.assertEqual(7, len(requests))
+        self.assertEqual(
+            [5, 5, 5, 5, 5, 4, 3],
+            [request.extensions["timeout"]["read"] for request in requests],
         )
 
     def test_fetch_health_rejects_zero_duplicate_or_non_running_jobs(self):

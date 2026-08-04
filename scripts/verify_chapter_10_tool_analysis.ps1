@@ -89,6 +89,58 @@ function Test-NullableInteger {
     )
 }
 
+function Test-NativeNumber {
+    param([AllowNull()][object]$Value)
+
+    return (
+        $Value -is [sbyte] -or
+        $Value -is [byte] -or
+        $Value -is [int16] -or
+        $Value -is [uint16] -or
+        $Value -is [int32] -or
+        $Value -is [uint32] -or
+        $Value -is [int64] -or
+        $Value -is [uint64] -or
+        $Value -is [single] -or
+        $Value -is [double] -or
+        $Value -is [decimal]
+    )
+}
+
+function Test-FiniteNonNegativeNumber {
+    param([AllowNull()][object]$Value)
+
+    if (-not (Test-NativeNumber -Value $Value) -or [decimal]$Value -lt 0) {
+        return $false
+    }
+    if ($Value -is [single] -or $Value -is [double]) {
+        return -not [double]::IsNaN([double]$Value) -and -not [double]::IsInfinity([double]$Value)
+    }
+    return $true
+}
+
+function Test-JsonArray {
+    param([AllowNull()][object]$Value)
+
+    return $Value -is [System.Array] -or $Value -is [System.Collections.IList]
+}
+
+function Assert-StringArray {
+    param(
+        [AllowNull()][object]$Value,
+        [Parameter(Mandatory = $true)][string]$FieldName
+    )
+
+    if (-not (Test-JsonArray -Value $Value)) {
+        throw "Response field '$FieldName' must be an array."
+    }
+    foreach ($item in $Value) {
+        if ($item -isnot [string]) {
+            throw "Response field '$FieldName' must contain only strings."
+        }
+    }
+}
+
 function Test-NonNegativeInteger {
     param([AllowNull()][object]$Value)
 
@@ -116,9 +168,8 @@ function Assert-NullableTimestamp {
 function Assert-RealtimeEvidence {
     param([Parameter(Mandatory = $true)][object]$Evidence)
 
-    if (-not (Test-JsonObject -Value $Evidence)) {
-        throw "Realtime evidence must be an object."
-    }
+    Assert-ExactJsonPropertySet -Object $Evidence -Names @("pv", "uv", "updated_at") `
+        -ObjectName "Realtime evidence"
     $pv = Get-RequiredProperty -Object $Evidence -Name "pv"
     $uv = Get-RequiredProperty -Object $Evidence -Name "uv"
     if (-not (Test-NullableInteger -Value $pv) -or -not (Test-NullableInteger -Value $uv)) {
@@ -131,9 +182,9 @@ function Assert-RealtimeEvidence {
 function Assert-HistoricalEvidence {
     param([Parameter(Mandatory = $true)][object]$Evidence)
 
-    if (-not (Test-JsonObject -Value $Evidence)) {
-        throw "Historical evidence must be an object."
-    }
+    Assert-ExactJsonPropertySet -Object $Evidence `
+        -Names @("event_count", "event_type_counts", "latest_event_time") `
+        -ObjectName "Historical evidence"
     if (-not (Test-NullableInteger -Value (Get-RequiredProperty -Object $Evidence -Name "event_count"))) {
         throw "Historical evidence event_count must be an integer or null."
     }
@@ -142,7 +193,8 @@ function Assert-HistoricalEvidence {
         throw "Historical evidence event_type_counts must be an object."
     }
     foreach ($eventType in Get-JsonPropertyNames -Object $eventTypeCounts) {
-        if ([string]::IsNullOrWhiteSpace($eventType) -or -not (Test-NullableInteger -Value (Get-RequiredProperty -Object $eventTypeCounts -Name $eventType))) {
+        $eventCount = Get-RequiredProperty -Object $eventTypeCounts -Name $eventType
+        if ([string]::IsNullOrWhiteSpace($eventType) -or -not (Test-NonNegativeInteger -Value $eventCount)) {
             throw "Historical evidence event_type_counts has an invalid entry."
         }
     }
@@ -153,9 +205,14 @@ function Assert-HistoricalEvidence {
 function Assert-DataQualityEvidence {
     param([Parameter(Mandatory = $true)][object]$Evidence)
 
-    if (-not (Test-JsonObject -Value $Evidence)) {
-        throw "Data quality evidence must be an object."
-    }
+    Assert-ExactJsonPropertySet -Object $Evidence -Names @(
+        "job_id",
+        "job_state",
+        "completed_checkpoints",
+        "failed_checkpoints",
+        "latest_completed_at",
+        "counters"
+    ) -ObjectName "Data quality evidence"
     $jobId = Get-RequiredProperty -Object $Evidence -Name "job_id"
     if ($jobId -isnot [string] -or [string]::IsNullOrWhiteSpace($jobId)) {
         throw "Data quality evidence job_id must be a non-empty string."
@@ -168,7 +225,15 @@ function Assert-DataQualityEvidence {
             throw "Data quality evidence $fieldName must be a non-negative integer."
         }
     }
-    Assert-NullableTimestamp -Value (Get-RequiredProperty -Object $Evidence -Name "latest_completed_at") `
+    $completedCheckpoints = Get-RequiredProperty -Object $Evidence -Name "completed_checkpoints"
+    if ([decimal]$completedCheckpoints -lt 1) {
+        throw "Data quality evidence must contain at least one completed checkpoint."
+    }
+    $latestCompletedAt = Get-RequiredProperty -Object $Evidence -Name "latest_completed_at"
+    if ($null -eq $latestCompletedAt) {
+        throw "Data quality evidence latest_completed_at must be a timestamp string."
+    }
+    Assert-NullableTimestamp -Value $latestCompletedAt `
         -FieldName "data_quality.latest_completed_at"
     $counters = Get-RequiredProperty -Object $Evidence -Name "counters"
     $counterNames = @(
@@ -244,6 +309,56 @@ function Assert-ToolAnalysisResponse {
         [Parameter(Mandatory = $true)][object]$AuditIds
     )
 
+    Assert-ExactJsonPropertySet -Object $Response -Names @(
+        "summary",
+        "insights",
+        "risks",
+        "actions",
+        "evidence",
+        "tool_calls",
+        "warnings",
+        "planner",
+        "analyzer",
+        "degraded",
+        "audit_id",
+        "generated_at"
+    ) -ObjectName "Tool analysis response"
+
+    if ($Response -is [System.Collections.IDictionary]) {
+        $summary = $Response["summary"]
+        $warnings = $Response["warnings"]
+        $toolCallsValue = $Response["tool_calls"]
+    } else {
+        $summary = $Response.PSObject.Properties["summary"].Value
+        $warnings = $Response.PSObject.Properties["warnings"].Value
+        $toolCallsValue = $Response.PSObject.Properties["tool_calls"].Value
+    }
+    if ($summary -isnot [string]) {
+        throw "Response summary must be a string."
+    }
+    foreach ($fieldName in @("insights", "risks", "actions")) {
+        if ($Response -is [System.Collections.IDictionary]) {
+            $fieldValue = $Response[$fieldName]
+        } else {
+            $fieldValue = $Response.PSObject.Properties[$fieldName].Value
+        }
+        Assert-StringArray -Value $fieldValue -FieldName $fieldName
+    }
+    if (-not (Test-JsonArray -Value $warnings) -or @($warnings).Count -ne 0) {
+        throw "Response warnings must be an empty array for strict acceptance."
+    }
+    if ((Get-RequiredProperty -Object $Response -Name "planner") -cne "rule_based") {
+        throw "Response planner must be rule_based for strict acceptance."
+    }
+    if ((Get-RequiredProperty -Object $Response -Name "analyzer") -cne "rule_based") {
+        throw "Response analyzer must be rule_based for strict acceptance."
+    }
+    $generatedAt = Get-RequiredProperty -Object $Response -Name "generated_at"
+    if ($null -eq $generatedAt) {
+        throw "Response generated_at must be a timestamp string."
+    }
+    Assert-NullableTimestamp -Value $generatedAt -FieldName "generated_at"
+
     $auditText = [string](Get-RequiredProperty -Object $Response -Name "audit_id")
     $auditId = [Guid]::Empty
     if (-not [Guid]::TryParse($auditText, [ref]$auditId) -or $auditId -eq [Guid]::Empty) {
@@ -258,13 +373,19 @@ function Assert-ToolAnalysisResponse {
         throw "Response degraded must be false for strict acceptance."
     }
 
-    $toolCalls = @(Get-RequiredProperty -Object $Response -Name "tool_calls")
+    if (-not (Test-JsonArray -Value $toolCallsValue)) {
+        throw "Response tool_calls must be an array."
+    }
+    $toolCalls = @($toolCallsValue)
     if ($toolCalls.Count -lt 1 -or $toolCalls.Count -gt $AllowedTools.Count) {
         throw "Response tool_calls count is outside the allowed range."
     }
 
     $actualTools = @()
     foreach ($toolCall in $toolCalls) {
+        Assert-ExactJsonPropertySet -Object $toolCall `
+            -Names @("tool_id", "status", "duration_ms", "error_type") `
+            -ObjectName "Tool call summary"
         $toolId = [string](Get-RequiredProperty -Object $toolCall -Name "tool_id")
         $status = [string](Get-RequiredProperty -Object $toolCall -Name "status")
         if ($AllowedTools -notcontains $toolId) {
@@ -272,6 +393,13 @@ function Assert-ToolAnalysisResponse {
         }
         if ($status -ne "success") {
             throw "Tool '$toolId' did not complete successfully."
+        }
+        $durationMs = Get-RequiredProperty -Object $toolCall -Name "duration_ms"
+        if (-not (Test-FiniteNonNegativeNumber -Value $durationMs)) {
+            throw "Tool '$toolId' duration_ms must be a finite non-negative number."
+        }
+        if ($null -ne (Get-RequiredProperty -Object $toolCall -Name "error_type")) {
+            throw "Tool '$toolId' error_type must be null after success."
         }
         $actualTools += $toolId
     }

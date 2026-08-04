@@ -3,7 +3,9 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 import logging
 import math
+from queue import Empty, Queue
 import re
+from threading import Thread
 from time import perf_counter
 
 from pydantic import ValidationError
@@ -21,6 +23,7 @@ from app.tool_models import (
     ToolPlan,
 )
 from app.trino_repository import TrinoAnalyticsRepository
+from app.tool_deadline import use_tool_deadline
 
 
 LOGGER = logging.getLogger(__name__)
@@ -91,7 +94,22 @@ class ToolExecutor:
                 raise ToolExecutionUnavailableError("tool execution unavailable") from None
 
             try:
-                partition = self._registry[call.tool_id]()
+                remaining = self._remaining(started_at, call_started_at)
+                partition = self._run_with_timeout(
+                    self._registry[call.tool_id],
+                    remaining,
+                )
+            except ToolExecutionUnavailableError:
+                completed_at = self._now()
+                duration_ms = self._duration_ms(call_started_at, completed_at)
+                self._log_call(
+                    safe_audit_id,
+                    call.tool_id,
+                    "failed",
+                    duration_ms,
+                    "budget_exceeded",
+                )
+                raise ToolExecutionUnavailableError("tool execution unavailable") from None
             except Exception:
                 completed_at = self._now()
                 duration_ms = self._duration_ms(call_started_at, completed_at)
@@ -195,7 +213,7 @@ class ToolExecutor:
         error_type: str | None,
     ) -> None:
         LOGGER.info(
-            "analysis tool execution completed",
+            "tool_call_completed" if status == "success" else "tool_call_failed",
             extra={
                 "audit_id": audit_id,
                 "tool_id": tool_id.value,
@@ -214,6 +232,36 @@ class ToolExecutor:
             return self._timer()
         except Exception:
             raise ToolExecutionUnavailableError("tool execution unavailable") from None
+
+    def _remaining(self, started_at: float, current_at: float) -> float:
+        return self._total_timeout_seconds - self._elapsed(started_at, current_at)
+
+    @staticmethod
+    def _run_with_timeout(
+        operation: Callable[[], EvidencePartition],
+        timeout_seconds: float,
+    ) -> EvidencePartition:
+        outcomes: Queue[tuple[bool, object]] = Queue(maxsize=1)
+
+        def run() -> None:
+            try:
+                with use_tool_deadline(timeout_seconds):
+                    outcomes.put((True, operation()))
+            except Exception as error:
+                outcomes.put((False, error))
+
+        worker = Thread(target=run, name="tool-execution", daemon=True)
+        worker.start()
+        worker.join(timeout_seconds)
+        if worker.is_alive():
+            raise ToolExecutionUnavailableError("tool execution unavailable") from None
+        try:
+            succeeded, value = outcomes.get_nowait()
+        except Empty:
+            raise ToolExecutionUnavailableError("tool execution unavailable") from None
+        if not succeeded:
+            raise value  # type: ignore[misc]
+        return value  # type: ignore[return-value]
 
     @staticmethod
     def _elapsed(started_at: float, current_at: float) -> float:

@@ -7,6 +7,7 @@ from typing import Any
 import httpx
 
 from app.analysis_models import HistoricalEvidence
+from app.tool_deadline import remaining_timeout
 
 
 _IDENTIFIER_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
@@ -131,7 +132,7 @@ class TrinoAnalyticsRepository:
                 f"{self._base_url}/v1/statement",
                 headers=self._headers,
                 content=sql,
-                timeout=self._timeout_seconds,
+                timeout=remaining_timeout(self._timeout_seconds),
             )
             while True:
                 response.raise_for_status()
@@ -142,4 +143,7 @@ class TrinoAnalyticsRepository:
                 next_uri = payload.get("nextUri")
                 if not next_uri:
                     return rows
-                response = client.get(next_uri, timeout=self._timeout_seconds)
+                response = client.get(
+                    next_uri,
+                    timeout=remaining_timeout(self._timeout_seconds),
+                )

@@ -119,7 +119,7 @@ class ToolModelsTest(unittest.TestCase):
     def test_tool_settings_have_safe_defaults_ranges_and_environment_parsing(self):
         settings = load_settings({})
 
-        self.assertEqual("http://localhost:8081", settings.flink_rest_url)
+        self.assertEqual("http://flink-jobmanager:8081", settings.flink_rest_url)
         self.assertEqual("chapter-9-datastream-quality-production", settings.chapter9_production_job_name)
         self.assertEqual(3, settings.ai_tool_max_calls)
         configured = load_settings(

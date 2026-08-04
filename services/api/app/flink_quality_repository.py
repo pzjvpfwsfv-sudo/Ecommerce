@@ -9,6 +9,7 @@ from urllib.parse import quote
 import httpx
 
 from app.tool_models import DataQualityEvidence, QUALITY_COUNTERS
+from app.tool_deadline import remaining_timeout
 
 
 _JOB_ID_PATTERN = re.compile(r"[0-9a-f]{32}\Z")
@@ -64,7 +65,7 @@ class FlinkQualityRepository:
             response = client.get(
                 f"{self._base_url}{path}",
                 params=params,
-                timeout=self._timeout_seconds,
+                timeout=remaining_timeout(self._timeout_seconds),
             )
             response.raise_for_status()
         except httpx.TimeoutException:
@@ -153,7 +154,7 @@ class FlinkQualityRepository:
             values = self._get_json(
                 client,
                 metric_path,
-                [("get", metric_id) for metric_id in metric_ids] + [("agg", "sum")],
+                [("get", ",".join(metric_ids)), ("agg", "sum")],
             )
             self._add_counter_values(values, metric_ids, totals, observed)
 
