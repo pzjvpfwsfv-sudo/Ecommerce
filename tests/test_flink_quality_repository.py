@@ -43,6 +43,7 @@ def metric_values(vertex_id: str, counters: list[str]) -> list[dict[str, str]]:
             "operator.late_events_total": "0",
         },
         "v2": {
+            "operator.valid_events_total": "3",
             "operator.duplicate_events_total": "0",
             "operator.parse_errors_total": "0",
             "operator.validation_errors_total": "0",
@@ -109,7 +110,23 @@ class FlinkQualityRepositoryTest(unittest.TestCase):
             [request.url.path for request in requests],
         )
         metric_requests = [request for request in requests if request.url.path.endswith("/metrics")]
-        self.assertTrue(all(request.url.params["agg"] == "sum" for request in metric_requests[1::2]))
+        self.assertEqual(
+            [
+                [
+                    ("get", "operator.valid_events_total"),
+                    ("get", "operator.dlq_events_total"),
+                    ("get", "operator.late_events_total"),
+                    ("agg", "sum"),
+                ],
+                [
+                    ("get", "operator.duplicate_events_total"),
+                    ("get", "operator.parse_errors_total"),
+                    ("get", "operator.validation_errors_total"),
+                    ("agg", "sum"),
+                ],
+            ],
+            [list(request.url.params.multi_items()) for request in metric_requests[1::2]],
+        )
 
     def test_fetch_health_rejects_zero_duplicate_or_non_running_jobs(self):
         for jobs in ([], [job("FAILED")], [job("RUNNING"), job("RUNNING")]):
@@ -129,6 +146,42 @@ class FlinkQualityRepositoryTest(unittest.TestCase):
                 responses[f"/jobs/{JOB_ID}/checkpoints"] = {"counts": counts, "latest": {}}
                 with self.assertRaises(ValueError):
                     repository_for(responses)[0].fetch_health()
+
+    def test_fetch_health_scrubs_an_out_of_range_checkpoint_timestamp(self):
+        responses = valid_flink_responses()
+        responses[f"/jobs/{JOB_ID}/checkpoints"] = {
+            "counts": {"completed": 1, "failed": 0},
+            "latest": {"completed": {"latest_ack_timestamp": 10**1000}},
+        }
+
+        with self.assertRaisesRegex(ValueError, r"^Flink checkpoint response was malformed$") as error:
+            repository_for(responses)[0].fetch_health()
+
+        self.assertIsNone(error.exception.__cause__)
+        self.assertNotIn("10", str(error.exception))
+
+    def test_fetch_health_rejects_duplicate_vertex_ids_before_metric_requests(self):
+        responses = valid_flink_responses()
+        responses[f"/jobs/{JOB_ID}"] = {"vertices": [{"id": "v1"}, {"id": "v1"}]}
+        repository, requests = repository_for(responses)
+
+        with self.assertRaisesRegex(ValueError, r"^Flink job details were malformed$"):
+            repository.fetch_health()
+
+        self.assertEqual(
+            ["/jobs/overview", f"/jobs/{JOB_ID}/checkpoints", f"/jobs/{JOB_ID}"],
+            [request.url.path for request in requests],
+        )
+
+    def test_fetch_health_sums_matching_counters_across_distinct_vertices(self):
+        responses = valid_flink_responses()
+        responses[f"/jobs/{JOB_ID}/vertices/v2/metrics"].append(
+            {"id": "operator.valid_events_total"}
+        )
+
+        evidence = repository_for(responses)[0].fetch_health()
+
+        self.assertEqual(5, evidence.counters["valid_events_total"])
 
     def test_fetch_health_rejects_invalid_job_id_vertices_and_counter_values(self):
         invalid_responses = []

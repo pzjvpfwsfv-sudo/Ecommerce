@@ -118,18 +118,32 @@ class FlinkQualityRepository:
         timestamp = FlinkQualityRepository._strict_int(
             latest_completed.get("latest_ack_timestamp"), "checkpoint timestamp"
         )
-        return completed, failed, datetime.fromtimestamp(timestamp / 1000, tz=UTC)
+        try:
+            latest_completed_at = datetime.fromtimestamp(timestamp / 1000, tz=UTC)
+        except (OverflowError, OSError, ValueError):
+            latest_completed_at = None
+        else:
+            return completed, failed, latest_completed_at
+        raise ValueError("Flink checkpoint response was malformed")
 
     def _fetch_counters(self, client: httpx.Client, job_id: str, payload: Any) -> dict[str, int]:
         if not isinstance(payload, dict) or not isinstance(payload.get("vertices"), list):
             raise ValueError("Flink job details were malformed")
 
-        totals = {counter: 0 for counter in QUALITY_COUNTERS}
-        observed: set[str] = set()
+        vertex_ids: list[str] = []
+        seen_vertex_ids: set[str] = set()
         for vertex in payload["vertices"]:
             if not isinstance(vertex, dict) or not isinstance(vertex.get("id"), str) or not vertex["id"]:
                 raise ValueError("Flink job details were malformed")
             vertex_id = vertex["id"]
+            if vertex_id in seen_vertex_ids:
+                raise ValueError("Flink job details were malformed")
+            seen_vertex_ids.add(vertex_id)
+            vertex_ids.append(vertex_id)
+
+        totals = {counter: 0 for counter in QUALITY_COUNTERS}
+        observed: set[str] = set()
+        for vertex_id in vertex_ids:
             vertex_path = quote(vertex_id, safe="")
             metric_path = f"/jobs/{job_id}/vertices/{vertex_path}/metrics"
             metrics = self._get_json(client, metric_path)
