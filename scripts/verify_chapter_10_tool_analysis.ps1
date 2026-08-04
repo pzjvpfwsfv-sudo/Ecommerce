@@ -11,11 +11,167 @@ function Get-RequiredProperty {
         [Parameter(Mandatory = $true)][string]$Name
     )
 
+    if ($Object -is [System.Collections.IDictionary]) {
+        if (-not $Object.Contains($Name)) {
+            throw "Response is missing required property '$Name'."
+        }
+        return $Object[$Name]
+    }
+    if ($Object -isnot [System.Management.Automation.PSCustomObject]) {
+        throw "Response object has an invalid shape."
+    }
     $property = $Object.PSObject.Properties[$Name]
     if ($null -eq $property) {
         throw "Response is missing required property '$Name'."
     }
     return $property.Value
+}
+
+function Test-JsonObject {
+    param([AllowNull()][object]$Value)
+
+    return (
+        $Value -is [System.Management.Automation.PSCustomObject] -or
+        $Value -is [System.Collections.IDictionary]
+    )
+}
+
+function Get-JsonPropertyNames {
+    param([Parameter(Mandatory = $true)][object]$Object)
+
+    if ($Object -is [System.Collections.IDictionary]) {
+        return @($Object.Keys | ForEach-Object { [string]$_ })
+    }
+    return @($Object.PSObject.Properties.Name)
+}
+
+function Test-NullableInteger {
+    param([AllowNull()][object]$Value)
+
+    return (
+        $null -eq $Value -or
+        $Value -is [sbyte] -or
+        $Value -is [byte] -or
+        $Value -is [int16] -or
+        $Value -is [uint16] -or
+        $Value -is [int32] -or
+        $Value -is [uint32] -or
+        $Value -is [int64] -or
+        $Value -is [uint64]
+    )
+}
+
+function Test-NonNegativeInteger {
+    param([AllowNull()][object]$Value)
+
+    return (Test-NullableInteger -Value $Value) -and $null -ne $Value -and [decimal]$Value -ge 0
+}
+
+function Assert-NullableTimestamp {
+    param(
+        [AllowNull()][object]$Value,
+        [Parameter(Mandatory = $true)][string]$FieldName
+    )
+
+    if ($null -eq $Value) {
+        return
+    }
+    if ($Value -isnot [string] -or [string]::IsNullOrWhiteSpace($Value)) {
+        throw "Evidence field '$FieldName' must be a timestamp string or null."
+    }
+    $timestamp = [DateTimeOffset]::MinValue
+    if (-not [DateTimeOffset]::TryParse($Value, [ref]$timestamp)) {
+        throw "Evidence field '$FieldName' must be a timestamp string or null."
+    }
+}
+
+function Assert-RealtimeEvidence {
+    param([Parameter(Mandatory = $true)][object]$Evidence)
+
+    if (-not (Test-JsonObject -Value $Evidence)) {
+        throw "Realtime evidence must be an object."
+    }
+    $pv = Get-RequiredProperty -Object $Evidence -Name "pv"
+    $uv = Get-RequiredProperty -Object $Evidence -Name "uv"
+    if (-not (Test-NullableInteger -Value $pv) -or -not (Test-NullableInteger -Value $uv)) {
+        throw "Realtime evidence pv and uv must be integers or null."
+    }
+    Assert-NullableTimestamp -Value (Get-RequiredProperty -Object $Evidence -Name "updated_at") `
+        -FieldName "realtime.updated_at"
+}
+
+function Assert-HistoricalEvidence {
+    param([Parameter(Mandatory = $true)][object]$Evidence)
+
+    if (-not (Test-JsonObject -Value $Evidence)) {
+        throw "Historical evidence must be an object."
+    }
+    if (-not (Test-NullableInteger -Value (Get-RequiredProperty -Object $Evidence -Name "event_count"))) {
+        throw "Historical evidence event_count must be an integer or null."
+    }
+    $eventTypeCounts = Get-RequiredProperty -Object $Evidence -Name "event_type_counts"
+    if (-not (Test-JsonObject -Value $eventTypeCounts)) {
+        throw "Historical evidence event_type_counts must be an object."
+    }
+    foreach ($eventType in Get-JsonPropertyNames -Object $eventTypeCounts) {
+        if ([string]::IsNullOrWhiteSpace($eventType) -or -not (Test-NullableInteger -Value (Get-RequiredProperty -Object $eventTypeCounts -Name $eventType))) {
+            throw "Historical evidence event_type_counts has an invalid entry."
+        }
+    }
+    Assert-NullableTimestamp -Value (Get-RequiredProperty -Object $Evidence -Name "latest_event_time") `
+        -FieldName "historical.latest_event_time"
+}
+
+function Assert-DataQualityEvidence {
+    param([Parameter(Mandatory = $true)][object]$Evidence)
+
+    if (-not (Test-JsonObject -Value $Evidence)) {
+        throw "Data quality evidence must be an object."
+    }
+    $jobId = Get-RequiredProperty -Object $Evidence -Name "job_id"
+    if ($jobId -isnot [string] -or [string]::IsNullOrWhiteSpace($jobId)) {
+        throw "Data quality evidence job_id must be a non-empty string."
+    }
+    if ((Get-RequiredProperty -Object $Evidence -Name "job_state") -cne "RUNNING") {
+        throw "Data quality evidence job_state must be RUNNING."
+    }
+    foreach ($fieldName in @("completed_checkpoints", "failed_checkpoints")) {
+        if (-not (Test-NonNegativeInteger -Value (Get-RequiredProperty -Object $Evidence -Name $fieldName))) {
+            throw "Data quality evidence $fieldName must be a non-negative integer."
+        }
+    }
+    Assert-NullableTimestamp -Value (Get-RequiredProperty -Object $Evidence -Name "latest_completed_at") `
+        -FieldName "data_quality.latest_completed_at"
+    $counters = Get-RequiredProperty -Object $Evidence -Name "counters"
+    if (-not (Test-JsonObject -Value $counters) -or (Get-JsonPropertyNames -Object $counters).Count -eq 0) {
+        throw "Data quality evidence counters must be a non-empty object."
+    }
+    foreach ($counterName in Get-JsonPropertyNames -Object $counters) {
+        if ([string]::IsNullOrWhiteSpace($counterName) -or -not (Test-NonNegativeInteger -Value (Get-RequiredProperty -Object $counters -Name $counterName))) {
+            throw "Data quality evidence counters has an invalid entry."
+        }
+    }
+}
+
+function Assert-ToolEvidenceShape {
+    param(
+        [Parameter(Mandatory = $true)][string]$ToolId,
+        [Parameter(Mandatory = $true)][object]$Evidence
+    )
+
+    if ($ToolId -eq "get_realtime_metrics") {
+        Assert-RealtimeEvidence -Evidence $Evidence
+        return
+    }
+    if ($ToolId -eq "get_historical_behavior_summary") {
+        Assert-HistoricalEvidence -Evidence $Evidence
+        return
+    }
+    if ($ToolId -eq "get_data_quality_health") {
+        Assert-DataQualityEvidence -Evidence $Evidence
+        return
+    }
+    throw "Response returned a non-whitelisted tool '$ToolId'."
 }
 
 function Invoke-ToolAnalysisRequest {
@@ -63,7 +219,8 @@ function Assert-ToolAnalysisResponse {
         throw "Response audit_id must be unique for every request."
     }
 
-    if ((Get-RequiredProperty -Object $Response -Name "degraded") -ne $false) {
+    $degraded = Get-RequiredProperty -Object $Response -Name "degraded"
+    if ($degraded -isnot [bool] -or $degraded -ne $false) {
         throw "Response degraded must be false for strict acceptance."
     }
 
@@ -100,10 +257,22 @@ function Assert-ToolAnalysisResponse {
     }
 
     $evidence = Get-RequiredProperty -Object $Response -Name "evidence"
+    if (-not (Test-JsonObject -Value $evidence)) {
+        throw "Response evidence must be an object."
+    }
     $evidenceByTool = @{
         "get_realtime_metrics" = "realtime"
         "get_historical_behavior_summary" = "historical"
         "get_data_quality_health" = "data_quality"
+    }
+    $evidenceNames = Get-JsonPropertyNames -Object $evidence
+    if ($evidenceNames.Count -ne $evidenceByTool.Count) {
+        throw "Response evidence has an invalid set of partitions."
+    }
+    foreach ($evidenceName in $evidenceByTool.Values) {
+        if ($evidenceNames -notcontains $evidenceName) {
+            throw "Response evidence is missing a required partition."
+        }
     }
     foreach ($toolId in $AllowedTools) {
         $evidenceName = $evidenceByTool[$toolId]
@@ -112,6 +281,7 @@ function Assert-ToolAnalysisResponse {
             if ($null -eq $evidenceValue) {
                 throw "Tool '$toolId' did not return its required evidence."
             }
+            Assert-ToolEvidenceShape -ToolId $toolId -Evidence $evidenceValue
         } elseif ($null -ne $evidenceValue) {
             throw "Response returned evidence for an uncalled tool '$toolId'."
         }
