@@ -38,7 +38,7 @@ def valid_evidence() -> dict[str, object]:
                 "dlq_events_total": 0,
                 "late_events_total": 0,
                 "duplicate_events_total": 0,
-                "out_of_order_events_total": 0,
+                "parse_errors_total": 0,
                 "validation_errors_total": 0,
             },
         },
@@ -224,11 +224,11 @@ class Chapter10VerifierTest(unittest.TestCase):
         invalid_counters.append(missing)
 
         forged = deepcopy(expected_counters)
-        del forged["out_of_order_events_total"]
+        del forged["parse_errors_total"]
         forged["forged_events_total"] = 0
         invalid_counters.append(forged)
 
-        extra = {**expected_counters, "unexpected_events_total": 0}
+        extra = {**expected_counters, "out_of_order_events_total": 0}
         invalid_counters.append(extra)
 
         for value in (True, 1.5, "1"):

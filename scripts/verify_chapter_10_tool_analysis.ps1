@@ -176,7 +176,7 @@ function Assert-DataQualityEvidence {
         "dlq_events_total",
         "late_events_total",
         "duplicate_events_total",
-        "out_of_order_events_total",
+        "parse_errors_total",
         "validation_errors_total"
     )
     Assert-ExactJsonPropertySet -Object $counters -Names $counterNames -ObjectName "Data quality evidence counters"
