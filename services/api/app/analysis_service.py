@@ -169,6 +169,11 @@ def _allowed_narrative_numbers(context: AnalysisContext) -> set[Decimal]:
 
 
 def _validate_narrative(narrative: AnalysisNarrative, context: AnalysisContext) -> None:
+    validate_narrative_output_safety(narrative)
+    validate_narrative_numbers(narrative, _allowed_narrative_numbers(context))
+
+
+def validate_narrative_output_safety(narrative: AnalysisNarrative) -> None:
     fields = [narrative.summary, *narrative.insights, *narrative.risks, *narrative.actions]
     normalized_fields = [unicodedata.normalize("NFKC", value) for value in fields]
     if any(
@@ -177,8 +182,6 @@ def _validate_narrative(narrative: AnalysisNarrative, context: AnalysisContext) 
         for pattern in _PROHIBITED_OUTPUT_PATTERNS
     ):
         raise NarrativeProvenanceError("Narrative contains prohibited SQL or code output")
-
-    validate_narrative_numbers(narrative, _allowed_narrative_numbers(context))
 
 
 def validate_narrative_numbers(

@@ -10,7 +10,7 @@ from uuid import UUID
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str((ROOT / "services" / "api").resolve()))
 
-from app.analysis_models import AnalysisNarrative, RealtimeEvidence
+from app.analysis_models import HistoricalEvidence, RealtimeEvidence
 from app.tool_analysis_service import ToolAnalysisService, ToolAnalysisUnavailableError
 from app.tool_executor import ToolExecutor
 from app.tool_models import (
@@ -43,34 +43,53 @@ def successful_execution() -> ToolExecutionResult:
     )
 
 
+def historical_execution(event_type: str) -> ToolExecutionResult:
+    return ToolExecutionResult(
+        evidence=ToolEvidence(
+            historical=HistoricalEvidence(event_count=2, event_type_counts={event_type: 2})
+        ),
+        tool_calls=[
+            ToolCallSummary(
+                tool_id=ToolId.HISTORICAL,
+                status="success",
+                duration_ms=1,
+            )
+        ],
+    )
+
+
 def service_with(
     primary_planner: Mock | None = None,
     fallback_planner: Mock | None = None,
     executor: Mock | None = None,
     primary_analyzer: Mock | None = None,
-    fallback_analyzer: RuleBasedToolNarrativeAnalyzer | None = None,
+    fallback_analyzer: ToolNarrativeAnalyzer | None = None,
     audit_ids: Iterator[UUID] | None = None,
 ) -> tuple[ToolAnalysisService, Mock]:
-    primary = primary_planner or Mock(spec=ToolPlanner)
+    primary = primary_planner if primary_planner is not None else Mock(spec=ToolPlanner)
     primary.name = "openai_compatible"
-    primary.plan.return_value = realtime_plan()
-    fallback = fallback_planner or Mock(spec=ToolPlanner)
+    if primary_planner is None:
+        primary.plan.return_value = realtime_plan()
+    fallback = fallback_planner if fallback_planner is not None else Mock(spec=ToolPlanner)
     fallback.name = "rule_based"
-    fallback.plan.return_value = realtime_plan()
-    tool_executor = executor or Mock(spec=ToolExecutor)
-    tool_executor.execute.return_value = successful_execution()
-    analyzer = primary_analyzer or Mock(spec=ToolNarrativeAnalyzer)
-    analyzer.name = "openai_compatible"
-    analyzer.select.return_value = ToolAnalysisSelection(
-        summary="realtime_only", insights=[], risks=[], actions=[]
-    )
+    if fallback_planner is None:
+        fallback.plan.return_value = realtime_plan()
+    tool_executor = executor if executor is not None else Mock(spec=ToolExecutor)
+    if executor is None:
+        tool_executor.execute.return_value = successful_execution()
+    analyzer = primary_analyzer if primary_analyzer is not None else Mock(spec=ToolNarrativeAnalyzer)
+    if primary_analyzer is None:
+        analyzer.name = "openai_compatible"
+        analyzer.select.return_value = ToolAnalysisSelection(
+            summary="realtime_only", insights=[], risks=[], actions=[]
+        )
     return (
         ToolAnalysisService(
             primary,
             fallback,
             tool_executor,
             analyzer,
-            fallback_analyzer or RuleBasedToolNarrativeAnalyzer(),
+            fallback_analyzer if fallback_analyzer is not None else RuleBasedToolNarrativeAnalyzer(),
             clock=lambda: datetime(2026, 8, 3, tzinfo=UTC),
             audit_id_factory=(lambda: next(audit_ids)) if audit_ids else None,
         ),
@@ -106,6 +125,57 @@ class ToolAnalysisServiceTest(unittest.TestCase):
         self.assertTrue(response.degraded)
         for forbidden in ("SELECT", "secret", "https://", "internal.invalid"):
             self.assertNotIn(forbidden, rendered)
+
+    def test_prohibited_template_output_from_evidence_falls_back_to_safe_claims(self):
+        executor = Mock(spec=ToolExecutor)
+        executor.execute.return_value = historical_execution("INSERT INTO secret")
+        primary_analyzer = Mock(spec=ToolNarrativeAnalyzer)
+        primary_analyzer.name = "openai_compatible"
+        primary_analyzer.select.return_value = ToolAnalysisSelection(
+            summary="historical_only", insights=["top_event_type_share"], risks=[], actions=[]
+        )
+        fallback_analyzer = Mock(spec=ToolNarrativeAnalyzer)
+        fallback_analyzer.name = "rule_based"
+        fallback_analyzer.select.return_value = ToolAnalysisSelection(
+            summary="historical_only", insights=["historical_event_count"], risks=[], actions=[]
+        )
+        service, _ = service_with(
+            executor=executor,
+            primary_analyzer=primary_analyzer,
+            fallback_analyzer=fallback_analyzer,
+        )
+
+        with self.assertLogs("app.tool_analysis_service", level="WARNING"):
+            response = service.analyze("历史行为")
+
+        self.assertEqual("rule_based", response.analyzer)
+        self.assertTrue(response.degraded)
+        self.assertEqual(["历史明细共包含 2 条行为事件。"], response.insights)
+        fallback_analyzer.select.assert_called_once()
+
+    def test_prohibited_template_output_from_rule_fallback_returns_safe_error(self):
+        executor = Mock(spec=ToolExecutor)
+        executor.execute.return_value = historical_execution("INSERT INTO secret")
+        selection = ToolAnalysisSelection(
+            summary="historical_only", insights=["top_event_type_share"], risks=[], actions=[]
+        )
+        primary_analyzer = Mock(spec=ToolNarrativeAnalyzer)
+        primary_analyzer.name = "openai_compatible"
+        primary_analyzer.select.return_value = selection
+        fallback_analyzer = Mock(spec=ToolNarrativeAnalyzer)
+        fallback_analyzer.name = "rule_based"
+        fallback_analyzer.select.return_value = selection
+        service, _ = service_with(
+            executor=executor,
+            primary_analyzer=primary_analyzer,
+            fallback_analyzer=fallback_analyzer,
+        )
+
+        with self.assertLogs("app.tool_analysis_service", level="ERROR"):
+            with self.assertRaisesRegex(ToolAnalysisUnavailableError, "^tool analysis is unavailable$") as error:
+                service.analyze("历史行为")
+
+        self.assertIsNone(error.exception.__cause__)
 
     def test_service_runs_plan_validate_execute_claims_then_narrative_once(self):
         trace: list[str] = []

@@ -11,7 +11,11 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str((ROOT / "services" / "api").resolve()))
 
 from app.analysis_models import AnalysisNarrative
-from app.analysis_service import NarrativeProvenanceError, validate_narrative_numbers
+from app.analysis_service import (
+    NarrativeProvenanceError,
+    validate_narrative_numbers,
+    validate_narrative_output_safety,
+)
 from app.tool_models import (
     DataQualityEvidence,
     HistoricalEvidence,
@@ -102,6 +106,15 @@ class ToolNarrativesTest(unittest.TestCase):
         ):
             with self.subTest(payload=payload), self.assertRaises(ValidationError):
                 ToolAnalysisSelection.model_validate(payload)
+
+    def test_output_safety_allows_ordinary_keyword_substrings(self):
+        for summary in (
+            "Select the strongest channel for the next campaign.",
+            "Update the plan after reviewing the evidence.",
+            "Grant discounts on weekends only after approval.",
+        ):
+            with self.subTest(summary=summary):
+                validate_narrative_output_safety(AnalysisNarrative(summary=summary))
 
 
 if __name__ == "__main__":

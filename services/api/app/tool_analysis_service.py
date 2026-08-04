@@ -6,7 +6,7 @@ import logging
 from uuid import UUID, uuid4
 
 from app.analysis_models import AnalysisNarrative
-from app.analysis_service import validate_narrative_numbers
+from app.analysis_service import validate_narrative_numbers, validate_narrative_output_safety
 from app.tool_executor import ToolExecutor
 from app.tool_models import ToolAnalysisContext, ToolAnalysisResponse, ToolAnalysisSelection, ToolPlan
 from app.tool_narratives import (
@@ -128,6 +128,7 @@ class ToolAnalysisService:
     ) -> AnalysisNarrative:
         selection = self._validated_selection(analyzer.select(context))
         narrative = render_tool_selection(selection, context)
+        validate_narrative_output_safety(narrative)
         validate_narrative_numbers(narrative, allowed_tool_narrative_numbers(context))
         return narrative
 
