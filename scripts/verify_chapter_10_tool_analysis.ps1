@@ -12,19 +12,47 @@ function Get-RequiredProperty {
     )
 
     if ($Object -is [System.Collections.IDictionary]) {
-        if (-not $Object.Contains($Name)) {
-            throw "Response is missing required property '$Name'."
-        }
-        return $Object[$Name]
-    }
-    if ($Object -isnot [System.Management.Automation.PSCustomObject]) {
+        $properties = @($Object.Keys | ForEach-Object { [string]$_ })
+    } elseif ($Object -is [System.Management.Automation.PSCustomObject]) {
+        $properties = @($Object.PSObject.Properties.Name)
+    } else {
         throw "Response object has an invalid shape."
     }
-    $property = $Object.PSObject.Properties[$Name]
-    if ($null -eq $property) {
+
+    $caseInsensitiveMatches = @($properties | Where-Object {
+        [string]::Equals($_, $Name, [StringComparison]::OrdinalIgnoreCase)
+    })
+    $exactMatches = @($properties | Where-Object {
+        [string]::Equals($_, $Name, [StringComparison]::Ordinal)
+    })
+    if ($caseInsensitiveMatches.Count -ne 1 -or $exactMatches.Count -ne 1) {
         throw "Response is missing required property '$Name'."
     }
-    return $property.Value
+    if ($Object -is [System.Collections.IDictionary]) {
+        return $Object[$exactMatches[0]]
+    }
+    return ($Object.PSObject.Properties | Where-Object {
+        [string]::Equals($_.Name, $Name, [StringComparison]::Ordinal)
+    }).Value
+}
+
+function Assert-ExactJsonPropertySet {
+    param(
+        [Parameter(Mandatory = $true)][object]$Object,
+        [Parameter(Mandatory = $true)][string[]]$Names,
+        [Parameter(Mandatory = $true)][string]$ObjectName
+    )
+
+    if (-not (Test-JsonObject -Value $Object)) {
+        throw "$ObjectName must be an object."
+    }
+    $actualNames = Get-JsonPropertyNames -Object $Object
+    if ($actualNames.Count -ne $Names.Count) {
+        throw "$ObjectName has an invalid set of properties."
+    }
+    foreach ($name in $Names) {
+        Get-RequiredProperty -Object $Object -Name $name | Out-Null
+    }
 }
 
 function Test-JsonObject {
@@ -143,11 +171,17 @@ function Assert-DataQualityEvidence {
     Assert-NullableTimestamp -Value (Get-RequiredProperty -Object $Evidence -Name "latest_completed_at") `
         -FieldName "data_quality.latest_completed_at"
     $counters = Get-RequiredProperty -Object $Evidence -Name "counters"
-    if (-not (Test-JsonObject -Value $counters) -or (Get-JsonPropertyNames -Object $counters).Count -eq 0) {
-        throw "Data quality evidence counters must be a non-empty object."
-    }
-    foreach ($counterName in Get-JsonPropertyNames -Object $counters) {
-        if ([string]::IsNullOrWhiteSpace($counterName) -or -not (Test-NonNegativeInteger -Value (Get-RequiredProperty -Object $counters -Name $counterName))) {
+    $counterNames = @(
+        "valid_events_total",
+        "dlq_events_total",
+        "late_events_total",
+        "duplicate_events_total",
+        "out_of_order_events_total",
+        "validation_errors_total"
+    )
+    Assert-ExactJsonPropertySet -Object $counters -Names $counterNames -ObjectName "Data quality evidence counters"
+    foreach ($counterName in $counterNames) {
+        if (-not (Test-NonNegativeInteger -Value (Get-RequiredProperty -Object $counters -Name $counterName))) {
             throw "Data quality evidence counters has an invalid entry."
         }
     }
@@ -257,23 +291,13 @@ function Assert-ToolAnalysisResponse {
     }
 
     $evidence = Get-RequiredProperty -Object $Response -Name "evidence"
-    if (-not (Test-JsonObject -Value $evidence)) {
-        throw "Response evidence must be an object."
-    }
     $evidenceByTool = @{
         "get_realtime_metrics" = "realtime"
         "get_historical_behavior_summary" = "historical"
         "get_data_quality_health" = "data_quality"
     }
-    $evidenceNames = Get-JsonPropertyNames -Object $evidence
-    if ($evidenceNames.Count -ne $evidenceByTool.Count) {
-        throw "Response evidence has an invalid set of partitions."
-    }
-    foreach ($evidenceName in $evidenceByTool.Values) {
-        if ($evidenceNames -notcontains $evidenceName) {
-            throw "Response evidence is missing a required partition."
-        }
-    }
+    Assert-ExactJsonPropertySet -Object $evidence -Names @("realtime", "historical", "data_quality") `
+        -ObjectName "Response evidence"
     foreach ($toolId in $AllowedTools) {
         $evidenceName = $evidenceByTool[$toolId]
         $evidenceValue = Get-RequiredProperty -Object $evidence -Name $evidenceName

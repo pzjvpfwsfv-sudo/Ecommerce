@@ -38,7 +38,7 @@ def valid_evidence() -> dict[str, object]:
                 "dlq_events_total": 0,
                 "late_events_total": 0,
                 "duplicate_events_total": 0,
-                "parse_errors_total": 0,
+                "out_of_order_events_total": 0,
                 "validation_errors_total": 0,
             },
         },
@@ -173,6 +173,15 @@ class Chapter10VerifierTest(unittest.TestCase):
         missing[0] = (200, missing_payload)
         self.assert_rejected(missing)
 
+    def test_verifier_rejects_case_variant_required_property_names(self):
+        responses = valid_sequence()
+        payload = deepcopy(responses[0][1])
+        del payload["degraded"]
+        payload["DeGrAdEd"] = False
+        responses[0] = (200, payload)
+
+        self.assert_rejected(responses)
+
     def test_verifier_rejects_empty_or_malformed_evidence(self):
         for value in ("", {}, [], 7):
             with self.subTest(realtime=value):
@@ -205,6 +214,35 @@ class Chapter10VerifierTest(unittest.TestCase):
         uncalled_payload["evidence"]["historical"] = valid_evidence()["historical"]
         uncalled_evidence[0] = (200, uncalled_payload)
         self.assert_rejected(uncalled_evidence)
+
+    def test_verifier_requires_exact_data_quality_counter_keys_and_integer_values(self):
+        expected_counters = valid_evidence()["data_quality"]["counters"]
+        invalid_counters = []
+
+        missing = deepcopy(expected_counters)
+        del missing["valid_events_total"]
+        invalid_counters.append(missing)
+
+        forged = deepcopy(expected_counters)
+        del forged["out_of_order_events_total"]
+        forged["forged_events_total"] = 0
+        invalid_counters.append(forged)
+
+        extra = {**expected_counters, "unexpected_events_total": 0}
+        invalid_counters.append(extra)
+
+        for value in (True, 1.5, "1"):
+            wrong_type = deepcopy(expected_counters)
+            wrong_type["valid_events_total"] = value
+            invalid_counters.append(wrong_type)
+
+        for counters in invalid_counters:
+            with self.subTest(counters=counters):
+                responses = valid_sequence()
+                payload = deepcopy(responses[2][1])
+                payload["evidence"]["data_quality"]["counters"] = counters
+                responses[2] = (200, payload)
+                self.assert_rejected(responses)
 
     def test_verifier_rejects_injection_tool_order_extra_tool_http_and_json_failures(self):
         sql_responses = valid_sequence()
