@@ -109,8 +109,8 @@ class OpenAICompatibleToolPlanner:
         try:
             tool_id = ToolId(name)
             parsed_arguments = json.loads(arguments)
-        except (TypeError, ValueError, json.JSONDecodeError) as exc:
-            raise ValueError("model tool call is not allowed") from exc
+        except ValueError:
+            raise ValueError("model tool call is not allowed") from None
         if parsed_arguments != {}:
             raise ValueError("model tool calls must not include arguments")
         return ToolCall(tool_id=tool_id)
