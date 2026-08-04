@@ -242,6 +242,56 @@ class OpenAICompatibleAnalyzerTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "unsupported AI_ANALYZER_MODE: unknown"):
             build_analysis_service(ApiSettings(ai_analyzer_mode="unknown"), object())
 
+    def test_build_tool_analysis_service_defaults_to_rule_based_without_api_key(self):
+        from app.dependencies import build_tool_analysis_service
+        from app.tool_narratives import RuleBasedToolNarrativeAnalyzer
+        from app.tool_planners import RuleBasedToolPlanner
+
+        realtime_repository = object()
+        service = build_tool_analysis_service(ApiSettings(), realtime_repository)
+
+        self.assertIs(service._executor._realtime_repository, realtime_repository)
+        self.assertIsInstance(service._primary_planner, RuleBasedToolPlanner)
+        self.assertIsInstance(service._fallback_planner, RuleBasedToolPlanner)
+        self.assertIsInstance(service._primary_analyzer, RuleBasedToolNarrativeAnalyzer)
+        self.assertIsInstance(service._fallback_analyzer, RuleBasedToolNarrativeAnalyzer)
+
+    def test_build_tool_analysis_service_configures_openai_components_and_safe_repositories(self):
+        from app.dependencies import build_tool_analysis_service
+        from app.tool_narratives import OpenAICompatibleToolNarrativeAnalyzer
+        from app.tool_planners import OpenAICompatibleToolPlanner
+
+        service = build_tool_analysis_service(
+            ApiSettings(
+                ai_analyzer_mode="openai_compatible",
+                ai_tool_planner_mode="openai_compatible",
+                ai_api_key="secret",
+                ai_base_url="http://model.local/v1",
+                ai_model="demo-model",
+                ai_request_timeout_seconds=7,
+                trino_base_url="http://trino.local:8088",
+                trino_user="test-user",
+                trino_catalog="test_catalog",
+                trino_schema="test_schema",
+                trino_request_timeout_seconds=3,
+                flink_rest_url="http://flink.local:8081",
+                chapter9_production_job_name="chapter-9-job",
+                ai_tool_max_calls=2,
+                ai_tool_total_timeout_seconds=12,
+                ai_tool_max_event_types=4,
+            ),
+            object(),
+        )
+
+        self.assertIsInstance(service._primary_planner, OpenAICompatibleToolPlanner)
+        self.assertIsInstance(service._primary_analyzer, OpenAICompatibleToolNarrativeAnalyzer)
+        self.assertEqual("http://trino.local:8088", service._executor._historical_repository._base_url)
+        self.assertEqual("http://flink.local:8081", service._executor._quality_repository._base_url)
+        self.assertEqual("chapter-9-job", service._executor._quality_repository._production_job_name)
+        self.assertEqual(2, service._executor._max_calls)
+        self.assertEqual(12, service._executor._total_timeout_seconds)
+        self.assertEqual(4, service._executor._max_event_types)
+
 
 if __name__ == "__main__":
     unittest.main()

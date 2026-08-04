@@ -47,7 +47,9 @@ class ApiServiceArtifactsTest(unittest.TestCase):
         self.assertIn('@app.get("/metrics/realtime")', text)
         self.assertIn('@app.get("/metrics/{metric_name}")', text)
         self.assertIn('@app.post("/analysis/realtime"', text)
+        self.assertIn('@app.post("/analysis/tools"', text)
         self.assertIn("build_analysis_service", text)
+        self.assertIn("build_tool_analysis_service", text)
         self.assertIn("create_app", text)
 
 
@@ -86,6 +88,26 @@ class ApiServiceRuntimeTest(unittest.TestCase):
 
         self.assertEqual(404, response.status_code)
         self.assertEqual({"detail": "metric 'gmv' not found"}, response.json())
+
+    def test_realtime_analysis_endpoint_remains_compatible_with_injected_service(self):
+        repository = Mock()
+        analysis_service = Mock()
+        analysis_service.analyze.return_value = {
+            "summary": "当前累计访问 2 次，覆盖 2 名用户。",
+            "insights": [],
+            "risks": [],
+            "actions": [],
+            "evidence": {"realtime": {"pv": 2, "uv": 2}},
+            "warnings": [],
+            "analyzer": "rule_based",
+            "generated_at": "2026-08-03T00:00:00Z",
+        }
+        client = TestClient(create_app(repository=repository, analysis_service=analysis_service))
+
+        response = client.post("/analysis/realtime", json={"question": "  实时分析  "})
+
+        self.assertEqual(200, response.status_code)
+        analysis_service.analyze.assert_called_once_with("实时分析")
 
 
 if __name__ == "__main__":

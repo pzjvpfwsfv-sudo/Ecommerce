@@ -1,7 +1,12 @@
 from app.analysis_service import AnalysisService
 from app.analyzers import OpenAICompatibleAnalyzer, RuleBasedAnalyzer
 from app.config import ApiSettings
+from app.flink_quality_repository import FlinkQualityRepository
 from app.repository import RealtimeMetricsRepository
+from app.tool_analysis_service import ToolAnalysisService
+from app.tool_executor import ToolExecutor
+from app.tool_narratives import OpenAICompatibleToolNarrativeAnalyzer, RuleBasedToolNarrativeAnalyzer
+from app.tool_planners import OpenAICompatibleToolPlanner, RuleBasedToolPlanner
 from app.trino_repository import TrinoAnalyticsRepository
 
 
@@ -29,3 +34,56 @@ def build_analysis_service(
         timeout_seconds=settings.trino_request_timeout_seconds,
     )
     return AnalysisService(realtime_repository, historical, primary, fallback)
+
+
+def build_tool_analysis_service(
+    settings: ApiSettings,
+    realtime_repository: RealtimeMetricsRepository,
+) -> ToolAnalysisService:
+    fallback_planner = RuleBasedToolPlanner()
+    primary_planner = fallback_planner
+    if settings.ai_tool_planner_mode == "openai_compatible":
+        primary_planner = OpenAICompatibleToolPlanner(
+            api_key=settings.ai_api_key,
+            base_url=settings.ai_base_url,
+            model=settings.ai_model,
+            timeout_seconds=settings.ai_request_timeout_seconds,
+        )
+
+    fallback_analyzer = RuleBasedToolNarrativeAnalyzer()
+    primary_analyzer = fallback_analyzer
+    if settings.ai_analyzer_mode == "openai_compatible":
+        primary_analyzer = OpenAICompatibleToolNarrativeAnalyzer(
+            api_key=settings.ai_api_key,
+            base_url=settings.ai_base_url,
+            model=settings.ai_model,
+            timeout_seconds=settings.ai_request_timeout_seconds,
+        )
+
+    historical_repository = TrinoAnalyticsRepository(
+        base_url=settings.trino_base_url,
+        user=settings.trino_user,
+        catalog=settings.trino_catalog,
+        schema=settings.trino_schema,
+        timeout_seconds=settings.trino_request_timeout_seconds,
+    )
+    quality_repository = FlinkQualityRepository(
+        base_url=settings.flink_rest_url,
+        production_job_name=settings.chapter9_production_job_name,
+        timeout_seconds=settings.ai_tool_total_timeout_seconds,
+    )
+    executor = ToolExecutor(
+        realtime_repository=realtime_repository,
+        historical_repository=historical_repository,
+        quality_repository=quality_repository,
+        max_calls=settings.ai_tool_max_calls,
+        total_timeout_seconds=settings.ai_tool_total_timeout_seconds,
+        max_event_types=settings.ai_tool_max_event_types,
+    )
+    return ToolAnalysisService(
+        primary_planner=primary_planner,
+        fallback_planner=fallback_planner,
+        executor=executor,
+        primary_analyzer=primary_analyzer,
+        fallback_analyzer=fallback_analyzer,
+    )
