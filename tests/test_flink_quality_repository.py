@@ -99,33 +99,31 @@ class FlinkQualityRepositoryTest(unittest.TestCase):
         self.assertTrue(all(request.url.host == "flink" for request in requests))
         self.assertEqual(
             [
-                "/jobs/overview",
-                f"/jobs/{JOB_ID}/checkpoints",
-                f"/jobs/{JOB_ID}",
-                f"/jobs/{JOB_ID}/vertices/v1/metrics",
-                f"/jobs/{JOB_ID}/vertices/v1/metrics",
-                f"/jobs/{JOB_ID}/vertices/v2/metrics",
-                f"/jobs/{JOB_ID}/vertices/v2/metrics",
+                ("/jobs/overview", []),
+                (f"/jobs/{JOB_ID}/checkpoints", []),
+                (f"/jobs/{JOB_ID}", []),
+                (f"/jobs/{JOB_ID}/vertices/v1/metrics", []),
+                (
+                    f"/jobs/{JOB_ID}/vertices/v1/metrics",
+                    [
+                        ("get", "operator.valid_events_total"),
+                        ("get", "operator.dlq_events_total"),
+                        ("get", "operator.late_events_total"),
+                        ("agg", "sum"),
+                    ],
+                ),
+                (f"/jobs/{JOB_ID}/vertices/v2/metrics", []),
+                (
+                    f"/jobs/{JOB_ID}/vertices/v2/metrics",
+                    [
+                        ("get", "operator.duplicate_events_total"),
+                        ("get", "operator.parse_errors_total"),
+                        ("get", "operator.validation_errors_total"),
+                        ("agg", "sum"),
+                    ],
+                ),
             ],
-            [request.url.path for request in requests],
-        )
-        metric_requests = [request for request in requests if request.url.path.endswith("/metrics")]
-        self.assertEqual(
-            [
-                [
-                    ("get", "operator.valid_events_total"),
-                    ("get", "operator.dlq_events_total"),
-                    ("get", "operator.late_events_total"),
-                    ("agg", "sum"),
-                ],
-                [
-                    ("get", "operator.duplicate_events_total"),
-                    ("get", "operator.parse_errors_total"),
-                    ("get", "operator.validation_errors_total"),
-                    ("agg", "sum"),
-                ],
-            ],
-            [list(request.url.params.multi_items()) for request in metric_requests[1::2]],
+            [(request.url.path, list(request.url.params.multi_items())) for request in requests],
         )
 
     def test_fetch_health_rejects_zero_duplicate_or_non_running_jobs(self):
