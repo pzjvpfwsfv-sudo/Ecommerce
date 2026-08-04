@@ -80,6 +80,8 @@ def create_app(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail="analysis tools are temporarily unavailable",
             ) from None
+        except HTTPException:
+            raise
         except Exception as exc:
             logger.error(
                 "tool_analysis_route_failed",

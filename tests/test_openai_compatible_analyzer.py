@@ -292,6 +292,46 @@ class OpenAICompatibleAnalyzerTest(unittest.TestCase):
         self.assertEqual(12, service._executor._total_timeout_seconds)
         self.assertEqual(4, service._executor._max_event_types)
 
+    def test_build_tool_analysis_service_uses_model_planner_with_rule_based_analyzer(self):
+        from app.dependencies import build_tool_analysis_service
+        from app.tool_narratives import RuleBasedToolNarrativeAnalyzer
+        from app.tool_planners import OpenAICompatibleToolPlanner, RuleBasedToolPlanner
+
+        service = build_tool_analysis_service(
+            ApiSettings(
+                ai_tool_planner_mode="openai_compatible",
+                ai_api_key="secret",
+                ai_base_url="http://model.local/v1",
+                ai_model="demo-model",
+            ),
+            object(),
+        )
+
+        self.assertIsInstance(service._primary_planner, OpenAICompatibleToolPlanner)
+        self.assertIsInstance(service._fallback_planner, RuleBasedToolPlanner)
+        self.assertIsInstance(service._primary_analyzer, RuleBasedToolNarrativeAnalyzer)
+        self.assertIsInstance(service._fallback_analyzer, RuleBasedToolNarrativeAnalyzer)
+
+    def test_build_tool_analysis_service_uses_model_analyzer_with_rule_based_planner(self):
+        from app.dependencies import build_tool_analysis_service
+        from app.tool_narratives import OpenAICompatibleToolNarrativeAnalyzer, RuleBasedToolNarrativeAnalyzer
+        from app.tool_planners import RuleBasedToolPlanner
+
+        service = build_tool_analysis_service(
+            ApiSettings(
+                ai_analyzer_mode="openai_compatible",
+                ai_api_key="secret",
+                ai_base_url="http://model.local/v1",
+                ai_model="demo-model",
+            ),
+            object(),
+        )
+
+        self.assertIsInstance(service._primary_planner, RuleBasedToolPlanner)
+        self.assertIsInstance(service._fallback_planner, RuleBasedToolPlanner)
+        self.assertIsInstance(service._primary_analyzer, OpenAICompatibleToolNarrativeAnalyzer)
+        self.assertIsInstance(service._fallback_analyzer, RuleBasedToolNarrativeAnalyzer)
+
 
 if __name__ == "__main__":
     unittest.main()

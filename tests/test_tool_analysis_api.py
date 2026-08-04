@@ -5,6 +5,7 @@ import unittest
 from unittest.mock import Mock
 from uuid import UUID
 
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 
@@ -100,6 +101,17 @@ class ToolAnalysisApiTest(unittest.TestCase):
 
         self.assertEqual(503, response.status_code)
         self.assertEqual({"detail": "analysis tools are temporarily unavailable"}, response.json())
+
+    def test_endpoint_preserves_http_exception_from_injected_service(self):
+        self.service.analyze.side_effect = HTTPException(
+            status_code=418,
+            detail="fixed service detail",
+        )
+
+        response = self.client.post("/analysis/tools", json={"question": "综合分析"})
+
+        self.assertEqual(418, response.status_code)
+        self.assertEqual({"detail": "fixed service detail"}, response.json())
 
 
 if __name__ == "__main__":
