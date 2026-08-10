@@ -195,7 +195,8 @@ class FlinkQualityRepository:
             counter = FlinkQualityRepository._counter_for_metric(metric_id)
             if counter is None:
                 raise ValueError("Flink counter values were malformed")
-            totals[counter] += FlinkQualityRepository._strict_metric_count(metric.get("sum"))
+            metric_value = metric.get("value") if "value" in metric else metric.get("sum")
+            totals[counter] += FlinkQualityRepository._strict_metric_count(metric_value)
             observed.add(counter)
             returned.add(metric_id)
         if returned != requested:

@@ -63,7 +63,9 @@ def repository_for(responses: dict[str, object]):
             return httpx.Response(404, text="unexpected Flink endpoint")
         metric_get = request.url.params.get("get")
         if request.url.path.endswith("/metrics") and metric_get:
-            if isinstance(payload, list) and payload and "sum" in payload[0]:
+            if isinstance(payload, list) and payload and (
+                "sum" in payload[0] or "value" in payload[0]
+            ):
                 return httpx.Response(200, json=payload)
             vertex_id = request.url.path.split("/")[-2]
             return httpx.Response(200, json=metric_values(vertex_id, metric_get.split(",")))
@@ -85,6 +87,25 @@ def repository_for_jobs(jobs: list[dict[str, str]]) -> FlinkQualityRepository:
 
 
 class FlinkQualityRepositoryTest(unittest.TestCase):
+    def test_fetch_health_accepts_flink_vertex_metric_value_payloads(self):
+        responses = valid_flink_responses()
+        responses[f"/jobs/{JOB_ID}/vertices/v1/metrics"] = [
+            {"id": "operator.valid_events_total", "value": "2"},
+            {"id": "operator.dlq_events_total", "value": "1"},
+            {"id": "operator.late_events_total", "value": "0"},
+        ]
+        responses[f"/jobs/{JOB_ID}/vertices/v2/metrics"] = [
+            {"id": "operator.duplicate_events_total", "value": "1"},
+            {"id": "operator.parse_errors_total", "value": "0"},
+            {"id": "operator.validation_errors_total", "value": "0"},
+        ]
+
+        evidence = repository_for(responses)[0].fetch_health()
+
+        self.assertEqual(2, evidence.counters["valid_events_total"])
+        self.assertEqual(1, evidence.counters["dlq_events_total"])
+        self.assertEqual(1, evidence.counters["duplicate_events_total"])
+
     def test_fetch_health_requires_one_running_job_and_maps_checkpoints_and_counters(self):
         repository, requests = repository_for(valid_flink_responses())
 
