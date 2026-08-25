@@ -124,6 +124,8 @@ services:
         jobmanager.rpc.address: flink-jobmanager
         rest.address: flink-jobmanager
       HADOOP_CONF_DIR: /opt/hadoop-conf
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
       AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
       AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
       AWS_REGION: us-east-1
@@ -159,6 +161,8 @@ services:
         rest.address: flink-jobmanager
         taskmanager.numberOfTaskSlots: ${FLINK_TASKMANAGER_SLOTS}
       HADOOP_CONF_DIR: /opt/hadoop-conf
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
       AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
       AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
       AWS_REGION: us-east-1
@@ -194,6 +198,8 @@ services:
         jobmanager.rpc.address: flink-jobmanager
         rest.address: flink-jobmanager
       HADOOP_CONF_DIR: /opt/hadoop-conf
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
       AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
       AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
       AWS_REGION: us-east-1
@@ -334,6 +340,8 @@ services:
       DB_DRIVER: postgres
       HADOOP_CONF_DIR: /opt/hadoop/etc/hadoop
       HADOOP_OPTIONAL_TOOLS: hadoop-aws
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
       SERVICE_OPTS: >-
         -Djavax.jdo.option.ConnectionURL=jdbc:postgresql://metastore-postgres:5432/${METASTORE_POSTGRES_DB}
         -Djavax.jdo.option.ConnectionDriverName=org.postgresql.Driver

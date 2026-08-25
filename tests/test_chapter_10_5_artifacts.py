@@ -198,6 +198,45 @@ class Chapter105ArtifactsTest(unittest.TestCase):
         self.assertNotIn("DB_DRIVER: derby", compose_text)
         self.assertNotIn("tail -f /dev/null", compose_text.split("  minio-init:")[1].split("  hive-metastore:")[0])
 
+    def test_core_site_consumers_receive_minio_credentials(self):
+        result = subprocess.run(
+            [
+                "docker",
+                "compose",
+                "--env-file",
+                str(ENV_FILE),
+                "-f",
+                str(COMPOSE_FILE),
+                "--profile",
+                "flink",
+                "--profile",
+                "lakehouse",
+                "config",
+                "--format",
+                "json",
+            ],
+            cwd=ROOT,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        services = json.loads(result.stdout)["services"]
+        expected = {
+            "MINIO_ROOT_USER": "minioadmin",
+            "MINIO_ROOT_PASSWORD": "minioadmin123",
+        }
+
+        for service_name in (
+            "flink-jobmanager",
+            "flink-taskmanager",
+            "flink-sql-client",
+            "hive-metastore",
+        ):
+            with self.subTest(service=service_name):
+                environment = services[service_name]["environment"]
+                actual = {name: environment.get(name) for name in expected}
+                self.assertEqual(expected, actual)
+
 
 if __name__ == "__main__":
     unittest.main()
