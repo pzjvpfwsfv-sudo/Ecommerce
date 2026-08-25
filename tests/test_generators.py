@@ -1,11 +1,27 @@
 import unittest
 from unittest.mock import Mock
+from uuid import UUID
 
 from generators.run_generator import run_once
 from generators.user_behavior_generator import UserBehaviorGenerator
 
 
 class UserBehaviorGeneratorTest(unittest.TestCase):
+    def test_event_id_uses_injectable_uuid_factory(self):
+        fixed = UUID("12345678-1234-5678-1234-567812345678")
+
+        event = UserBehaviorGenerator(event_id_factory=lambda: fixed).generate_event()
+
+        self.assertEqual("evt_12345678123456781234567812345678", event["event_id"])
+
+    def test_default_event_ids_are_unique_across_generator_instances(self):
+        first = UserBehaviorGenerator(seed=7).generate_event()["event_id"]
+        second = UserBehaviorGenerator(seed=7).generate_event()["event_id"]
+
+        self.assertRegex(first, r"^evt_[0-9a-f]{32}$")
+        self.assertRegex(second, r"^evt_[0-9a-f]{32}$")
+        self.assertNotEqual(first, second)
+
     def test_generate_event_returns_required_schema(self):
         generator = UserBehaviorGenerator(seed=7)
 
