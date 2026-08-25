@@ -1,4 +1,5 @@
 import unittest
+from datetime import UTC, datetime, timedelta
 
 import httpx
 
@@ -8,6 +9,7 @@ from app.tool_deadline import use_tool_deadline
 
 JOB_ID = "a" * 32
 JOB_NAME = "chapter-9-datastream-quality-production"
+CHECKPOINT_TIME = datetime(2026, 8, 2, 16, 0, tzinfo=UTC)
 
 
 def job(state: str) -> dict[str, str]:
@@ -53,7 +55,11 @@ def metric_values(vertex_id: str, counters: list[str]) -> list[dict[str, str]]:
     return [{"id": counter, "sum": values[vertex_id][counter]} for counter in counters]
 
 
-def repository_for(responses: dict[str, object]):
+def repository_for(
+    responses: dict[str, object],
+    *,
+    clock=lambda: CHECKPOINT_TIME + timedelta(seconds=120),
+):
     requests: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -75,6 +81,8 @@ def repository_for(responses: dict[str, object]):
         base_url="http://flink:8081/",
         production_job_name=JOB_NAME,
         timeout_seconds=5,
+        checkpoint_max_age_seconds=120,
+        clock=clock,
         client_factory=lambda: httpx.Client(transport=httpx.MockTransport(handler)),
     )
     return repository, requests
@@ -87,6 +95,33 @@ def repository_for_jobs(jobs: list[dict[str, str]]) -> FlinkQualityRepository:
 
 
 class FlinkQualityRepositoryTest(unittest.TestCase):
+    def test_fetch_health_rejects_when_no_checkpoint_has_completed(self):
+        responses = valid_flink_responses()
+        responses[f"/jobs/{JOB_ID}/checkpoints"]["counts"]["completed"] = 0
+
+        with self.assertRaisesRegex(ValueError, r"^Flink completed checkpoint is unavailable$"):
+            repository_for(responses)[0].fetch_health()
+
+    def test_fetch_health_rejects_when_latest_completed_checkpoint_is_missing(self):
+        responses = valid_flink_responses()
+        responses[f"/jobs/{JOB_ID}/checkpoints"]["latest"] = {}
+
+        with self.assertRaisesRegex(ValueError, r"^Flink completed checkpoint is unavailable$"):
+            repository_for(responses)[0].fetch_health()
+
+    def test_fetch_health_rejects_when_latest_completed_checkpoint_is_stale(self):
+        with self.assertRaisesRegex(ValueError, r"^Flink completed checkpoint is stale$"):
+            repository_for(valid_flink_responses(), clock=lambda: CHECKPOINT_TIME + timedelta(seconds=121))[0].fetch_health()
+
+    def test_fetch_health_rejects_when_latest_completed_checkpoint_is_in_the_future(self):
+        with self.assertRaisesRegex(ValueError, r"^Flink completed checkpoint is stale$"):
+            repository_for(valid_flink_responses(), clock=lambda: CHECKPOINT_TIME - timedelta(seconds=1))[0].fetch_health()
+
+    def test_fetch_health_accepts_a_checkpoint_exactly_at_the_freshness_boundary(self):
+        evidence = repository_for(valid_flink_responses())[0].fetch_health()
+
+        self.assertEqual(CHECKPOINT_TIME, evidence.latest_completed_at)
+
     def test_fetch_health_accepts_flink_vertex_metric_value_payloads(self):
         responses = valid_flink_responses()
         responses[f"/jobs/{JOB_ID}/vertices/v1/metrics"] = [
@@ -168,6 +203,8 @@ class FlinkQualityRepositoryTest(unittest.TestCase):
             base_url="http://flink:8081",
             production_job_name=JOB_NAME,
             timeout_seconds=5,
+            checkpoint_max_age_seconds=120,
+            clock=lambda: CHECKPOINT_TIME + timedelta(seconds=120),
             client_factory=lambda: httpx.Client(transport=httpx.MockTransport(handler)),
         )
 
@@ -278,6 +315,8 @@ class FlinkQualityRepositoryTest(unittest.TestCase):
             base_url="http://flink:8081",
             production_job_name=JOB_NAME,
             timeout_seconds=5,
+            checkpoint_max_age_seconds=120,
+            clock=lambda: CHECKPOINT_TIME + timedelta(seconds=120),
             client_factory=lambda: httpx.Client(transport=httpx.MockTransport(error_handler)),
         )
         with self.assertRaisesRegex(RuntimeError, r"^Flink quality upstream request failed$") as error:
@@ -291,6 +330,8 @@ class FlinkQualityRepositoryTest(unittest.TestCase):
             base_url="http://flink:8081",
             production_job_name=JOB_NAME,
             timeout_seconds=5,
+            checkpoint_max_age_seconds=120,
+            clock=lambda: CHECKPOINT_TIME + timedelta(seconds=120),
             client_factory=lambda: httpx.Client(transport=httpx.MockTransport(timeout_handler)),
         )
         with self.assertRaisesRegex(RuntimeError, r"^Flink quality request timed out$") as timeout:

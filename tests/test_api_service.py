@@ -1,7 +1,7 @@
 ﻿from pathlib import Path
 import sys
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from fastapi.testclient import TestClient
 
@@ -14,6 +14,8 @@ REQUIREMENTS_FILE = ROOT / "services" / "api" / "requirements.txt"
 
 sys.path.insert(0, str((ROOT / "services" / "api").resolve()))
 from app.main import create_app  # noqa: E402
+from app.config import ApiSettings  # noqa: E402
+from app.readiness_service import ReadinessService  # noqa: E402
 
 
 class ApiServiceArtifactsTest(unittest.TestCase):
@@ -54,6 +56,12 @@ class ApiServiceArtifactsTest(unittest.TestCase):
 
 
 class ApiServiceRuntimeTest(unittest.TestCase):
+    def test_settings_default_and_validate_checkpoint_freshness_limit(self):
+        self.assertEqual(120, ApiSettings().flink_checkpoint_max_age_seconds)
+        for value in (0, 3601):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                ApiSettings(flink_checkpoint_max_age_seconds=value)
+
     def test_health_endpoint_returns_expected_payload(self):
         client = TestClient(create_app(repository=Mock()))
 
@@ -64,6 +72,70 @@ class ApiServiceRuntimeTest(unittest.TestCase):
             {"status": "ok", "service": "realtime-metrics-api"},
             response.json(),
         )
+
+    def test_ready_endpoint_returns_fixed_dependency_payload(self):
+        doris = Mock()
+        trino = Mock()
+        flink = Mock()
+        readiness_service = ReadinessService(doris, trino, flink)
+        client = TestClient(create_app(repository=Mock(), readiness_service=readiness_service))
+
+        response = client.get("/ready")
+
+        self.assertEqual(200, response.status_code)
+        self.assertEqual(
+            {"status": "ready", "dependencies": {"doris": "ready", "trino": "ready", "flink": "ready"}},
+            response.json(),
+        )
+        doris.fetch_all_metrics.assert_called_once_with()
+        trino.fetch_summary.assert_called_once_with()
+        flink.fetch_health.assert_called_once_with()
+
+    def test_ready_endpoint_hides_each_dependency_failure_and_logs_only_safe_fields(self):
+        for dependency in ("doris", "trino", "flink"):
+            with self.subTest(dependency=dependency):
+                doris = Mock()
+                trino = Mock()
+                flink = Mock()
+                getattr({"doris": doris, "trino": trino, "flink": flink}[dependency], {
+                    "doris": "fetch_all_metrics",
+                    "trino": "fetch_summary",
+                    "flink": "fetch_health",
+                }[dependency]).side_effect = RuntimeError("SELECT https://upstream.example internal response")
+                client = TestClient(
+                    create_app(
+                        repository=Mock(),
+                        readiness_service=ReadinessService(doris, trino, flink),
+                    )
+                )
+
+                with patch("app.main.logger.error") as log_error:
+                    response = client.get("/ready")
+
+                self.assertEqual(503, response.status_code)
+                self.assertEqual({"detail": "service is not ready"}, response.json())
+                log_error.assert_called_once_with(
+                    "readiness_check_failed",
+                    extra={"error_type": "RuntimeError"},
+                )
+
+    def test_health_does_not_call_failing_readiness_dependencies(self):
+        doris = Mock()
+        trino = Mock()
+        flink = Mock()
+        doris.fetch_all_metrics.side_effect = RuntimeError("doris failure")
+        trino.fetch_summary.side_effect = RuntimeError("trino failure")
+        flink.fetch_health.side_effect = RuntimeError("flink failure")
+        client = TestClient(
+            create_app(repository=Mock(), readiness_service=ReadinessService(doris, trino, flink))
+        )
+
+        response = client.get("/health")
+
+        self.assertEqual(200, response.status_code)
+        self.assertFalse(doris.fetch_all_metrics.called)
+        self.assertFalse(trino.fetch_summary.called)
+        self.assertFalse(flink.fetch_health.called)
 
     def test_realtime_metrics_endpoint_returns_repository_payload(self):
         repository = Mock()

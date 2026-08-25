@@ -23,6 +23,8 @@ class FlinkQualityRepository:
         base_url: str,
         production_job_name: str,
         timeout_seconds: float,
+        checkpoint_max_age_seconds: int,
+        clock: Callable[[], datetime],
         client_factory: ClientFactory | None = None,
     ) -> None:
         if not base_url.strip():
@@ -31,10 +33,14 @@ class FlinkQualityRepository:
             raise ValueError("Flink production job name must not be empty")
         if not isinstance(timeout_seconds, (int, float)) or isinstance(timeout_seconds, bool) or timeout_seconds <= 0:
             raise ValueError("Flink timeout must be positive")
+        if type(checkpoint_max_age_seconds) is not int or not 1 <= checkpoint_max_age_seconds <= 3600:
+            raise ValueError("Flink checkpoint maximum age must be between 1 and 3600 seconds")
 
         self._base_url = base_url.rstrip("/")
         self._production_job_name = production_job_name
         self._timeout_seconds = timeout_seconds
+        self._checkpoint_max_age_seconds = checkpoint_max_age_seconds
+        self._clock = clock
         self._client_factory = client_factory or (lambda: httpx.Client())
 
     def fetch_health(self) -> DataQualityEvidence:
@@ -43,6 +49,7 @@ class FlinkQualityRepository:
             job_id = self._find_running_job_id(overview)
             checkpoints = self._get_json(client, f"/jobs/{job_id}/checkpoints")
             completed, failed, latest_completed_at = self._parse_checkpoints(checkpoints)
+            self._require_fresh_completed_checkpoint(completed, latest_completed_at)
             job_details = self._get_json(client, f"/jobs/{job_id}")
             counters = self._fetch_counters(client, job_id, job_details)
 
@@ -54,6 +61,17 @@ class FlinkQualityRepository:
             latest_completed_at=latest_completed_at,
             counters=counters,
         )
+
+    def _require_fresh_completed_checkpoint(
+        self,
+        completed: int,
+        latest_completed_at: datetime | None,
+    ) -> None:
+        if completed < 1 or latest_completed_at is None:
+            raise ValueError("Flink completed checkpoint is unavailable")
+        age = self._clock() - latest_completed_at
+        if age.total_seconds() < 0 or age.total_seconds() > self._checkpoint_max_age_seconds:
+            raise ValueError("Flink completed checkpoint is stale")
 
     def _get_json(
         self,

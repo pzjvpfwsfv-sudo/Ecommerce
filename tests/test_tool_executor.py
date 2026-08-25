@@ -233,6 +233,8 @@ class ToolExecutorTest(unittest.TestCase):
             base_url="http://flink:8081",
             production_job_name="chapter-9-datastream-quality-production",
             timeout_seconds=1,
+            checkpoint_max_age_seconds=120,
+            clock=lambda: datetime.now(UTC),
             client_factory=lambda: httpx.Client(
                 transport=httpx.MockTransport(blocking_handler)
             ),

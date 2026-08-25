@@ -12,7 +12,8 @@ from app.analysis_service import (
     RealtimeDataUnavailableError,
 )
 from app.config import ApiSettings, load_settings
-from app.dependencies import build_analysis_service, build_tool_analysis_service
+from app.dependencies import build_analysis_service, build_readiness_service, build_tool_analysis_service
+from app.readiness_service import ReadinessService
 from app.repository import RealtimeMetricsRepository
 from app.tool_analysis_service import ToolAnalysisService, ToolAnalysisUnavailableError
 from app.tool_models import ToolAnalysisResponse
@@ -25,6 +26,7 @@ def create_app(
     repository: RealtimeMetricsRepository | Any | None = None,
     analysis_service: AnalysisService | Any | None = None,
     tool_analysis_service: ToolAnalysisService | Any | None = None,
+    readiness_service: ReadinessService | Any | None = None,
     settings: ApiSettings | None = None,
 ) -> FastAPI:
     settings = settings or load_settings()
@@ -34,6 +36,8 @@ def create_app(
         analysis_service = build_analysis_service(settings, repository)
     if tool_analysis_service is None:
         tool_analysis_service = build_tool_analysis_service(settings, repository)
+    if readiness_service is None:
+        readiness_service = build_readiness_service(settings)
 
     app = FastAPI(title="Realtime Metrics API", version="0.2.0")
 
@@ -95,6 +99,17 @@ def create_app(
     @app.get("/health")
     def health() -> dict[str, str]:
         return {"status": "ok", "service": "realtime-metrics-api"}
+
+    @app.get("/ready")
+    def ready() -> dict[str, object]:
+        try:
+            return readiness_service.check()
+        except Exception as exc:
+            logger.error("readiness_check_failed", extra={"error_type": type(exc).__name__})
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="service is not ready",
+            ) from None
 
     @app.get("/metrics/realtime")
     def get_realtime_metrics() -> dict[str, object]:

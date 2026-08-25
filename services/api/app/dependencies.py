@@ -1,7 +1,10 @@
+from datetime import UTC, datetime
+
 from app.analysis_service import AnalysisService
 from app.analyzers import OpenAICompatibleAnalyzer, RuleBasedAnalyzer
 from app.config import ApiSettings
 from app.flink_quality_repository import FlinkQualityRepository
+from app.readiness_service import ReadinessService
 from app.repository import RealtimeMetricsRepository
 from app.tool_analysis_service import ToolAnalysisService
 from app.tool_executor import ToolExecutor
@@ -71,6 +74,8 @@ def build_tool_analysis_service(
         base_url=settings.flink_rest_url,
         production_job_name=settings.chapter9_production_job_name,
         timeout_seconds=settings.ai_tool_total_timeout_seconds,
+        checkpoint_max_age_seconds=settings.flink_checkpoint_max_age_seconds,
+        clock=lambda: datetime.now(UTC),
     )
     executor = ToolExecutor(
         realtime_repository=realtime_repository,
@@ -87,3 +92,22 @@ def build_tool_analysis_service(
         primary_analyzer=primary_analyzer,
         fallback_analyzer=fallback_analyzer,
     )
+
+
+def build_readiness_service(settings: ApiSettings) -> ReadinessService:
+    doris_repository = RealtimeMetricsRepository.from_settings(settings)
+    trino_repository = TrinoAnalyticsRepository(
+        base_url=settings.trino_base_url,
+        user=settings.trino_user,
+        catalog=settings.trino_catalog,
+        schema=settings.trino_schema,
+        timeout_seconds=settings.trino_request_timeout_seconds,
+    )
+    flink_repository = FlinkQualityRepository(
+        base_url=settings.flink_rest_url,
+        production_job_name=settings.chapter9_production_job_name,
+        timeout_seconds=settings.ai_tool_total_timeout_seconds,
+        checkpoint_max_age_seconds=settings.flink_checkpoint_max_age_seconds,
+        clock=lambda: datetime.now(UTC),
+    )
+    return ReadinessService(doris_repository, trino_repository, flink_repository)

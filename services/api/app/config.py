@@ -25,6 +25,7 @@ class ApiSettings:
     ai_max_question_length: int = 500
     flink_rest_url: str = "http://flink-jobmanager:8081"
     chapter9_production_job_name: str = "chapter-9-datastream-quality-production"
+    flink_checkpoint_max_age_seconds: int = 120
     ai_tool_planner_mode: str = "rule_based"
     ai_tool_max_calls: int = 3
     ai_tool_total_timeout_seconds: float = 20
@@ -43,6 +44,8 @@ class ApiSettings:
             raise ValueError("FLINK_REST_URL must not be empty")
         if not self.chapter9_production_job_name:
             raise ValueError("CHAPTER9_PRODUCTION_JOB_NAME must not be empty")
+        if not 1 <= self.flink_checkpoint_max_age_seconds <= 3600:
+            raise ValueError("FLINK_CHECKPOINT_MAX_AGE_SECONDS must be between 1 and 3600")
 
 
 def load_settings(environ: Mapping[str, str] | None = None) -> ApiSettings:
@@ -68,6 +71,7 @@ def load_settings(environ: Mapping[str, str] | None = None) -> ApiSettings:
         chapter9_production_job_name=values.get(
             "CHAPTER9_PRODUCTION_JOB_NAME", "chapter-9-datastream-quality-production"
         ),
+        flink_checkpoint_max_age_seconds=int(values.get("FLINK_CHECKPOINT_MAX_AGE_SECONDS", "120")),
         ai_tool_planner_mode=values.get("AI_TOOL_PLANNER_MODE", "rule_based"),
         ai_tool_max_calls=int(values.get("AI_TOOL_MAX_CALLS", "3")),
         ai_tool_total_timeout_seconds=float(values.get("AI_TOOL_TOTAL_TIMEOUT_SECONDS", "20")),
