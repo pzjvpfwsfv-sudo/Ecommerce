@@ -8,6 +8,7 @@ ROOT = Path(__file__).resolve().parent.parent
 LOCK_FILE = ROOT / "infra" / "runtime-dependencies.lock.json"
 COMPOSE_FILE = ROOT / "infra" / "docker-compose.yml"
 ENV_FILE = ROOT / "infra" / ".env.example"
+CATALOG_RECOVERY = ROOT / "scripts" / "restore_chapter_10_5_catalog.ps1"
 
 
 class Chapter105ArtifactsTest(unittest.TestCase):
@@ -238,6 +239,17 @@ class Chapter105ArtifactsTest(unittest.TestCase):
                 environment = services[service_name]["environment"]
                 actual = {name: environment.get(name) for name in expected}
                 self.assertEqual(expected, actual)
+
+    def test_catalog_recovery_runtime_prerequisites_are_available(self):
+        compose_text = COMPOSE_FILE.read_text(encoding="utf-8")
+        catalog_text = (ROOT / "infra" / "compose" / "trino" / "catalog" / "lakehouse.properties").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertTrue(CATALOG_RECOVERY.is_file())
+        self.assertIn("iceberg.register-table-procedure.enabled=true", catalog_text)
+        self.assertIn("MINIO_ROOT_USER: ${MINIO_ROOT_USER}", compose_text)
+        self.assertIn("MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}", compose_text)
 
 
 if __name__ == "__main__":
