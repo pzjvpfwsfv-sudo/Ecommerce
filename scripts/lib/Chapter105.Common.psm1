@@ -155,4 +155,171 @@ function Install-RuntimeDependencies {
     }
 }
 
-Export-ModuleMember -Function Install-RuntimeDependencies
+function Read-Chapter105EnvFile {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        throw 'Environment file is missing.'
+    }
+
+    $values = [ordered]@{}
+    $lineNumber = 0
+    foreach ($line in Get-Content -LiteralPath $Path -Encoding UTF8) {
+        $lineNumber += 1
+        $trimmed = $line.Trim()
+        if (-not $trimmed -or $trimmed.StartsWith('#')) { continue }
+        $match = [regex]::Match($line, '^\s*(?<key>[A-Za-z_][A-Za-z0-9_]*)=(?<value>.*)$')
+        if (-not $match.Success) {
+            throw "Environment file has an invalid entry at line $lineNumber."
+        }
+        $key = $match.Groups['key'].Value
+        if ($values.Contains($key)) {
+            throw "Environment file contains a duplicate key at line $lineNumber."
+        }
+        $values[$key] = $match.Groups['value'].Value
+    }
+    return $values
+}
+
+function Get-Chapter105PrimaryRepositoryRoot {
+    param([Parameter(Mandatory = $true)][string]$StartPath)
+
+    $originalLocation = Get-Location
+    try {
+        Set-Location -LiteralPath $StartPath
+        $commonDirectory = @(& git rev-parse --path-format=absolute --git-common-dir 2>$null)
+        if ($LASTEXITCODE -eq 0 -and $commonDirectory.Count -eq 1) {
+            $commonPath = [System.IO.Path]::GetFullPath([string]$commonDirectory[0]).TrimEnd('\', '/')
+            if ([System.IO.Path]::GetFileName($commonPath) -eq '.git') {
+                $candidate = Split-Path -Parent $commonPath
+                $isRepository = @(& git -C $candidate rev-parse --is-inside-work-tree 2>$null)
+                if ($LASTEXITCODE -eq 0 -and $isRepository.Count -eq 1 -and $isRepository[0] -eq 'true') {
+                    return [System.IO.Path]::GetFullPath($candidate).TrimEnd('\', '/')
+                }
+            }
+        }
+        $topLevel = @(& git rev-parse --path-format=absolute --show-toplevel 2>$null)
+        if ($LASTEXITCODE -eq 0 -and $topLevel.Count -eq 1) {
+            return [System.IO.Path]::GetFullPath([string]$topLevel[0]).TrimEnd('\', '/')
+        }
+        throw 'Unable to resolve the primary repository root.'
+    } finally {
+        Set-Location -LiteralPath $originalLocation
+    }
+}
+
+function Get-Chapter105StableMinioDataPath {
+    param([Parameter(Mandatory = $true)][string]$RepositoryRoot)
+
+    $root = [System.IO.Path]::GetFullPath($RepositoryRoot).TrimEnd('\', '/')
+    if ($root -match '(?i)[\\/]\.worktrees(?:[\\/]|$)') {
+        throw 'The primary repository root must not be a worktree.'
+    }
+    return Join-Path $root 'infra\compose\minio\data'
+}
+
+function Invoke-Chapter105Native {
+    param(
+        [Parameter(Mandatory = $true)][string]$FilePath,
+        [Parameter(Mandatory = $true)][string[]]$Arguments,
+        [Parameter(Mandatory = $true)][string]$FailureMessage
+    )
+
+    $previousErrorActionPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        $output = @(& $FilePath @Arguments 2>&1)
+        $exitCode = $LASTEXITCODE
+    } catch {
+        throw $FailureMessage
+    } finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
+    if ($exitCode -ne 0) { throw $FailureMessage }
+    return @($output | ForEach-Object { [string]$_ })
+}
+
+function Invoke-Chapter105Retry {
+    param(
+        [Parameter(Mandatory = $true)][ValidateRange(1, 120)][int]$Attempts,
+        [Parameter(Mandatory = $true)][ValidateRange(0, 60)][int]$SleepSeconds,
+        [Parameter(Mandatory = $true)][string]$FailureMessage,
+        [Parameter(Mandatory = $true)][scriptblock]$Action
+    )
+
+    for ($attempt = 1; $attempt -le $Attempts; $attempt += 1) {
+        try { return & $Action } catch {
+            if ($attempt -eq $Attempts) { throw $FailureMessage }
+            if ($SleepSeconds -gt 0) { Start-Sleep -Seconds $SleepSeconds }
+        }
+    }
+    throw $FailureMessage
+}
+
+function ConvertTo-Chapter105RedactedValue {
+    param([AllowNull()][object]$Value)
+
+    if ($null -eq $Value) { return $null }
+    if ($Value -is [string]) {
+        if ($Value -match '(?i)password|secret|api[_-]?key|token') { return '[REDACTED]' }
+        return $Value
+    }
+    if ($Value -is [System.Collections.IDictionary]) {
+        $result = [ordered]@{}
+        foreach ($key in $Value.Keys) {
+            $safeKey = [string]$key
+            if ($safeKey -match '(?i)password|secret|api[_-]?key|token') { $safeKey = '[REDACTED]' }
+            $result[$safeKey] = ConvertTo-Chapter105RedactedValue -Value $Value[$key]
+        }
+        return $result
+    }
+    if ($Value -is [System.Management.Automation.PSCustomObject]) {
+        $result = [ordered]@{}
+        foreach ($property in $Value.PSObject.Properties) {
+            $safeKey = [string]$property.Name
+            if ($safeKey -match '(?i)password|secret|api[_-]?key|token') { $safeKey = '[REDACTED]' }
+            $result[$safeKey] = ConvertTo-Chapter105RedactedValue -Value $property.Value
+        }
+        return $result
+    }
+    if ($Value -is [System.Collections.IEnumerable]) {
+        return @($Value | ForEach-Object { ConvertTo-Chapter105RedactedValue -Value $_ })
+    }
+    return $Value
+}
+
+function Write-Chapter105BootstrapReport {
+    param(
+        [Parameter(Mandatory = $true)][object]$Report,
+        [Parameter(Mandatory = $true)][string]$Path
+    )
+
+    $destination = [System.IO.Path]::GetFullPath($Path)
+    $directory = Split-Path -Parent $destination
+    [System.IO.Directory]::CreateDirectory($directory) | Out-Null
+    $temporary = "$destination.partial.$([Guid]::NewGuid().ToString('N'))"
+    try {
+        $safeReport = ConvertTo-Chapter105RedactedValue -Value $Report
+        $json = $safeReport | ConvertTo-Json -Depth 20
+        [System.IO.File]::WriteAllText($temporary, $json, [System.Text.UTF8Encoding]::new($false))
+        if (Test-Path -LiteralPath $destination -PathType Leaf) {
+            [System.IO.File]::Replace($temporary, $destination, $null)
+        } else {
+            [System.IO.File]::Move($temporary, $destination)
+        }
+    } finally {
+        if (Test-Path -LiteralPath $temporary -PathType Leaf) {
+            Remove-Item -LiteralPath $temporary -Force
+        }
+    }
+}
+
+Export-ModuleMember -Function @(
+    'Install-RuntimeDependencies',
+    'Read-Chapter105EnvFile',
+    'Get-Chapter105PrimaryRepositoryRoot',
+    'Get-Chapter105StableMinioDataPath',
+    'Invoke-Chapter105Native',
+    'Invoke-Chapter105Retry',
+    'Write-Chapter105BootstrapReport'
+)

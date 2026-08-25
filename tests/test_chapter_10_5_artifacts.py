@@ -9,9 +9,35 @@ LOCK_FILE = ROOT / "infra" / "runtime-dependencies.lock.json"
 COMPOSE_FILE = ROOT / "infra" / "docker-compose.yml"
 ENV_FILE = ROOT / "infra" / ".env.example"
 CATALOG_RECOVERY = ROOT / "scripts" / "restore_chapter_10_5_catalog.ps1"
+BOOTSTRAP = ROOT / "scripts" / "bootstrap_chapter_10_5.ps1"
 
 
 class Chapter105ArtifactsTest(unittest.TestCase):
+    def test_bootstrap_surface_has_fixed_stages_and_no_destructive_commands(self):
+        text = BOOTSTRAP.read_text(encoding="utf-8")
+
+        for stage in (
+            "preflight",
+            "dependencies",
+            "infrastructure",
+            "initialization",
+            "catalog",
+            "jobs",
+            "acceptance",
+        ):
+            self.assertIn(stage, text)
+        self.assertIn("install_runtime_dependencies.ps1", text)
+        self.assertIn("restore_chapter_10_5_catalog.ps1", text)
+        self.assertIn("verify_chapter_10_tool_analysis.ps1", text)
+        self.assertIn("analytics.realtime_metrics", text)
+        self.assertIn("lakehouse.analytics.user_behavior_detail", text)
+        self.assertIn("/checkpoints", text)
+        self.assertIn("latest_ack_timestamp", text)
+        self.assertNotIn("down -v", text.lower())
+        self.assertNotIn("docker rm", text.lower())
+        self.assertNotIn("volume prune", text.lower())
+        self.assertNotIn("Remove-Item -Recurse", text)
+
     def test_runtime_lock_has_unique_https_artifacts_with_real_hashes(self):
         lock = json.loads(LOCK_FILE.read_text(encoding="utf-8"))
 
