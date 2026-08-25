@@ -21,7 +21,7 @@ from app.tool_models import (
     ToolPlan,
 )
 from app.trino_repository import TrinoAnalyticsRepository
-from app.tool_deadline import ToolDeadlineExceededError, remaining_timeout, use_tool_deadline
+from app.tool_deadline import ToolDeadlineExceededError, remaining_timeout
 from app.tool_runner import BoundedToolRunner, ToolRunnerUnavailableError
 
 
@@ -101,7 +101,7 @@ class ToolExecutor:
                     remaining_timeout(self._per_operation_cap_seconds),
                 )
                 partition = self._runner.run(
-                    lambda: self._run_with_deadline(self._registry[call.tool_id], remaining),
+                    self._registry[call.tool_id],
                     remaining,
                 )
             except (ToolDeadlineExceededError, ToolExecutionUnavailableError, ToolRunnerUnavailableError):
@@ -243,14 +243,6 @@ class ToolExecutor:
 
     def _remaining(self, started_at: float, current_at: float) -> float:
         return self._total_timeout_seconds - self._elapsed(started_at, current_at)
-
-    @staticmethod
-    def _run_with_deadline(
-        operation: Callable[[], EvidencePartition],
-        timeout_seconds: float,
-    ) -> EvidencePartition:
-        with use_tool_deadline(timeout_seconds):
-            return operation()
 
     @staticmethod
     def _elapsed(started_at: float, current_at: float) -> float:

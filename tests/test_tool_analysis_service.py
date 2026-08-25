@@ -155,6 +155,34 @@ def service_with(
 
 
 class ToolAnalysisServiceTest(unittest.TestCase):
+    def test_primary_planner_timeout_does_not_fallback_after_budget_expires(self):
+        timer = iter((0.0, 20.0))
+        primary = Mock(spec=ToolPlanner)
+        primary.name = "openai_compatible"
+        primary.plan.side_effect = TimeoutError("transport timeout secret")
+        fallback = Mock(spec=ToolPlanner)
+        fallback.name = "rule_based"
+        fallback.plan.return_value = realtime_plan()
+        executor = Mock(spec=ToolExecutor)
+        executor.execute.return_value = successful_execution()
+        analyzer = Mock(spec=ToolNarrativeAnalyzer)
+        analyzer.name = "openai_compatible"
+        service, _ = service_with(
+            primary_planner=primary,
+            fallback_planner=fallback,
+            executor=executor,
+            primary_analyzer=analyzer,
+            timer=lambda: next(timer),
+        )
+
+        with self.assertRaisesRegex(ToolAnalysisUnavailableError, "^tool analysis is unavailable$") as error:
+            service.analyze("当前指标")
+
+        self.assertIsNone(error.exception.__cause__)
+        fallback.plan.assert_not_called()
+        executor.execute.assert_not_called()
+        analyzer.select.assert_not_called()
+
     def test_service_shares_one_budget_with_executor_after_planner_consumes_time(self):
         timer = iter((0.0, 18.0, 18.0, 18.0))
         executor = Mock(spec=ToolExecutor)

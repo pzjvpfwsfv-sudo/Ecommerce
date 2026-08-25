@@ -95,6 +95,19 @@ class ToolAnalysisService:
             )
             raise ToolAnalysisUnavailableError("tool analysis is unavailable") from None
         except Exception:
+            try:
+                remaining_timeout(self._total_timeout_seconds)
+            except ToolDeadlineExceededError:
+                self._audit(
+                    "tool_analysis_failed",
+                    audit_id,
+                    planner,
+                    None,
+                    degraded,
+                    "plan_failure",
+                    logging.ERROR,
+                )
+                raise ToolAnalysisUnavailableError("tool analysis is unavailable") from None
             degraded = True
             warnings.append("规划模型不可用，已降级为规则规划。")
             self._audit(

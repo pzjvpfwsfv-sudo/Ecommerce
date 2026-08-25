@@ -17,9 +17,9 @@ sys.path.insert(0, str((ROOT / "services" / "api").resolve()))
 from app.analysis_models import HistoricalEvidence
 from app.flink_quality_repository import FlinkQualityRepository
 from app.tool_executor import ToolExecutionPlanError, ToolExecutionUnavailableError, ToolExecutor
-from app.tool_deadline import use_tool_deadline
+from app.tool_deadline import remaining_timeout, use_tool_deadline
 from app.tool_models import DataQualityEvidence, ToolCall, ToolId, ToolPlan
-from app.tool_runner import ToolRunnerUnavailableError
+from app.tool_runner import BoundedToolRunner, ToolRunnerUnavailableError
 
 
 COUNTERS = {
@@ -116,6 +116,63 @@ class CapturingHandler(logging.Handler):
 
 
 class ToolExecutorTest(unittest.TestCase):
+    def test_worker_repository_deadline_includes_time_since_runner_submission(self):
+        class ControlledTimer:
+            def __init__(self) -> None:
+                self._value = 0.0
+                self._lock = threading.Lock()
+
+            def __call__(self) -> float:
+                with self._lock:
+                    return self._value
+
+            def set(self, value: float) -> None:
+                with self._lock:
+                    self._value = value
+
+        timer = ControlledTimer()
+        repository_entered = threading.Event()
+        release_repository = threading.Event()
+        observed_timeouts: list[float] = []
+
+        class GatedRealtimeRepository:
+            def fetch_all_metrics(self):
+                repository_entered.set()
+                if not release_repository.wait(timeout=1):
+                    raise RuntimeError("repository gate timed out")
+                observed_timeouts.append(remaining_timeout(20))
+                return {"pv": 2, "uv": 2}
+
+        runner = BoundedToolRunner(max_workers=1)
+        executor = ToolExecutor(
+            GatedRealtimeRepository(),
+            Mock(),
+            Mock(),
+            3,
+            20,
+            20,
+            timer=timer,
+            runner=runner,
+        )
+
+        def advance_while_worker_is_gated() -> None:
+            if repository_entered.wait(timeout=1):
+                timer.set(18.0)
+                release_repository.set()
+
+        controller = threading.Thread(target=advance_while_worker_is_gated)
+        controller.start()
+        try:
+            with use_tool_deadline(20, timer=timer):
+                executor.execute(realtime_plan(), "audit-worker-delay")
+        finally:
+            release_repository.set()
+            controller.join(timeout=1)
+            runner.close()
+
+        self.assertFalse(controller.is_alive())
+        self.assertEqual([2.0], observed_timeouts)
+
     def test_executor_passes_the_request_remaining_budget_to_the_runner(self):
         class CapturingRunner:
             def __init__(self):

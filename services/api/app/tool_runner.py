@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from concurrent.futures import CancelledError, Future, ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+from contextvars import copy_context
 from threading import BoundedSemaphore, Lock
 from typing import TypeVar
 
@@ -30,7 +31,8 @@ class BoundedToolRunner:
                 self._capacity.release()
                 raise ToolRunnerUnavailableError("tool runner unavailable")
             try:
-                future = self._executor.submit(operation)
+                parent_context = copy_context()
+                future = self._executor.submit(lambda: parent_context.run(operation))
             except Exception:
                 self._capacity.release()
                 raise ToolRunnerUnavailableError("tool runner unavailable") from None
