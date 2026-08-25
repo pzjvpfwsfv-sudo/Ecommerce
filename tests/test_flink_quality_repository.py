@@ -1,5 +1,5 @@
 import unittest
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 
 import httpx
 
@@ -116,6 +116,26 @@ class FlinkQualityRepositoryTest(unittest.TestCase):
     def test_fetch_health_rejects_when_latest_completed_checkpoint_is_in_the_future(self):
         with self.assertRaisesRegex(ValueError, r"^Flink completed checkpoint is stale$"):
             repository_for(valid_flink_responses(), clock=lambda: CHECKPOINT_TIME - timedelta(seconds=1))[0].fetch_health()
+
+    def test_fetch_health_rejects_invalid_clock_values_with_a_safe_error(self):
+        invalid_values = (
+            datetime(2026, 8, 2, 16, 2),
+            "internal clock secret",
+            datetime(2026, 8, 3, 0, 2, tzinfo=timezone(timedelta(hours=8))),
+        )
+        for value in invalid_values:
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    r"^Flink clock must return an aware UTC datetime$",
+                ) as error:
+                    repository_for(
+                        valid_flink_responses(),
+                        clock=lambda value=value: value,
+                    )[0].fetch_health()
+
+                self.assertIsNone(error.exception.__cause__)
+                self.assertNotIn("internal clock secret", str(error.exception))
 
     def test_fetch_health_accepts_a_checkpoint_exactly_at_the_freshness_boundary(self):
         evidence = repository_for(valid_flink_responses())[0].fetch_health()

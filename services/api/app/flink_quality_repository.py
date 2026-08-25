@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 import re
 from typing import Any
 from urllib.parse import quote
@@ -69,7 +69,16 @@ class FlinkQualityRepository:
     ) -> None:
         if completed < 1 or latest_completed_at is None:
             raise ValueError("Flink completed checkpoint is unavailable")
-        age = self._clock() - latest_completed_at
+        current_time = self._clock()
+        if not isinstance(current_time, datetime):
+            raise ValueError("Flink clock must return an aware UTC datetime") from None
+        try:
+            utc_offset = current_time.utcoffset()
+        except Exception:
+            raise ValueError("Flink clock must return an aware UTC datetime") from None
+        if utc_offset != timedelta(0):
+            raise ValueError("Flink clock must return an aware UTC datetime") from None
+        age = current_time - latest_completed_at
         if age.total_seconds() < 0 or age.total_seconds() > self._checkpoint_max_age_seconds:
             raise ValueError("Flink completed checkpoint is stale")
 

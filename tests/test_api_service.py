@@ -91,6 +91,33 @@ class ApiServiceRuntimeTest(unittest.TestCase):
         trino.fetch_summary.assert_called_once_with()
         flink.fetch_health.assert_called_once_with()
 
+    def test_ready_endpoint_ignores_injected_service_payload(self):
+        readiness_service = Mock()
+        readiness_service.check.return_value = {
+            "status": "compromised",
+            "dependencies": {"doris": "secret"},
+            "upstream_url": "https://internal.example",
+        }
+        client = TestClient(
+            create_app(repository=Mock(), readiness_service=readiness_service)
+        )
+
+        response = client.get("/ready")
+
+        self.assertEqual(200, response.status_code)
+        self.assertEqual(
+            {
+                "status": "ready",
+                "dependencies": {
+                    "doris": "ready",
+                    "trino": "ready",
+                    "flink": "ready",
+                },
+            },
+            response.json(),
+        )
+        readiness_service.check.assert_called_once_with()
+
     def test_ready_endpoint_hides_each_dependency_failure_and_logs_only_safe_fields(self):
         for dependency in ("doris", "trino", "flink"):
             with self.subTest(dependency=dependency):

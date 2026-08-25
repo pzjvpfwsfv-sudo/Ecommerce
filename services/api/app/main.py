@@ -103,7 +103,15 @@ def create_app(
     @app.get("/ready")
     def ready() -> dict[str, object]:
         try:
-            return readiness_service.check()
+            readiness_service.check()
+            return {
+                "status": "ready",
+                "dependencies": {
+                    "doris": "ready",
+                    "trino": "ready",
+                    "flink": "ready",
+                },
+            }
         except Exception as exc:
             logger.error("readiness_check_failed", extra={"error_type": type(exc).__name__})
             raise HTTPException(
