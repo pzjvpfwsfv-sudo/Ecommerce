@@ -285,53 +285,58 @@ function Get-Chapter105Task4RecoveryPlan {
     $stateRoot = Join-Path $RepositoryRoot 'tmp\chapter-9'
     $finalPath = Join-Path $stateRoot 'cutover-manifest.json'
     $partialPath = Join-Path $stateRoot 'cutover-manifest.json.partial'
-    $statePath = if (Test-Path -LiteralPath $partialPath -PathType Leaf) {
-        $partialPath
-    } elseif (Test-Path -LiteralPath $finalPath -PathType Leaf) {
+    if (Test-Path -LiteralPath $finalPath -PathType Leaf) {
         throw 'Task 4 recovery state is invalid.'
-    } else {
+    }
+    if (-not (Test-Path -LiteralPath $partialPath -PathType Leaf)) {
+        if (Test-Path -LiteralPath $partialPath) { throw 'Task 4 recovery state is invalid.' }
         return [pscustomobject]@{
-            action = 'fresh'; savepoint_path = $null; state_path = $partialPath; state = $null
+            action = 'fresh'; savepoint_path = $null
         }
     }
     try {
-        $state = Get-Content -LiteralPath $statePath -Raw -Encoding UTF8 | ConvertFrom-Json -ErrorAction Stop
+        $state = Get-Content -LiteralPath $partialPath -Raw -Encoding UTF8 | ConvertFrom-Json -ErrorAction Stop
+        $rawOffsets = $state.PSObject.Properties['raw_offsets'].Value
         if ($state -isnot [System.Management.Automation.PSCustomObject] -or
-            $state.PSObject.Properties['mutations'].Value -isnot [System.Management.Automation.PSCustomObject]) {
+            $state.schema_version -isnot [int] -or [int]$state.schema_version -ne 2 -or
+            $state.cutover_id -isnot [string] -or [string]::IsNullOrWhiteSpace([string]$state.cutover_id) -or
+            $state.shadow_job_id -isnot [string] -or [string]$state.shadow_job_id -cnotmatch '^[0-9a-f]{32}$' -or
+            $rawOffsets -isnot [System.Collections.IList] -or $rawOffsets -is [string] -or @($rawOffsets).Count -lt 1 -or
+            $state.PSObject.Properties['mutations'].Value -isnot [System.Management.Automation.PSCustomObject] -or
+            $state.mutations.PSObject.Properties['shadow_stop'].Value -isnot [System.Management.Automation.PSCustomObject]) {
             throw 'invalid state'
         }
-        $mutation = $state.PSObject.Properties['mutations'].Value.PSObject.Properties['production_submit'].Value
-        if ($mutation -isnot [System.Management.Automation.PSCustomObject]) {
-            throw 'unsafe production mutation'
-        }
         $savepointPath = [string]$state.savepoint_path
-        if ($savepointPath) {
-            $savepointPath = Assert-CutoverSavepointPath -Path $savepointPath
-            if (-not $savepointPath.StartsWith($validatedSavepointUri.TrimEnd('/') + '/', [System.StringComparison]::Ordinal)) {
-                throw 'savepoint base mismatch'
-            }
+        if (-not $savepointPath) { throw 'savepoint is missing' }
+        $savepointPath = Assert-CutoverSavepointPath -Path $savepointPath
+        if (-not $savepointPath.StartsWith($validatedSavepointUri.TrimEnd('/') + '/', [System.StringComparison]::Ordinal)) {
+            throw 'savepoint base mismatch'
         }
     } catch {
         throw 'Task 4 recovery state is invalid.'
     }
-    $action = if ($savepointPath) { 'restore' } else { 'fresh' }
     return [pscustomobject]@{
-        action = $action; savepoint_path = $savepointPath; state_path = $statePath; state = $state
+        action = 'restore'; savepoint_path = $savepointPath
     }
 }
 
-function Invoke-Chapter105ProductionSubmitBoundary {
+function Invoke-Chapter105JobsStage {
     param(
-        [Parameter(Mandatory = $true)][object]$State,
-        [Parameter(Mandatory = $true)][string]$StatePath,
-        [Parameter(Mandatory = $true)][object]$Jobs,
+        [Parameter(Mandatory = $true)][string]$RepositoryRoot,
+        [Parameter(Mandatory = $true)][object]$Overview,
         [Parameter(Mandatory = $true)][string]$JobName,
+        [Parameter(Mandatory = $true)][string]$SavepointUri,
         [Parameter(Mandatory = $true)][scriptblock]$SubmitAction
     )
 
-    return Invoke-CutoverProductionSubmitBoundary -State $State -Path $StatePath -Jobs $Jobs `
-        -ExpectedName $JobName -Operation 'bootstrap_production_submit' `
-        -Details @{ source = 'bootstrap' } -Action $SubmitAction
+    $statePath = Get-CutoverProductionSubmitStatePath -RepositoryRoot $RepositoryRoot
+    $bootstrapSubmitAction = $SubmitAction
+    return Invoke-CutoverProductionSubmitBoundary -Path $statePath -Jobs $Overview `
+        -ExpectedName $JobName -Action {
+            $recovery = Get-Chapter105Task4RecoveryPlan -RepositoryRoot $RepositoryRoot `
+                -SavepointUri $SavepointUri
+            return & $bootstrapSubmitAction $recovery.savepoint_path
+        }
 }
 
 function Assert-Chapter105FreshCheckpoint {
@@ -522,21 +527,12 @@ function Invoke-Chapter105Bootstrap {
         Invoke-Chapter105BootstrapStage -Report $report -Name 'jobs' -Action {
             . (Join-Path $PSScriptRoot 'run_chapter_9_production_cutover.ps1') -FunctionsOnly
             $overview = Invoke-Chapter105FlinkOverview -Port ([int]$context.Environment['FLINK_REST_PORT'])
-            $decision = Invoke-Chapter105EnsureJob -Overview $overview -JobName $jobName -SubmitAction {
-                $recovery = Get-Chapter105Task4RecoveryPlan -RepositoryRoot $repositoryRoot `
-                    -SavepointUri $context.SavepointUri
-                $state = if ($null -ne $recovery.state) {
-                    $recovery.state
-                } else {
-                    New-CutoverRecoveryState -CutoverId 'chapter-10-5-bootstrap' -Path $recovery.state_path
-                }
-                $submission = Invoke-Chapter105ProductionSubmitBoundary -State $state `
-                    -StatePath $recovery.state_path -Jobs $overview -JobName $jobName -SubmitAction {
-                    $id = Invoke-Chapter105JobSubmission -RepositoryRoot $repositoryRoot -ComposePrefix $context.ComposePrefix `
-                        -CheckpointUri $context.CheckpointUri -SavepointPath $recovery.savepoint_path -SkipBuild:$SkipBuild
-                    [pscustomobject]@{ job_id = $id }
-                }
-                [pscustomobject]@{ action = 'submitted'; job_id = [string]$submission.job_id }
+            $decision = Invoke-Chapter105JobsStage -RepositoryRoot $repositoryRoot -Overview $overview `
+                -JobName $jobName -SavepointUri $context.SavepointUri -SubmitAction {
+                param($savepointPath)
+                $id = Invoke-Chapter105JobSubmission -RepositoryRoot $repositoryRoot -ComposePrefix $context.ComposePrefix `
+                    -CheckpointUri $context.CheckpointUri -SavepointPath $savepointPath -SkipBuild:$SkipBuild
+                [pscustomobject]@{ job_id = $id }
             }
             if ($decision.action -eq 'submitted') {
                 $running = Wait-Chapter105UniqueRunningJob -FlinkPort ([int]$context.Environment['FLINK_REST_PORT']) -JobName $jobName

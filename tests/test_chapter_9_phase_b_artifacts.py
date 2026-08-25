@@ -1204,7 +1204,7 @@ try {
         payload = json.loads(result.stdout.strip().splitlines()[-1])
         self.assertTrue(payload["terminal_rejected"])
 
-    def test_cutover_recovery_state_records_intent_and_result_and_fails_closed_on_adoption(self):
+    def test_cutover_sql_recovery_state_records_intent_and_result_and_fails_closed_on_adoption(self):
         command = r'''
 $ErrorActionPreference = "Stop"
 . (Resolve-Path "scripts/run_chapter_9_production_cutover.ps1") -FunctionsOnly
@@ -1216,32 +1216,32 @@ try {
     $script:mutationCalls = 0
     $crashRejected = $false
     try {
-        Invoke-CutoverMutation -State $state -Path $path -Stage "production_submit" `
-            -Operation "submit_production" -Details @{ name = "chapter-9-datastream-quality-production" } `
+        Invoke-CutoverMutation -State $state -Path $path -Stage "doris_submit" `
+            -Operation "submit_doris" -Details @{ name = "chapter-9-doris-clean" } `
             -Action { $script:mutationCalls++; throw "simulated REST output loss" } | Out-Null
     } catch { $crashRejected = $true }
     $crashed = Get-Content -Raw $path | ConvertFrom-Json
-    $crashedStatus = $crashed.mutations.production_submit.status
-    $crashedIntentExists = ($null -ne $crashed.mutations.production_submit.intent)
+    $crashedStatus = $crashed.mutations.doris_submit.status
+    $crashedIntentExists = ($null -ne $crashed.mutations.doris_submit.intent)
     $ambiguousState = Get-Content -Raw $path | ConvertFrom-Json
     $jobs = [pscustomobject]@{ jobs = @(
-        [pscustomobject]@{ jid = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"; name = "chapter-9-datastream-quality-production"; state = "RUNNING" },
-        [pscustomobject]@{ jid = "cccccccccccccccccccccccccccccccc"; name = "chapter-9-datastream-quality-production"; state = "CANCELED" }
+        [pscustomobject]@{ jid = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"; name = "chapter-9-doris-clean"; state = "RUNNING" },
+        [pscustomobject]@{ jid = "cccccccccccccccccccccccccccccccc"; name = "chapter-9-doris-clean"; state = "CANCELED" }
     ) }
-    $adopted = Resolve-CutoverJobReference -State $crashed -Stage "production_submit" `
-        -ExpectedName "chapter-9-datastream-quality-production" -Jobs $jobs -Path $path
+    $adopted = Resolve-CutoverJobReference -State $crashed -Stage "doris_submit" `
+        -ExpectedName "chapter-9-doris-clean" -Jobs $jobs -Path $path
     $adoptedState = Get-Content -Raw $path | ConvertFrom-Json
     $noIntentRejected = $false
     try {
-        Resolve-CutoverJobReference -State $adoptedState -Stage "doris_submit" `
-            -ExpectedName "chapter-9-doris-clean" -Jobs $jobs -Path $path | Out-Null
+        Resolve-CutoverJobReference -State $adoptedState -Stage "iceberg_submit" `
+            -ExpectedName "chapter-9-iceberg-clean" -Jobs $jobs -Path $path | Out-Null
     } catch { $noIntentRejected = $true }
     $ambiguousRejected = $false
     try {
-        Resolve-CutoverJobReference -State $ambiguousState -Stage "production_submit" `
-            -ExpectedName "chapter-9-datastream-quality-production" -Jobs ([pscustomobject]@{ jobs = @(
-                [pscustomobject]@{ jid = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"; name = "chapter-9-datastream-quality-production"; state = "RUNNING" },
-                [pscustomobject]@{ jid = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"; name = "chapter-9-datastream-quality-production"; state = "RUNNING" }
+        Resolve-CutoverJobReference -State $ambiguousState -Stage "doris_submit" `
+            -ExpectedName "chapter-9-doris-clean" -Jobs ([pscustomobject]@{ jobs = @(
+                [pscustomobject]@{ jid = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"; name = "chapter-9-doris-clean"; state = "RUNNING" },
+                [pscustomobject]@{ jid = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"; name = "chapter-9-doris-clean"; state = "RUNNING" }
             ) }) -Path $path | Out-Null
     } catch { $ambiguousRejected = $true }
     [ordered]@{
@@ -1249,10 +1249,10 @@ try {
         mutation_calls = $script:mutationCalls
         intent_status = $crashedStatus
         intent_exists = $crashedIntentExists
-        intent_operation = "submit_production"
+        intent_operation = "submit_doris"
         result_status = "failed"
         adopted_id = $adopted
-        adopted_persisted = $adoptedState.mutations.production_submit.result.job_id
+        adopted_persisted = $adoptedState.mutations.doris_submit.result.job_id
         no_intent_rejected = $noIntentRejected
         ambiguous_rejected = $ambiguousRejected
     } | ConvertTo-Json -Compress
@@ -1265,7 +1265,7 @@ try {
         self.assertEqual(1, payload["mutation_calls"])
         self.assertEqual("failed", payload["intent_status"])
         self.assertTrue(payload["intent_exists"])
-        self.assertEqual("submit_production", payload["intent_operation"])
+        self.assertEqual("submit_doris", payload["intent_operation"])
         self.assertEqual("failed", payload["result_status"])
         self.assertEqual("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", payload["adopted_id"], result.stdout)
         self.assertEqual("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", payload["adopted_persisted"])
@@ -1283,7 +1283,6 @@ try {
     $dorisId = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
     $icebergId = "cccccccccccccccccccccccccccccccc"
     $mappings = @(
-        [pscustomobject]@{ Stage = "production_submit"; Field = "production_job_id"; Id = $productionId; Name = "chapter-9-datastream-quality-production" },
         [pscustomobject]@{ Stage = "doris_submit"; Field = "doris_job_id"; Id = $dorisId; Name = "chapter-9-doris-clean" },
         [pscustomobject]@{ Stage = "iceberg_submit"; Field = "iceberg_job_id"; Id = $icebergId; Name = "chapter-9-iceberg-clean" }
     )
@@ -1316,7 +1315,6 @@ try {
             production_job_id = $productionId; doris_job_id = $dorisId; iceberg_job_id = $null
             mutations = [ordered]@{
                 shadow_stop = [ordered]@{ status = "result"; intent = @{ operation = "stop" }; result = @{ status = "result" } }
-                production_submit = [ordered]@{ status = "result"; intent = @{ operation = "submit" }; result = @{ status = "result"; job_id = $productionId } }
                 doris_submit = [ordered]@{ status = "result"; intent = @{ operation = "submit" }; result = @{ status = "result"; job_id = $dorisId } }
                 iceberg_submit = [ordered]@{ status = "result"; intent = @{ operation = "submit" }; result = @{ status = "result"; job_id = $icebergId } }
                 finalization = [ordered]@{ status = "not_started"; intent = $null; result = $null }
@@ -1370,7 +1368,6 @@ try {
 
     [ordered]@{
         submit_calls = $script:submitCalls
-        production = $results.production_submit
         doris = $results.doris_submit
         iceberg = $results.iceberg_submit
         conflicts = $conflicts
@@ -1382,7 +1379,6 @@ try {
         payload = json.loads(result.stdout.strip().splitlines()[-1])
         self.assertEqual(0, payload["submit_calls"])
         expected_ids = {
-            "production": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "doris": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
             "iceberg": "cccccccccccccccccccccccccccccccc",
         }
