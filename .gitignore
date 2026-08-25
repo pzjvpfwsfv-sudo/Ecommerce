@@ -17,6 +17,7 @@ logs/
 tmp/
 data/
 infra/compose/flink/lib/
+infra/compose/hive-metastore/lib/
 infra/compose/minio/data/
 .worktrees/
 
