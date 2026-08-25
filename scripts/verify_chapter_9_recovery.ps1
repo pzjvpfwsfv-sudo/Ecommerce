@@ -1,13 +1,59 @@
+param([switch]$FunctionsOnly)
+
 $ErrorActionPreference = "Stop"
 
 $kafka = "ecom-kafka"
-$jobManager = "ecom-flink-jobmanager"
 $jobName = "chapter-9-datastream-quality-shadow"
 $runId = "chapter9-recovery-" + [Guid]::NewGuid().ToString("N")
 $eventId = "$runId-state"
 
+function Invoke-FlinkJobManagerCommand {
+    param([string[]]$Command, [string]$FailureMessage)
+
+    $root = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+    $output = & docker compose --env-file (Join-Path $root "infra/.env.example") `
+        -f (Join-Path $root "infra/docker-compose.yml") exec -T flink-jobmanager @Command 2>&1
+    if ($LASTEXITCODE -ne 0) { throw "$FailureMessage Output: $($output -join "`n")" }
+    return @($output | ForEach-Object { [string]$_ })
+}
+
+function Invoke-FlinkRest([string]$Resource) {
+    $output = Invoke-FlinkJobManagerCommand -Command @(
+        "curl", "--fail", "--silent", "--show-error", "http://localhost:8081$Resource"
+    ) -FailureMessage "Flink REST request failed: $Resource"
+    return ($output -join "`n" | ConvertFrom-Json)
+}
+
+function Assert-Chapter9StateUri([string]$Path, [ValidateSet("checkpoint", "savepoint")][string]$Kind) {
+    $base = "s3a://flink-state/$($Kind)s/chapter-9"
+    if ([string]::IsNullOrWhiteSpace($Path) -or $Path -match "\.\." -or
+        $Path -cnotmatch "^$([regex]::Escape($base))(?:/[A-Za-z0-9._-]+)*$") {
+        throw "Invalid Chapter 9 $Kind URI: $Path"
+    }
+    return $Path
+}
+
+function Get-Chapter9StateUri([ValidateSet("checkpoint", "savepoint")][string]$Kind) {
+    $default = "s3a://flink-state/$($Kind)s/chapter-9"
+    $name = "CHAPTER9_$($Kind.ToUpperInvariant())_URI"
+    $configured = [Environment]::GetEnvironmentVariable($name)
+    if ([string]::IsNullOrWhiteSpace($configured)) { $configured = $default }
+    return Assert-Chapter9StateUri -Path $configured.Trim() -Kind $Kind
+}
+
+function Get-SavepointPath([string[]]$Lines) {
+    $paths = @($Lines | ForEach-Object {
+        $match = [regex]::Match([string]$_, "(?i)Savepoint completed\.\s*Path:\s*(\S+)")
+        if ($match.Success) { Assert-Chapter9StateUri -Path $match.Groups[1].Value -Kind "savepoint" }
+    } | Sort-Object -Unique)
+    if ($paths.Count -ne 1 -or $paths[0] -cnotmatch "^s3a://flink-state/savepoints/chapter-9/[A-Za-z0-9._-]+$") {
+        throw "Expected exactly one validated remote Savepoint path."
+    }
+    return [string]$paths[0]
+}
+
 function Get-ShadowJob {
-    $jobs = Invoke-RestMethod -Uri "http://localhost:8081/jobs/overview"
+    $jobs = Invoke-FlinkRest "/jobs/overview"
     return @($jobs.jobs | Where-Object { $_.name -eq $jobName -and $_.state -eq "RUNNING" }) | Select-Object -First 1
 }
 
@@ -24,7 +70,7 @@ function Wait-RunningJob([string]$ExpectedId, [int]$Attempts = 60) {
 
 function Wait-NewCheckpoint([string]$JobId, [int64]$Baseline) {
     for ($attempt = 1; $attempt -le 60; $attempt++) {
-        $checkpoints = Invoke-RestMethod -Uri "http://localhost:8081/jobs/$JobId/checkpoints"
+        $checkpoints = Invoke-FlinkRest "/jobs/$JobId/checkpoints"
         if ([int64]$checkpoints.counts.completed -gt $Baseline) { return $checkpoints }
         Start-Sleep -Seconds 2
     }
@@ -41,10 +87,12 @@ function Read-CommittedTopic([string]$Topic) {
     return @(docker exec $kafka bash -lc $command)
 }
 
+if ($FunctionsOnly) { return }
+
 & (Join-Path $PSScriptRoot "run_chapter_9_shadow.ps1")
 $job = Wait-RunningJob ""
 $jobId = $job.jid
-$before = Invoke-RestMethod -Uri "http://localhost:8081/jobs/$jobId/checkpoints"
+$before = Invoke-FlinkRest "/jobs/$jobId/checkpoints"
 $checkpointBaseline = [int64]$before.counts.completed
 
 docker restart ecom-flink-taskmanager | Out-Null
@@ -66,26 +114,25 @@ Send-KafkaValue $event
 $preSavepointCheckpoint = [int64]$afterRestart.counts.completed
 $null = Wait-NewCheckpoint $jobId $preSavepointCheckpoint
 
-docker exec $jobManager sh -lc "mkdir -p /workspace/tmp/savepoints/chapter-9 && chmod 0777 /workspace/tmp/savepoints/chapter-9"
-if ($LASTEXITCODE -ne 0) { throw "Could not prepare shared Savepoint directory." }
-$stopOutput = docker exec $jobManager /opt/flink/bin/flink stop `
-    --savepointPath file:///workspace/tmp/savepoints/chapter-9 $jobId
-if ($LASTEXITCODE -ne 0) { throw "Stop with Savepoint failed." }
-$stopText = $stopOutput -join "`n"
-if ($stopText -notmatch "Path:\s+(file:\S+)") { throw "Could not parse Savepoint path." }
-$savepointPath = $Matches[1]
+$checkpointUri = Get-Chapter9StateUri "checkpoint"
+$savepointUri = Get-Chapter9StateUri "savepoint"
+$stopOutput = Invoke-FlinkJobManagerCommand -Command @(
+    "/opt/flink/bin/flink", "stop", "--savepointPath", $savepointUri, $jobId
+) -FailureMessage "Stop with Savepoint failed."
+$savepointPath = Get-SavepointPath $stopOutput
 
-$restoreOutput = docker exec $jobManager /opt/flink/bin/flink run -d -s $savepointPath `
-    -c com.ecommerce.quality.DataQualityJob `
-    /tmp/datastream-quality-1.0.0.jar `
-    --bootstrap-servers kafka:29092 `
-    --input-topic user_behavior_events `
-    --mode shadow `
-    --consumer-group chapter9-quality-shadow `
-    --checkpoint-uri file:///workspace/tmp/checkpoints/chapter-9 `
-    --transaction-prefix chapter9-shadow `
-    --job-version chapter-9-v1
-if ($LASTEXITCODE -ne 0) { throw "Restore from Savepoint failed." }
+$restoreOutput = Invoke-FlinkJobManagerCommand -Command @(
+    "/opt/flink/bin/flink", "run", "-d", "-s", $savepointPath,
+    "-c", "com.ecommerce.quality.DataQualityJob",
+    "/tmp/datastream-quality-1.0.0.jar",
+    "--bootstrap-servers", "kafka:29092",
+    "--input-topic", "user_behavior_events",
+    "--mode", "shadow",
+    "--consumer-group", "chapter9-quality-shadow",
+    "--checkpoint-uri", $checkpointUri,
+    "--transaction-prefix", "chapter9-shadow",
+    "--job-version", "chapter-9-v1"
+) -FailureMessage "Restore from Savepoint failed."
 $restoreText = $restoreOutput -join "`n"
 if ($restoreText -notmatch "JobID ([0-9a-f]{32})") { throw "Could not parse restored Job ID." }
 $restoredJobId = $Matches[1]

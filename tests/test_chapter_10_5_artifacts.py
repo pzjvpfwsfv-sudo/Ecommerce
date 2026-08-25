@@ -171,6 +171,8 @@ class Chapter105ArtifactsTest(unittest.TestCase):
             "METASTORE_POSTGRES_USER=hive",
             "METASTORE_POSTGRES_PASSWORD=hive",
             "API_BIND_HOST=127.0.0.1",
+            "CHAPTER9_CHECKPOINT_URI=s3a://flink-state/checkpoints/chapter-9",
+            "CHAPTER9_SAVEPOINT_URI=s3a://flink-state/savepoints/chapter-9",
         ):
             self.assertIn(variable, env_text)
         self.assertIn("mc mb --ignore-existing local/warehouse", services["minio-init"]["entrypoint"][-1])

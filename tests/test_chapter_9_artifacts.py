@@ -74,7 +74,7 @@ class Chapter9ArtifactsTest(unittest.TestCase):
         self.assertIn("docker restart ecom-flink-taskmanager", recovery)
         self.assertIn("/checkpoints", recovery)
         self.assertIn("--savepointPath", recovery)
-        self.assertIn(" -s ", recovery)
+        self.assertIn('"-s", $savepointPath', recovery)
         self.assertNotIn("kafka-topics --delete", recovery)
         self.assertNotIn("Remove-Item", recovery)
         self.assertIn("影子链路已完成、主链路尚未切换", runbook)

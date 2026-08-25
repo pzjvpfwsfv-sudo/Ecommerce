@@ -468,7 +468,7 @@ $adoptedIcebergId = Assert-ResumeManifest -Manifest $manifest -Jobs $jobs
         self.assertIn("doris-preflight.sql", normal_preflight)
         self.assertIn("iceberg-preflight.sql", normal_preflight)
 
-    def test_cutover_shadow_stop_resume_plans_initial_retry_recovery_and_ambiguity(self):
+    def test_cutover_shadow_stop_resume_fails_closed_without_a_validated_savepoint(self):
         command = r'''
 $ErrorActionPreference = "Stop"
 . (Resolve-Path "scripts/run_chapter_9_production_cutover.ps1") -FunctionsOnly
@@ -483,39 +483,32 @@ try {
         [pscustomobject]@{ jid = $shadowId; name = "chapter-9-datastream-quality-shadow"; state = "RUNNING" },
         [pscustomobject]@{ jid = "22222222222222222222222222222222"; name = "chapter-9-datastream-quality-shadow"; state = "CANCELED" }
     ) }
-    $initial = Get-CutoverShadowStopResumePlan -State $state -Jobs $running `
-        -SavepointCandidates @("savepoint-old")
+    $initial = Get-CutoverShadowStopResumePlan -State $state -Jobs $running
     Set-CutoverMutationIntent -State $state -Path $path -Stage "shadow_stop" `
         -Operation "stop_shadow_with_savepoint" -Details @{
             job_id = $shadowId
             name = "chapter-9-datastream-quality-shadow"
-            savepoint_directory_snapshot = @("savepoint-old")
+            savepoint_destination = "s3a://flink-state/savepoints/chapter-9"
         }
-    $retry = Get-CutoverShadowStopResumePlan -State $state -Jobs $running `
-        -SavepointCandidates @("savepoint-old")
+    $retry = Get-CutoverShadowStopResumePlan -State $state -Jobs $running
     $finished = [pscustomobject]@{ jobs = @(
         [pscustomobject]@{ jid = $shadowId; name = "chapter-9-datastream-quality-shadow"; state = "FINISHED" },
         [pscustomobject]@{ jid = "22222222222222222222222222222222"; name = "chapter-9-datastream-quality-shadow"; state = "CANCELED" }
     ) }
-    $recovered = Get-CutoverShadowStopResumePlan -State $state -Jobs $finished `
-        -SavepointCandidates @("savepoint-old", "savepoint-new")
-    $ambiguousRejected = $false
+    $finishedRejected = $false
     try {
-        Get-CutoverShadowStopResumePlan -State $state -Jobs $finished `
-            -SavepointCandidates @("savepoint-old", "savepoint-a", "savepoint-b") | Out-Null
-    } catch { $ambiguousRejected = $true }
+        Get-CutoverShadowStopResumePlan -State $state -Jobs $finished | Out-Null
+    } catch { $finishedRejected = $true }
     $terminalRejected = $false
     try {
         Get-CutoverShadowStopResumePlan -State $state -Jobs ([pscustomobject]@{ jobs = @(
             [pscustomobject]@{ jid = $shadowId; name = "chapter-9-datastream-quality-shadow"; state = "FAILED" }
-        ) }) -SavepointCandidates @("savepoint-old") | Out-Null
+        ) }) | Out-Null
     } catch { $terminalRejected = $true }
     [ordered]@{
         initial = $initial.Action
         retry = $retry.Action
-        recovered = $recovered.Action
-        recovered_path = $recovered.SavepointPath
-        ambiguous_rejected = $ambiguousRejected
+        finished_rejected = $finishedRejected
         terminal_rejected = $terminalRejected
     } | ConvertTo-Json -Compress
 } finally { Remove-Item -LiteralPath $root -Recurse -Force }
@@ -525,12 +518,7 @@ try {
         payload = json.loads(result.stdout.strip().splitlines()[-1])
         self.assertEqual("stop", payload["initial"])
         self.assertEqual("retry_stop", payload["retry"])
-        self.assertEqual("recover_savepoint", payload["recovered"])
-        self.assertEqual(
-            "file:/workspace/tmp/savepoints/chapter-9/savepoint-new",
-            payload["recovered_path"],
-        )
-        self.assertTrue(payload["ambiguous_rejected"])
+        self.assertTrue(payload["finished_rejected"])
         self.assertTrue(payload["terminal_rejected"])
 
     def test_cutover_finalization_keeps_partial_resumable_and_writes_independent_final(self):
@@ -683,7 +671,7 @@ $output = @(Invoke-DockerCommand -Arguments @("example") -FailureMessage "unexpe
         self.assertTrue(payload["payload"])
         self.assertFalse(payload["leaked_type"])
 
-    def test_cutover_parsers_reject_ambiguous_state_and_format_offsets(self):
+    def test_cutover_parsers_require_exact_remote_savepoint_evidence(self):
         command = r'''
 $ErrorActionPreference = "Stop"
 . (Resolve-Path "scripts/run_chapter_9_production_cutover.ps1") -FunctionsOnly
@@ -695,7 +683,11 @@ $group = ConvertFrom-KafkaGroupDescription @(
     "chapter9-quality-shadow user_behavior_events 0 212 212 0 - - -"
 ) -ExpectedGroup "chapter9-quality-shadow" -ExpectedTopic "user_behavior_events"
 $jobId = Get-SubmittedJobId @("Job has been submitted with JobID 0123456789abcdef0123456789abcdef")
-$savepoint = Get-SavepointPath @("Savepoint completed. Path: file:/workspace/tmp/savepoints/chapter-9/savepoint-1")
+$savepoint = Get-SavepointPath @("Savepoint completed. Path: s3a://flink-state/savepoints/chapter-9/savepoint-1")
+$localSavepointRejected = $false
+try { Assert-CutoverSavepointPath -Path "file:///workspace/tmp/savepoints/chapter-9/savepoint-1" | Out-Null } catch { $localSavepointRejected = $true }
+$ambiguousSavepointRejected = $false
+try { Assert-CutoverSavepointPath -Path "s3a://flink-state/savepoints/chapter-9/../savepoint-1" | Out-Null } catch { $ambiguousSavepointRejected = $true }
 $ambiguousRejected = $false
 try {
     Get-SubmittedJobId @(
@@ -712,6 +704,8 @@ try {
     job_id = $jobId
     savepoint = $savepoint
     ambiguous_rejected = $ambiguousRejected
+    local_savepoint_rejected = $localSavepointRejected
+    ambiguous_savepoint_rejected = $ambiguousSavepointRejected
 } | ConvertTo-Json -Compress
 '''
         result = self._run_powershell(command)
@@ -721,8 +715,73 @@ try {
         self.assertEqual(0, payload["lag"])
         self.assertEqual(212, payload["current_offset"])
         self.assertEqual("0123456789abcdef0123456789abcdef", payload["job_id"])
-        self.assertEqual("file:/workspace/tmp/savepoints/chapter-9/savepoint-1", payload["savepoint"])
+        self.assertEqual("s3a://flink-state/savepoints/chapter-9/savepoint-1", payload["savepoint"])
         self.assertTrue(payload["ambiguous_rejected"])
+        self.assertTrue(payload["local_savepoint_rejected"])
+        self.assertTrue(payload["ambiguous_savepoint_rejected"])
+
+    def test_cutover_and_recovery_keep_state_in_minio_and_use_compose_jobmanager(self):
+        cutover = (ROOT / "scripts/run_chapter_9_production_cutover.ps1").read_text(encoding="ascii")
+        recovery = (ROOT / "scripts/verify_chapter_9_recovery.ps1").read_text(encoding="ascii")
+
+        for text in (cutover, recovery):
+            self.assertIn("Get-Chapter9StateUri", text)
+            self.assertTrue(
+                '"compose", "--env-file"' in text or "docker compose --env-file" in text
+            )
+            self.assertTrue(
+                '"exec", "-T", "flink-jobmanager"' in text or "exec -T flink-jobmanager" in text
+            )
+            self.assertNotIn("file:///workspace/tmp/checkpoints/chapter-9", text)
+            self.assertNotIn("file:///workspace/tmp/savepoints/chapter-9", text)
+            self.assertNotIn(".state/chapter-9", text)
+
+    def test_cutover_state_uri_defaults_to_minio_and_rejects_local_or_ambiguous_values(self):
+        command = r'''
+$ErrorActionPreference = "Stop"
+. (Resolve-Path "scripts/run_chapter_9_production_cutover.ps1") -FunctionsOnly
+$originalCheckpoint = $env:CHAPTER9_CHECKPOINT_URI
+$originalSavepoint = $env:CHAPTER9_SAVEPOINT_URI
+try {
+    Remove-Item Env:CHAPTER9_CHECKPOINT_URI -ErrorAction SilentlyContinue
+    Remove-Item Env:CHAPTER9_SAVEPOINT_URI -ErrorAction SilentlyContinue
+    $checkpoint = Get-Chapter9StateUri -Kind "checkpoint"
+    $savepoint = Get-Chapter9StateUri -Kind "savepoint"
+    $localRejected = $false
+    try {
+        $env:CHAPTER9_SAVEPOINT_URI = "file:///workspace/tmp/savepoints/chapter-9"
+        Get-Chapter9StateUri -Kind "savepoint" | Out-Null
+    } catch { $localRejected = $true }
+    $ambiguousRejected = $false
+    try {
+        $env:CHAPTER9_CHECKPOINT_URI = "s3a://flink-state/checkpoints/chapter-9/../other"
+        Get-Chapter9StateUri -Kind "checkpoint" | Out-Null
+    } catch { $ambiguousRejected = $true }
+    $caseVariantRejected = $false
+    try {
+        $env:CHAPTER9_CHECKPOINT_URI = "S3A://flink-state/checkpoints/chapter-9"
+        Get-Chapter9StateUri -Kind "checkpoint" | Out-Null
+    } catch { $caseVariantRejected = $true }
+    [ordered]@{
+        checkpoint = $checkpoint
+        savepoint = $savepoint
+        local_rejected = $localRejected
+        ambiguous_rejected = $ambiguousRejected
+        case_variant_rejected = $caseVariantRejected
+    } | ConvertTo-Json -Compress
+} finally {
+    if ($null -eq $originalCheckpoint) { Remove-Item Env:CHAPTER9_CHECKPOINT_URI -ErrorAction SilentlyContinue } else { $env:CHAPTER9_CHECKPOINT_URI = $originalCheckpoint }
+    if ($null -eq $originalSavepoint) { Remove-Item Env:CHAPTER9_SAVEPOINT_URI -ErrorAction SilentlyContinue } else { $env:CHAPTER9_SAVEPOINT_URI = $originalSavepoint }
+}
+'''
+        result = self._run_powershell(command)
+        self.assertEqual(0, result.returncode, result.stderr or result.stdout)
+        payload = json.loads(result.stdout.strip().splitlines()[-1])
+        self.assertEqual("s3a://flink-state/checkpoints/chapter-9", payload["checkpoint"])
+        self.assertEqual("s3a://flink-state/savepoints/chapter-9", payload["savepoint"])
+        self.assertTrue(payload["local_rejected"])
+        self.assertTrue(payload["ambiguous_rejected"])
+        self.assertTrue(payload["case_variant_rejected"])
 
     def test_cutover_kafka_parsers_accept_exact_single_and_multi_partition_inputs(self):
         command = r'''

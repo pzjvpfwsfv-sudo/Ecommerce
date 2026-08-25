@@ -13,10 +13,7 @@ class DataQualityJobTest {
     @Test
     void buildsShadowTopologyAndReliabilitySettingsWithoutExecution() {
         StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
-        JobConfig config = JobConfig.fromArgs(new String[] {
-                "--bootstrap-servers", "kafka:29092",
-                "--checkpoint-uri", "file:///tmp/checkpoints/chapter-9"
-        });
+        JobConfig config = JobConfig.fromArgs(new String[] {"--bootstrap-servers", "kafka:29092"});
 
         DataQualityJob.build(env, config);
 

@@ -25,13 +25,13 @@ public record JobConfig(
     public static JobConfig fromArgs(String[] args) {
         ParameterTool parameters = ParameterTool.fromArgs(args);
         String bootstrap = parameters.get("bootstrap-servers", "").trim();
-        String checkpoint = parameters.get("checkpoint-uri", "").trim();
+        String checkpoint = parameters.get("checkpoint-uri", "s3a://flink-state/checkpoints/chapter-9").trim();
         String mode = parameters.get("mode", "shadow").trim();
         if (bootstrap.isEmpty()) {
             throw new IllegalArgumentException("--bootstrap-servers must not be blank");
         }
-        if (checkpoint.isEmpty()) {
-            throw new IllegalArgumentException("--checkpoint-uri must not be blank");
+        if (!checkpoint.matches("^s3a://flink-state/checkpoints/chapter-9(?:/[A-Za-z0-9._-]+)*$")) {
+            throw new IllegalArgumentException("--checkpoint-uri must be an unambiguous s3a://flink-state/checkpoints/chapter-9 path");
         }
         if (!Set.of("shadow", "production").contains(mode)) {
             throw new IllegalArgumentException("--mode must be shadow or production");

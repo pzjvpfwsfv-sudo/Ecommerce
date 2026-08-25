@@ -5,6 +5,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+$script:Chapter9FunctionsOnly = [bool]$FunctionsOnly
 
 function Invoke-DockerCommand {
     param(
@@ -35,6 +36,59 @@ function Invoke-DockerCommand {
         throw $FailureMessage
     }
     return $output
+}
+
+function Assert-Chapter9StateUri {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][ValidateSet("checkpoint", "savepoint")][string]$Kind
+    )
+
+    $base = "s3a://flink-state/$($Kind)s/chapter-9"
+    if ([string]::IsNullOrWhiteSpace($Path) -or $Path -match "\.\." -or
+        $Path -cnotmatch "^$([regex]::Escape($base))(?:/[A-Za-z0-9._-]+)*$") {
+        throw "Invalid Chapter 9 $Kind URI: $Path"
+    }
+    return $Path
+}
+
+function Get-Chapter9StateUri {
+    param(
+        [Parameter(Mandatory = $true)][ValidateSet("checkpoint", "savepoint")][string]$Kind
+    )
+
+    $default = "s3a://flink-state/$($Kind)s/chapter-9"
+    $name = "CHAPTER9_$($Kind.ToUpperInvariant())_URI"
+    $configured = [Environment]::GetEnvironmentVariable($name)
+    if ([string]::IsNullOrWhiteSpace($configured)) { $configured = $default }
+    return Assert-Chapter9StateUri -Path $configured.Trim() -Kind $Kind
+}
+
+function Invoke-FlinkJobManagerCommand {
+    param(
+        [Parameter(Mandatory = $true)][string[]]$Command,
+        [Parameter(Mandatory = $true)][string]$FailureMessage
+    )
+
+    $root = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+    $arguments = @(
+        "compose", "--env-file", (Join-Path $root "infra/.env.example"),
+        "-f", (Join-Path $root "infra/docker-compose.yml"),
+        "exec", "-T", "flink-jobmanager"
+    ) + $Command
+    return Invoke-DockerCommand -Arguments $arguments -FailureMessage $FailureMessage
+}
+
+function Invoke-FlinkRest {
+    param([Parameter(Mandatory = $true)][string]$Resource)
+
+    if ($script:Chapter9FunctionsOnly) {
+        return Invoke-RestMethod -Uri "http://localhost:8081$Resource" -TimeoutSec 5
+    }
+    $output = Invoke-FlinkJobManagerCommand -Command @(
+        "curl", "--fail", "--silent", "--show-error", "http://localhost:8081$Resource"
+    ) -FailureMessage "Flink REST request failed: $Resource"
+    return ($output -join "`n" | ConvertFrom-Json)
 }
 
 function Get-WorkspaceMountSource([string]$Container) {
@@ -176,33 +230,21 @@ function Get-SavepointPath([string[]]$Lines) {
     if ($uniquePaths.Count -ne 1) {
         throw "Expected exactly one completed Savepoint path, found $($uniquePaths.Count)."
     }
-    return [string]$uniquePaths[0]
+    return Assert-CutoverSavepointPath -Path ([string]$uniquePaths[0])
 }
 
 function Assert-CutoverSavepointPath([string]$Path) {
     if ([string]::IsNullOrWhiteSpace($Path) -or $Path -match "\.\." -or
-        $Path -notmatch "^file:/workspace/tmp/savepoints/chapter-9/[A-Za-z0-9._-]+$") {
+        $Path -cnotmatch "^s3a://flink-state/savepoints/chapter-9/[A-Za-z0-9._-]+$") {
         throw "Invalid cutover Savepoint evidence: $Path"
     }
     return $Path
 }
 
-function Get-CutoverSavepointDirectorySnapshot([string]$JobManager = "ecom-flink-jobmanager") {
-    $output = Invoke-DockerCommand -Arguments @(
-        "exec", $JobManager, "sh", "-lc",
-        "find /workspace/tmp/savepoints/chapter-9 -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null | sort"
-    ) -FailureMessage "Unable to snapshot the cutover savepoint directory."
-    return @($output | ForEach-Object {
-        $value = ([string]$_).Trim()
-        if ($value -and $value -match '^[A-Za-z0-9._-]+$') { $value }
-    } | Sort-Object -Unique)
-}
-
 function Get-CutoverShadowStopResumePlan {
     param(
         [Parameter(Mandatory = $true)][object]$State,
-        [Parameter(Mandatory = $true)][object]$Jobs,
-        [string[]]$SavepointCandidates = @()
+        [Parameter(Mandatory = $true)][object]$Jobs
     )
 
     $expectedName = "chapter-9-datastream-quality-shadow"
@@ -229,16 +271,7 @@ function Get-CutoverShadowStopResumePlan {
         throw "Shadow stop has no intent and the exact shadow job is $jobState."
     }
     if ($jobState -eq "RUNNING") { return [pscustomobject]@{ Action = "retry_stop" } }
-    if ($jobState -eq "FINISHED") {
-        $before = @($mutation.intent.details.savepoint_directory_snapshot)
-        $newCandidates = @($SavepointCandidates | Where-Object { $_ -notin $before })
-        if ($newCandidates.Count -eq 1) {
-            $recoveredPath = Assert-CutoverSavepointPath `
-                -Path "file:/workspace/tmp/savepoints/chapter-9/$($newCandidates[0])"
-            return [pscustomobject]@{ Action = "recover_savepoint"; SavepointPath = $recoveredPath }
-        }
-        throw "Shadow stop Savepoint recovery expected one unique new directory, found $($newCandidates.Count)."
-    }
+    if ($jobState -eq "FINISHED") { throw "Shadow stop has no validated Savepoint response or manifest URI." }
     throw "Shadow stop recovery is fail-closed for exact job state $jobState."
 }
 
@@ -246,8 +279,7 @@ function Set-CutoverShadowStopResult {
     param(
         [Parameter(Mandatory = $true)][object]$State,
         [Parameter(Mandatory = $true)][string]$Path,
-        [Parameter(Mandatory = $true)][string]$SavepointPath,
-        [switch]$Recovered
+        [Parameter(Mandatory = $true)][string]$SavepointPath
     )
 
     $validatedPath = Assert-CutoverSavepointPath -Path $SavepointPath
@@ -257,7 +289,6 @@ function Set-CutoverShadowStopResult {
     $mutation.result = [pscustomobject]@{
         status = "result"
         savepoint_path = $validatedPath
-        recovered_from_directory_snapshot = [bool]$Recovered
         completed_at_utc = [DateTimeOffset]::UtcNow.ToString("o")
     }
     if ($State -is [System.Collections.IDictionary]) {
@@ -276,27 +307,20 @@ function Invoke-CutoverShadowStopStage {
         [Parameter(Mandatory = $true)][object]$State,
         [Parameter(Mandatory = $true)][string]$Path,
         [Parameter(Mandatory = $true)][object]$Jobs,
-        [Parameter(Mandatory = $true)][string[]]$SavepointCandidates,
         [Parameter(Mandatory = $true)][scriptblock]$StopAction
     )
 
-    $plan = Get-CutoverShadowStopResumePlan -State $State -Jobs $Jobs `
-        -SavepointCandidates $SavepointCandidates
+    $plan = Get-CutoverShadowStopResumePlan -State $State -Jobs $Jobs
     if ($plan.Action -eq "complete") {
         $savepointPath = Set-CutoverShadowStopResult -State $State -Path $Path `
             -SavepointPath $plan.SavepointPath
         return [pscustomobject]@{ savepoint_path = $savepointPath; action = "complete" }
     }
-    if ($plan.Action -eq "recover_savepoint") {
-        $savepointPath = Set-CutoverShadowStopResult -State $State -Path $Path `
-            -SavepointPath $plan.SavepointPath -Recovered
-        return [pscustomobject]@{ savepoint_path = $savepointPath; action = "recover_savepoint" }
-    }
     $stopResult = Invoke-CutoverMutation -State $State -Path $Path -Stage "shadow_stop" `
         -Operation "stop_shadow_with_savepoint" -Details @{
             job_id = [string]$State.shadow_job_id
             name = "chapter-9-datastream-quality-shadow"
-            savepoint_directory_snapshot = @($SavepointCandidates)
+            savepoint_destination = (Get-Chapter9StateUri -Kind "savepoint")
         } -Action $StopAction
     $savepointPath = Set-CutoverShadowStopResult -State $State -Path $Path `
         -SavepointPath ([string]$stopResult.savepoint_path)
@@ -681,7 +705,7 @@ function Complete-CutoverManifest {
 }
 
 function Get-FlinkJobs {
-    return Invoke-RestMethod -Uri "http://localhost:8081/jobs/overview" -TimeoutSec 5
+    return Invoke-FlinkRest -Resource "/jobs/overview"
 }
 
 function Assert-JobNamesAbsent([string[]]$Names) {
@@ -743,7 +767,7 @@ function Get-OnlyRunningShadowJob([string]$Name) {
 }
 
 function Assert-RecentCompletedCheckpoint([string]$JobId, [int]$MaximumAgeSeconds = 120) {
-    $checkpoints = Invoke-RestMethod -Uri "http://localhost:8081/jobs/$JobId/checkpoints" -TimeoutSec 5
+    $checkpoints = Invoke-FlinkRest -Resource "/jobs/$JobId/checkpoints"
     $latest = $checkpoints.latest.completed
     if ($null -eq $latest -or $latest.status -ne "COMPLETED") {
         throw "Shadow job $JobId has no latest completed checkpoint."
@@ -815,7 +839,7 @@ function Wait-FlinkJobRunning {
     $lastError = $null
     for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
         try {
-            $job = Invoke-RestMethod -Uri "http://localhost:8081/jobs/$JobId" -TimeoutSec 5
+            $job = Invoke-FlinkRest -Resource "/jobs/$JobId"
             if ($job.name -ne $ExpectedName) {
                 throw "Job ID $JobId has unexpected name $($job.name)."
             }
@@ -846,7 +870,7 @@ function Wait-NewCompletedCheckpoint {
     $lastState = "NOT_FOUND"
     for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
         try {
-            $job = Invoke-RestMethod -Uri "http://localhost:8081/jobs/$JobId" -TimeoutSec 5
+            $job = Invoke-FlinkRest -Resource "/jobs/$JobId"
             if ($job.name -ne $ExpectedName) {
                 throw "Job ID $JobId has unexpected name $($job.name)."
             }
@@ -858,7 +882,7 @@ function Wait-NewCompletedCheckpoint {
                 throw "Job $JobId entered terminal state $lastState while waiting for a checkpoint."
             }
             if ($lastState -eq "RUNNING") {
-                $checkpoints = Invoke-RestMethod -Uri "http://localhost:8081/jobs/$JobId/checkpoints" -TimeoutSec 5
+                $checkpoints = Invoke-FlinkRest -Resource "/jobs/$JobId/checkpoints"
                 if ([int64]$checkpoints.counts.completed -gt $Baseline -and
                     $checkpoints.latest.completed.status -eq "COMPLETED") {
                     return $checkpoints
@@ -949,8 +973,8 @@ $tmpRoot = Join-Path $root "tmp/chapter-9"
 $connectorDirectory = Join-Path $tmpRoot "lib"
 $manifestPath = Join-Path $tmpRoot "cutover-manifest.json"
 $manifestPartialPath = Join-Path $tmpRoot "cutover-manifest.json.partial"
-$savepointDirectory = Join-Path $root "tmp/savepoints/chapter-9"
-$productionCheckpointDirectory = Join-Path $root "tmp/checkpoints/chapter-9-production"
+$checkpointUri = Get-Chapter9StateUri -Kind "checkpoint"
+$savepointUri = Get-Chapter9StateUri -Kind "savepoint"
 $fatJar = Join-Path $root "jobs/datastream-quality/target/datastream-quality-1.0.0.jar"
 $mainRoot = $root
 $worktreesDirectory = Split-Path $root -Parent
@@ -1018,10 +1042,10 @@ if (($dorisTable -join "`n").Trim() -ne "realtime_metrics") {
     throw "Doris table analytics.realtime_metrics is missing."
 }
 
-$overview = Invoke-RestMethod -Uri "http://localhost:8081/overview" -TimeoutSec 5
+$overview = Invoke-FlinkRest -Resource "/overview"
 Assert-FlinkCapacity $overview
 
-New-Item -ItemType Directory -Force -Path $tmpRoot, $connectorDirectory, $savepointDirectory, $productionCheckpointDirectory | Out-Null
+New-Item -ItemType Directory -Force -Path $tmpRoot, $connectorDirectory | Out-Null
 if (Test-Path -LiteralPath $manifestPath) {
     if (-not $ResumePartial) {
         throw "Final cutover manifest already exists: $manifestPath"
@@ -1094,12 +1118,11 @@ if ($ResumePartial) {
     $savedManifest = Get-Content -Raw -Encoding UTF8 $manifestPartialPath | ConvertFrom-Json
     $recoveryState = Ensure-CutoverRecoveryState -State $savedManifest -Path $manifestPartialPath
     $resumeJobs = Get-FlinkJobs
-    $savepointCandidates = @(Get-CutoverSavepointDirectorySnapshot -JobManager $jobManager)
     $stopResult = Invoke-CutoverShadowStopStage -State $recoveryState -Path $manifestPartialPath `
-        -Jobs $resumeJobs -SavepointCandidates $savepointCandidates -StopAction {
-            $output = Invoke-DockerCommand -Arguments @(
-                "exec", $jobManager, "/opt/flink/bin/flink", "stop",
-                "--savepointPath", "file:///workspace/tmp/savepoints/chapter-9",
+        -Jobs $resumeJobs -StopAction {
+            $output = Invoke-FlinkJobManagerCommand -Command @(
+                "/opt/flink/bin/flink", "stop",
+                "--savepointPath", $savepointUri,
                 [string]$recoveryState.shadow_job_id
             ) -FailureMessage "Shadow Stop-with-Savepoint resume failed."
             $output | ForEach-Object { Write-Host $_ }
@@ -1129,12 +1152,12 @@ if ($ResumePartial) {
         $productionResult = Invoke-CutoverMutation -State $recoveryState -Path $manifestPartialPath `
             -Stage "production_submit" -Operation "submit_production_from_savepoint" `
             -Details @{ name = $productionJobName; savepoint_path = $savepointPath } -Action {
-                $output = Invoke-DockerCommand -Arguments @(
-                    "exec", $jobManager, "/opt/flink/bin/flink", "run", "-d", "-s", $savepointPath,
+                $output = Invoke-FlinkJobManagerCommand -Command @(
+                    "/opt/flink/bin/flink", "run", "-d", "-s", $savepointPath,
                     "-c", "com.ecommerce.quality.DataQualityJob", "/tmp/datastream-quality-1.0.0.jar",
                     "--bootstrap-servers", "kafka:29092", "--input-topic", "user_behavior_events",
                     "--mode", "production", "--consumer-group", "chapter9-quality-production",
-                    "--checkpoint-uri", "file:///workspace/tmp/checkpoints/chapter-9-production",
+                    "--checkpoint-uri", $checkpointUri,
                     "--transaction-prefix", "chapter9-production", "--job-version", "chapter-9-v1"
                 ) -FailureMessage "Production resume submission failed."
                 $id = Get-SubmittedJobId $output
@@ -1194,10 +1217,6 @@ Assert-JobNamesAbsent @($productionJobName, $dorisJobName, $icebergJobName)
 if (-not (Test-Path -LiteralPath $fatJar -PathType Leaf)) { throw "DataStream Fat JAR is missing: $fatJar" }
 if ((Get-Item -LiteralPath $fatJar).Length -le 0) { throw "DataStream Fat JAR is empty: $fatJar" }
 
-Invoke-DockerCommand -Arguments @("exec", $jobManager, "sh", "-lc", "mkdir -p /workspace/tmp/savepoints/chapter-9 /workspace/tmp/checkpoints/chapter-9-production && test -w /workspace/tmp/savepoints/chapter-9 && test -w /workspace/tmp/checkpoints/chapter-9-production") `
-    -FailureMessage "Flink JobManager cannot write production checkpoint/savepoint directories." | Out-Null
-Invoke-DockerCommand -Arguments @("exec", $taskManager, "sh", "-lc", "test -w /workspace/tmp/savepoints/chapter-9 && test -w /workspace/tmp/checkpoints/chapter-9-production") `
-    -FailureMessage "Flink TaskManager cannot write production checkpoint/savepoint directories." | Out-Null
 Invoke-DockerCommand -Arguments @("cp", $fatJar, "${jobManager}:/tmp/datastream-quality-1.0.0.jar") `
     -FailureMessage "Failed to copy DataStream Fat JAR to JobManager." | Out-Null
 Invoke-DockerCommand -Arguments @("exec", $jobManager, "test", "-s", "/tmp/datastream-quality-1.0.0.jar") `
@@ -1246,12 +1265,11 @@ Write-ManifestPartial -Manifest $manifest -PartialPath $manifestPartialPath
 Write-Host "[cutover] manifest_partial=$manifestPartialPath raw_offsets=$($rawOffsets -join ';') shadow_lag=$($shadowGroup.TotalLag) shadow_job_id=$shadowJobId"
 
 Write-Host "[cutover] stopping shadow job with Savepoint"
-$savepointCandidates = @(Get-CutoverSavepointDirectorySnapshot -JobManager $jobManager)
 $stopResult = Invoke-CutoverShadowStopStage -State $manifest -Path $manifestPartialPath `
-    -Jobs (Get-FlinkJobs) -SavepointCandidates $savepointCandidates -StopAction {
-        $output = Invoke-DockerCommand -Arguments @(
-            "exec", $jobManager, "/opt/flink/bin/flink", "stop",
-            "--savepointPath", "file:///workspace/tmp/savepoints/chapter-9", $shadowJobId
+    -Jobs (Get-FlinkJobs) -StopAction {
+        $output = Invoke-FlinkJobManagerCommand -Command @(
+            "/opt/flink/bin/flink", "stop",
+            "--savepointPath", $savepointUri, $shadowJobId
         ) -FailureMessage "Shadow Stop-with-Savepoint failed."
         $output | ForEach-Object { Write-Host $_ }
         [pscustomobject]@{ savepoint_path = (Get-SavepointPath $output) }
@@ -1264,12 +1282,12 @@ Write-Host "[cutover] starting production DataStream from Savepoint"
 $productionResult = Invoke-CutoverMutation -State $manifest -Path $manifestPartialPath `
     -Stage "production_submit" -Operation "submit_production_from_savepoint" `
     -Details @{ name = $productionJobName; savepoint_path = $savepointPath } -Action {
-        $output = Invoke-DockerCommand -Arguments @(
-            "exec", $jobManager, "/opt/flink/bin/flink", "run", "-d", "-s", $savepointPath,
+        $output = Invoke-FlinkJobManagerCommand -Command @(
+            "/opt/flink/bin/flink", "run", "-d", "-s", $savepointPath,
             "-c", "com.ecommerce.quality.DataQualityJob", "/tmp/datastream-quality-1.0.0.jar",
             "--bootstrap-servers", "kafka:29092", "--input-topic", "user_behavior_events",
             "--mode", "production", "--consumer-group", "chapter9-quality-production",
-            "--checkpoint-uri", "file:///workspace/tmp/checkpoints/chapter-9-production",
+            "--checkpoint-uri", $checkpointUri,
             "--transaction-prefix", "chapter9-production", "--job-version", "chapter-9-v1"
         ) -FailureMessage "Production DataStream submission or Savepoint restore failed."
         $output | ForEach-Object { Write-Host $_ }

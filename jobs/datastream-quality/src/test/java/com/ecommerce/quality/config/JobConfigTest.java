@@ -17,6 +17,7 @@ class JobConfigTest {
         assertEquals(Duration.ofSeconds(10), config.watermarkOutOfOrderness());
         assertEquals(Duration.ofSeconds(30), config.sourceIdleness());
         assertEquals(Duration.ofHours(24), config.stateTtl());
+        assertEquals("s3a://flink-state/checkpoints/chapter-9", config.checkpointUri());
         assertNotEquals(config.cleanTransactionPrefix(), config.dlqTransactionPrefix());
         assertNotEquals(config.dlqTransactionPrefix(), config.lateTransactionPrefix());
     }
@@ -32,7 +33,13 @@ class JobConfigTest {
         assertThrows(IllegalArgumentException.class,
                 () -> JobConfig.fromArgs(concat(requiredArgs(), "--mode", "unsafe")));
         assertThrows(IllegalArgumentException.class,
-                () -> JobConfig.fromArgs(new String[] {"--bootstrap-servers", "", "--checkpoint-uri", "file:///tmp/cp"}));
+                () -> JobConfig.fromArgs(new String[] {"--bootstrap-servers", "", "--checkpoint-uri", "s3a://flink-state/checkpoints/chapter-9"}));
+        assertThrows(IllegalArgumentException.class,
+                () -> JobConfig.fromArgs(concat(requiredArgs(), "--checkpoint-uri", "file:///tmp/cp")));
+        assertThrows(IllegalArgumentException.class,
+                () -> JobConfig.fromArgs(concat(requiredArgs(), "--checkpoint-uri", "s3a://flink-state//checkpoints/chapter-9")));
+        assertThrows(IllegalArgumentException.class,
+                () -> JobConfig.fromArgs(concat(requiredArgs(), "--checkpoint-uri", "s3a://other-state/checkpoints/chapter-9")));
         assertThrows(IllegalArgumentException.class,
                 () -> JobConfig.fromArgs(concat(requiredArgs(), "--dlq-topic", "user_behavior_clean_shadow")));
         assertThrows(IllegalArgumentException.class,
@@ -46,7 +53,7 @@ class JobConfigTest {
     }
 
     private static String[] requiredArgs() {
-        return new String[] {"--bootstrap-servers", "kafka:29092", "--checkpoint-uri", "file:///tmp/checkpoints/chapter-9"};
+        return new String[] {"--bootstrap-servers", "kafka:29092"};
     }
 
     private static String[] concat(String[] base, String... extra) {
