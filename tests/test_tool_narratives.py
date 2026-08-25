@@ -25,6 +25,7 @@ from app.tool_models import (
     ToolEvidence,
 )
 from app.tool_narratives import RuleBasedToolNarrativeAnalyzer, render_tool_selection
+from app.tool_deadline import use_tool_deadline
 
 
 COUNTERS = {
@@ -74,6 +75,33 @@ def quality_claim_selection() -> ToolAnalysisSelection:
 
 
 class ToolNarrativesTest(unittest.TestCase):
+    def test_model_selection_uses_remaining_deadline_budget_for_transport_timeout(self):
+        from app.tool_narratives import OpenAICompatibleToolNarrativeAnalyzer
+        import httpx
+        import json
+
+        captured: dict[str, object] = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured["timeout"] = request.extensions["timeout"]
+            return httpx.Response(
+                200,
+                json={"choices": [{"message": {"content": json.dumps({"summary": "realtime_only", "insights": [], "risks": [], "actions": []})}}]},
+            )
+
+        analyzer = OpenAICompatibleToolNarrativeAnalyzer(
+            api_key="test-key",
+            base_url="https://model.invalid/v1",
+            model="test-model",
+            timeout_seconds=7,
+            client_factory=lambda: httpx.Client(transport=httpx.MockTransport(handler)),
+        )
+        timer = iter((0.0, 18.0))
+
+        with use_tool_deadline(20, timer=lambda: next(timer)):
+            analyzer.select(realtime_only_context())
+
+        self.assertEqual({"connect": 2, "read": 2, "write": 2, "pool": 2}, captured["timeout"])
     def test_rule_narrative_uses_only_available_tool_evidence(self):
         narrative = RuleBasedToolNarrativeAnalyzer().analyze(complete_context())
 

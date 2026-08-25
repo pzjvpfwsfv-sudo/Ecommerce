@@ -7,6 +7,7 @@ from typing import Protocol
 import httpx
 
 from app.analysis_models import AnalysisContext, AnalysisNarrative, AnalysisSelection
+from app.tool_deadline import remaining_timeout
 
 
 class MetricAnalyzer(Protocol):
@@ -142,7 +143,7 @@ class OpenAICompatibleAnalyzer:
                 f"{self._base_url}/chat/completions",
                 headers={"Authorization": f"Bearer {self._api_key}"},
                 json=payload,
-                timeout=self._timeout_seconds,
+                timeout=remaining_timeout(self._timeout_seconds),
             )
         response.raise_for_status()
         content = response.json()["choices"][0]["message"]["content"]

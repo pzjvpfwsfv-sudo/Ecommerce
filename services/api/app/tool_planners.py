@@ -7,6 +7,7 @@ from typing import Any, Protocol
 import httpx
 
 from app.tool_models import ToolCall, ToolId, ToolPlan
+from app.tool_deadline import remaining_timeout
 
 
 class ToolPlanner(Protocol):
@@ -69,7 +70,7 @@ class OpenAICompatibleToolPlanner:
                 f"{self._base_url}/chat/completions",
                 headers={"Authorization": f"Bearer {self._api_key}"},
                 json=payload,
-                timeout=self._timeout_seconds,
+                timeout=remaining_timeout(self._timeout_seconds),
             )
         response.raise_for_status()
         tool_calls = response.json()["choices"][0]["message"]["tool_calls"]

@@ -3,11 +3,14 @@ from __future__ import annotations
 from collections.abc import Callable
 from datetime import datetime, timezone
 import logging
+import math
+from time import perf_counter
 from uuid import UUID, uuid4
 
 from app.analysis_models import AnalysisNarrative
 from app.analysis_service import validate_narrative_numbers, validate_narrative_output_safety
 from app.tool_executor import ToolExecutor
+from app.tool_deadline import ToolDeadlineExceededError, remaining_timeout, use_tool_deadline
 from app.tool_models import ToolAnalysisContext, ToolAnalysisResponse, ToolAnalysisSelection, ToolPlan
 from app.tool_narratives import (
     RuleBasedToolNarrativeAnalyzer,
@@ -35,7 +38,16 @@ class ToolAnalysisService:
         fallback_analyzer: ToolNarrativeAnalyzer,
         clock: Callable[[], datetime] | None = None,
         audit_id_factory: Callable[[], UUID] | None = None,
+        total_timeout_seconds: float = 15,
+        timer: Callable[[], float] = perf_counter,
     ) -> None:
+        if (
+            not isinstance(total_timeout_seconds, (int, float))
+            or isinstance(total_timeout_seconds, bool)
+            or not math.isfinite(total_timeout_seconds)
+            or not 0 < total_timeout_seconds <= 60
+        ):
+            raise ValueError("tool total timeout must be between 0 and 60 seconds")
         self._primary_planner = primary_planner
         self._fallback_planner = fallback_planner
         self._executor = executor
@@ -43,9 +55,20 @@ class ToolAnalysisService:
         self._fallback_analyzer = fallback_analyzer
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._audit_id_factory = audit_id_factory or uuid4
+        self._total_timeout_seconds = float(total_timeout_seconds)
+        self._timer = timer
 
     def analyze(self, question: str) -> ToolAnalysisResponse:
         audit_id = self._new_audit_id()
+        try:
+            with use_tool_deadline(self._total_timeout_seconds, timer=self._timer):
+                return self._analyze_in_budget(question, audit_id)
+        except ToolAnalysisUnavailableError:
+            raise
+        except Exception:
+            raise ToolAnalysisUnavailableError("tool analysis is unavailable") from None
+
+    def _analyze_in_budget(self, question: str, audit_id: UUID) -> ToolAnalysisResponse:
         warnings: list[str] = []
         degraded = False
         planner = self._primary_planner
@@ -60,6 +83,17 @@ class ToolAnalysisService:
         )
         try:
             plan = self._validated_plan(planner.plan(question))
+        except ToolDeadlineExceededError:
+            self._audit(
+                "tool_analysis_failed",
+                audit_id,
+                planner,
+                None,
+                degraded,
+                "plan_failure",
+                logging.ERROR,
+            )
+            raise ToolAnalysisUnavailableError("tool analysis is unavailable") from None
         except Exception:
             degraded = True
             warnings.append("规划模型不可用，已降级为规则规划。")
@@ -136,13 +170,37 @@ class ToolAnalysisService:
 
         analyzer = self._primary_analyzer
         try:
+            remaining_timeout(self._total_timeout_seconds)
             narrative = self._render_selected_claims(analyzer, context)
+        except ToolDeadlineExceededError:
+            self._audit(
+                "tool_analysis_failed",
+                audit_id,
+                planner,
+                analyzer,
+                degraded,
+                "narrative_failure",
+                logging.ERROR,
+            )
+            raise ToolAnalysisUnavailableError("tool analysis is unavailable") from None
         except Exception:
             degraded = True
             warnings.append("叙事模型不可用，已降级为规则叙事。")
             analyzer = self._fallback_analyzer
             try:
+                remaining_timeout(self._total_timeout_seconds)
                 narrative = self._render_selected_claims(analyzer, context)
+            except ToolDeadlineExceededError:
+                self._audit(
+                    "tool_analysis_failed",
+                    audit_id,
+                    planner,
+                    analyzer,
+                    True,
+                    "narrative_failure",
+                    logging.ERROR,
+                )
+                raise ToolAnalysisUnavailableError("tool analysis is unavailable") from None
             except Exception:
                 self._audit(
                     "tool_analysis_failed",
@@ -156,6 +214,7 @@ class ToolAnalysisService:
                 raise ToolAnalysisUnavailableError("tool analysis is unavailable") from None
 
         try:
+            remaining_timeout(self._total_timeout_seconds)
             response = ToolAnalysisResponse(
                 **narrative.model_dump(),
                 evidence=execution.evidence,

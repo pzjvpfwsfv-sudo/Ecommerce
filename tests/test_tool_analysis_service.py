@@ -13,6 +13,7 @@ sys.path.insert(0, str((ROOT / "services" / "api").resolve()))
 
 from app.analysis_models import HistoricalEvidence, RealtimeEvidence
 from app.tool_executor import ToolExecutor
+from app.tool_deadline import remaining_timeout
 from app.tool_analysis_service import ToolAnalysisService, ToolAnalysisUnavailableError
 from app.tool_models import (
     ToolCall,
@@ -117,6 +118,8 @@ def service_with(
     primary_analyzer: Mock | None = None,
     fallback_analyzer: ToolNarrativeAnalyzer | None = None,
     audit_ids: Iterator[UUID] | None = None,
+    total_timeout_seconds: float = 20,
+    timer: callable = lambda: 0.0,
 ) -> tuple[ToolAnalysisService, Mock]:
     primary = primary_planner if primary_planner is not None else Mock(spec=ToolPlanner)
     primary.name = "openai_compatible"
@@ -144,12 +147,75 @@ def service_with(
             fallback_analyzer if fallback_analyzer is not None else RuleBasedToolNarrativeAnalyzer(),
             clock=lambda: datetime(2026, 8, 3, tzinfo=UTC),
             audit_id_factory=(lambda: next(audit_ids)) if audit_ids else None,
+            total_timeout_seconds=total_timeout_seconds,
+            timer=timer,
         ),
         tool_executor,
     )
 
 
 class ToolAnalysisServiceTest(unittest.TestCase):
+    def test_service_shares_one_budget_with_executor_after_planner_consumes_time(self):
+        timer = iter((0.0, 18.0, 18.0, 18.0))
+        executor = Mock(spec=ToolExecutor)
+        executor.execute.side_effect = lambda plan, audit_id: (
+            self.assertEqual(2.0, remaining_timeout(20)) or successful_execution()
+        )
+        service, _ = service_with(executor=executor, timer=lambda: next(timer))
+
+        service.analyze("当前指标")
+
+        executor.execute.assert_called_once()
+
+    def test_service_stops_before_execution_when_planner_exhausts_request_budget(self):
+        timer = iter((0.0, 20.0))
+        primary = Mock(spec=ToolPlanner)
+        primary.name = "openai_compatible"
+        primary.plan.side_effect = lambda question: remaining_timeout(20) and realtime_plan()
+        fallback = Mock(spec=ToolPlanner)
+        fallback.name = "rule_based"
+        realtime = Mock()
+        executor = ToolExecutor(realtime, Mock(), Mock(), 3, 20, 20)
+        analyzer = Mock(spec=ToolNarrativeAnalyzer)
+        analyzer.name = "openai_compatible"
+        service, _ = service_with(
+            primary_planner=primary,
+            fallback_planner=fallback,
+            executor=executor,
+            primary_analyzer=analyzer,
+            timer=lambda: next(timer),
+        )
+
+        with self.assertRaisesRegex(ToolAnalysisUnavailableError, "^tool analysis is unavailable$"):
+            service.analyze("当前指标")
+
+        fallback.plan.assert_not_called()
+        realtime.fetch_all_metrics.assert_not_called()
+        analyzer.select.assert_not_called()
+
+    def test_service_does_not_refresh_budget_when_primary_planner_falls_back(self):
+        timer = iter((0.0, 18.0, 18.0, 18.0, 18.0))
+        primary = Mock(spec=ToolPlanner)
+        primary.name = "openai_compatible"
+        primary.plan.side_effect = RuntimeError("planner unavailable")
+        fallback = Mock(spec=ToolPlanner)
+        fallback.name = "rule_based"
+        fallback.plan.side_effect = lambda question: (
+            self.assertEqual(2.0, remaining_timeout(20)) or realtime_plan()
+        )
+        executor = Mock(spec=ToolExecutor)
+        executor.execute.return_value = successful_execution()
+        service, _ = service_with(
+            primary_planner=primary,
+            fallback_planner=fallback,
+            executor=executor,
+            timer=lambda: next(timer),
+        )
+
+        response = service.analyze("当前指标")
+
+        self.assertEqual("rule_based", response.planner)
+        fallback.plan.assert_called_once_with("当前指标")
     def test_close_delegates_to_the_tool_executor(self):
         service, executor = service_with()
 

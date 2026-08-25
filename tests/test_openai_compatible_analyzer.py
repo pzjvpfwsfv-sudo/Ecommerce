@@ -15,9 +15,38 @@ from app import analyzers
 from app.analysis_models import AnalysisContext, AnalysisEvidence, HistoricalEvidence, RealtimeEvidence
 from app.analysis_service import AnalysisService
 from app.config import ApiSettings, load_settings
+from app.tool_deadline import use_tool_deadline
 
 
 class OpenAICompatibleAnalyzerTest(unittest.TestCase):
+    def test_adapter_uses_remaining_deadline_budget_for_transport_timeout(self):
+        captured = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured["timeout"] = request.extensions["timeout"]
+            return httpx.Response(
+                200,
+                json={"choices": [{"message": {"content": json.dumps({"summary": "realtime_overview", "insights": [], "risks": [], "actions": []})}}]},
+            )
+
+        analyzer = getattr(analyzers, "OpenAICompatibleAnalyzer")(
+            api_key="secret",
+            base_url="http://model.local/v1",
+            model="demo-model",
+            timeout_seconds=7,
+            client_factory=lambda: httpx.Client(transport=httpx.MockTransport(handler)),
+        )
+        context = AnalysisContext(
+            question="Analyze activity",
+            generated_at=datetime(2026, 7, 18, tzinfo=timezone.utc),
+            evidence=AnalysisEvidence(realtime=RealtimeEvidence(pv=12, uv=5)),
+        )
+        timer = iter((0.0, 18.0))
+
+        with use_tool_deadline(20, timer=lambda: next(timer)):
+            analyzer.analyze(context)
+
+        self.assertEqual({"connect": 2, "read": 2, "write": 2, "pool": 2}, captured["timeout"])
     def test_adapter_sends_evidence_and_renders_strict_claim_selection(self):
         captured = {}
 

@@ -21,7 +21,7 @@ from app.tool_models import (
     ToolPlan,
 )
 from app.trino_repository import TrinoAnalyticsRepository
-from app.tool_deadline import use_tool_deadline
+from app.tool_deadline import ToolDeadlineExceededError, remaining_timeout, use_tool_deadline
 from app.tool_runner import BoundedToolRunner, ToolRunnerUnavailableError
 
 
@@ -68,6 +68,7 @@ class ToolExecutor:
 
         self._max_calls = max_calls
         self._total_timeout_seconds = float(total_timeout_seconds)
+        self._per_operation_cap_seconds = float(total_timeout_seconds)
         self._max_event_types = max_event_types
         self._timer = timer
         self._realtime_repository = realtime_repository
@@ -95,12 +96,15 @@ class ToolExecutor:
                 raise ToolExecutionUnavailableError("tool execution unavailable") from None
 
             try:
-                remaining = self._remaining(started_at, call_started_at)
+                remaining = min(
+                    self._remaining(started_at, call_started_at),
+                    remaining_timeout(self._per_operation_cap_seconds),
+                )
                 partition = self._runner.run(
                     lambda: self._run_with_deadline(self._registry[call.tool_id], remaining),
                     remaining,
                 )
-            except (ToolExecutionUnavailableError, ToolRunnerUnavailableError):
+            except (ToolDeadlineExceededError, ToolExecutionUnavailableError, ToolRunnerUnavailableError):
                 completed_at = self._now()
                 duration_ms = self._duration_ms(call_started_at, completed_at)
                 self._log_call(

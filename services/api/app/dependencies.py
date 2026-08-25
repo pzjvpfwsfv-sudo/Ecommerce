@@ -93,6 +93,7 @@ def build_tool_analysis_service(
         executor=executor,
         primary_analyzer=primary_analyzer,
         fallback_analyzer=fallback_analyzer,
+        total_timeout_seconds=settings.ai_tool_total_timeout_seconds,
     )
 
 

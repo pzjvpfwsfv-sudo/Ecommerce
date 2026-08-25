@@ -12,6 +12,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str((ROOT / "services" / "api").resolve()))
 
 from app.tool_models import ToolId, ToolPlan
+from app.tool_deadline import use_tool_deadline
 from app.tool_planners import OpenAICompatibleToolPlanner, RuleBasedToolPlanner
 
 
@@ -48,6 +49,29 @@ def planner_for(
 
 
 class ToolPlannerTest(unittest.TestCase):
+    def test_openai_planner_uses_remaining_deadline_budget_for_transport_timeout(self):
+        captured: dict[str, object] = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured["timeout"] = request.extensions["timeout"]
+            return httpx.Response(
+                200,
+                json={"choices": [{"message": {"content": None, "tool_calls": [model_call(ToolId.REALTIME, "{}")]}}]},
+            )
+
+        planner = OpenAICompatibleToolPlanner(
+            api_key="test-key",
+            base_url="https://model.invalid/v1",
+            model="test-model",
+            timeout_seconds=7,
+            client_factory=lambda: httpx.Client(transport=httpx.MockTransport(handler)),
+        )
+        timer = iter((0.0, 18.0))
+
+        with use_tool_deadline(20, timer=lambda: next(timer)):
+            planner.plan("current metrics")
+
+        self.assertEqual({"connect": 2, "read": 2, "write": 2, "pool": 2}, captured["timeout"])
     def test_rule_planner_selects_one_tool_or_stable_composite_plan(self):
         planner = RuleBasedToolPlanner()
 

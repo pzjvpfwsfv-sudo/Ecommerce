@@ -17,6 +17,7 @@ sys.path.insert(0, str((ROOT / "services" / "api").resolve()))
 from app.analysis_models import HistoricalEvidence
 from app.flink_quality_repository import FlinkQualityRepository
 from app.tool_executor import ToolExecutionPlanError, ToolExecutionUnavailableError, ToolExecutor
+from app.tool_deadline import use_tool_deadline
 from app.tool_models import DataQualityEvidence, ToolCall, ToolId, ToolPlan
 from app.tool_runner import ToolRunnerUnavailableError
 
@@ -115,6 +116,29 @@ class CapturingHandler(logging.Handler):
 
 
 class ToolExecutorTest(unittest.TestCase):
+    def test_executor_passes_the_request_remaining_budget_to_the_runner(self):
+        class CapturingRunner:
+            def __init__(self):
+                self.timeouts: list[float] = []
+
+            def run(self, operation, timeout_seconds):
+                self.timeouts.append(timeout_seconds)
+                return operation()
+
+            def close(self):
+                pass
+
+        realtime = Mock()
+        realtime.fetch_all_metrics.return_value = {"pv": 2, "uv": 2}
+        runner = CapturingRunner()
+        executor = ToolExecutor(realtime, Mock(), Mock(), 3, 20, 20, timer=lambda: 0.0, runner=runner)
+        timer = iter((0.0, 18.0))
+
+        with use_tool_deadline(20, timer=lambda: next(timer)):
+            executor.execute(realtime_plan(), "audit-remaining-budget")
+
+        self.assertEqual([2.0], runner.timeouts)
+
     def test_executor_maps_runner_unavailability_to_the_existing_safe_error(self):
         class UnavailableRunner:
             def __init__(self):
