@@ -219,7 +219,20 @@ function Restore-Chapter105Catalog {
     $metadataFileName = Select-IcebergMetadataCandidate -Names (Get-Chapter105MetadataNames)
     $metadata = Get-Chapter105MetadataObject -MetadataFileName $metadataFileName
     Assert-IcebergMetadata -Metadata $metadata
-    Invoke-Chapter105RegisterTable -MetadataFileName $metadataFileName
+    try {
+        Invoke-Chapter105RegisterTable -MetadataFileName $metadataFileName
+    } catch {
+        try {
+            $recheckCount = Get-Chapter105CatalogTableCount
+            if ($recheckCount -ne 1) {
+                throw "Fixed Iceberg table is still absent after registration failure."
+            }
+            Assert-Chapter105FixedTableAggregateReadable
+        } catch {
+            throw "Fixed Iceberg catalog registration failed."
+        }
+        return "registered_by_another_actor"
+    }
     Assert-Chapter105FixedTableAggregateReadable
     return "restored"
 }

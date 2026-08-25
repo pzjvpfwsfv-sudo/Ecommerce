@@ -28,6 +28,51 @@ class Chapter105CatalogRecoveryTest(unittest.TestCase):
         self.assertEqual(0, result.returncode, result.stderr or result.stdout)
         return json.loads(result.stdout.strip().splitlines()[-1])
 
+    def _registration_race_payload(self, recheck_line, validation_statement):
+        command = r'''
+. (Resolve-Path "scripts/restore_chapter_10_5_catalog.ps1") -FunctionsOnly
+$script:infoChecks = 0
+$script:registerCalls = 0
+$script:aggregateChecks = 0
+function Invoke-Chapter105Compose {
+    param([string[]]$Arguments, [string]$FailureMessage)
+    $last = [string]$Arguments[-1]
+    if ($last -match "information_schema") {
+        $script:infoChecks++
+        if ($script:infoChecks -eq 1) { return @("table_count", "0") }
+        return @("table_count", "__RECHECK_LINE__")
+    }
+    if ($last -match "mc ls --recursive --json") {
+        return @('{"key":"iceberg/analytics.db/user_behavior_detail/metadata/00012-22222222-2222-4222-8222-222222222222.metadata.json"}')
+    }
+    if ($last -match "mc cat") {
+        return @('{"location":"s3a://warehouse/iceberg/analytics.db/user_behavior_detail","table-uuid":"22222222-2222-4222-8222-222222222222","current-snapshot-id":12}')
+    }
+    if ($last -match "register_table") {
+        $script:registerCalls++
+        throw "registration-secret-minioadmin123 response-body"
+    }
+    if ($last -match "event_count") {
+        $script:aggregateChecks++
+        __VALIDATION_STATEMENT__
+    }
+    throw "unexpected controlled command"
+}
+$status = ""
+$failureMessage = ""
+try { $status = Restore-Chapter105Catalog } catch { $failureMessage = $_.Exception.Message }
+[ordered]@{
+    status = $status
+    failure = $failureMessage
+    info_checks = $script:infoChecks
+    register_calls = $script:registerCalls
+    aggregate_checks = $script:aggregateChecks
+} | ConvertTo-Json -Compress
+'''
+        command = command.replace("__RECHECK_LINE__", recheck_line)
+        command = command.replace("__VALIDATION_STATEMENT__", validation_statement)
+        return self._payload(command)
+
     def test_metadata_candidate_selection_rejects_empty_malformed_and_duplicate_highest(self):
         payload = self._payload(
             r'''
@@ -113,6 +158,75 @@ function docker { $script:dockerCalls++; throw "docker must not run during Funct
         )
         self.assertEqual({"docker_calls": 0, "error_preference_unchanged": True}, payload)
 
+    def test_compose_wrapper_passes_fixed_prefix_and_caller_arguments_as_exact_argv(self):
+        payload = self._payload(
+            r'''
+[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
+. (Resolve-Path "scripts/restore_chapter_10_5_catalog.ps1") -FunctionsOnly
+$script:capturedArguments = @()
+function docker {
+    $script:capturedArguments = @($args)
+    $global:LASTEXITCODE = 0
+    return "native-result"
+}
+$output = @(Invoke-Chapter105Compose -Arguments @(
+    "exec", "-T", "trino", "trino", "--execute", "SELECT 1"
+) -FailureMessage "Catalog compose command failed.")
+[ordered]@{
+    arguments = $script:capturedArguments
+    output = $output
+} | ConvertTo-Json -Compress -Depth 4
+'''
+        )
+        self.assertEqual(
+            [
+                "compose",
+                "--env-file",
+                str(ROOT / "infra" / ".env.example"),
+                "-f",
+                str(ROOT / "infra" / "docker-compose.yml"),
+                "--profile",
+                "lakehouse",
+                "exec",
+                "-T",
+                "trino",
+                "trino",
+                "--execute",
+                "SELECT 1",
+            ],
+            payload["arguments"],
+        )
+        self.assertEqual(["native-result"], payload["output"])
+
+    def test_compose_wrapper_scrubs_nonzero_native_output_and_credentials(self):
+        secret = "native-secret-minioadmin123 response-body"
+        result = self._run_powershell(
+            r'''
+. (Resolve-Path "scripts/restore_chapter_10_5_catalog.ps1") -FunctionsOnly
+function docker {
+    $global:LASTEXITCODE = 23
+    return "native-secret-minioadmin123 response-body"
+}
+$capturedOutput = @()
+$failureMessage = ""
+try {
+    $capturedOutput = @(Invoke-Chapter105Compose -Arguments @("exec", "-T", "trino") `
+        -FailureMessage "Catalog compose command failed.")
+} catch {
+    $failureMessage = $_.Exception.Message
+}
+[ordered]@{
+    failure = $failureMessage
+    emitted = $capturedOutput
+} | ConvertTo-Json -Compress
+'''
+        )
+        self.assertEqual(0, result.returncode, result.stderr or result.stdout)
+        self.assertNotIn(secret, result.stdout + result.stderr)
+        payload = json.loads(result.stdout.strip().splitlines()[-1])
+        self.assertEqual("Catalog compose command failed.", payload["failure"])
+        self.assertEqual([], payload["emitted"])
+
     def test_existing_readable_table_is_a_no_op(self):
         payload = self._payload(
             r'''
@@ -187,6 +301,53 @@ $registerSql = @($script:commands | ForEach-Object { [string]$_[-1] } | Where-Ob
             },
             payload,
         )
+
+    def test_registration_race_rechecks_once_and_accepts_only_verified_fixed_table(self):
+        payload = self._registration_race_payload(
+            "1", 'return @("event_count,max_event_time", "0,")'
+        )
+
+        self.assertEqual("registered_by_another_actor", payload["status"])
+        self.assertEqual("", payload["failure"])
+        self.assertEqual(2, payload["info_checks"])
+        self.assertEqual(1, payload["register_calls"])
+        self.assertEqual(1, payload["aggregate_checks"])
+
+    def test_registration_race_with_table_still_absent_fails_scrubbed_without_retry(self):
+        payload = self._registration_race_payload(
+            "0", 'return @("event_count,max_event_time", "0,")'
+        )
+
+        self.assertEqual("", payload["status"])
+        self.assertEqual("Fixed Iceberg catalog registration failed.", payload["failure"])
+        self.assertNotIn("registration-secret", payload["failure"])
+        self.assertEqual(2, payload["info_checks"])
+        self.assertEqual(1, payload["register_calls"])
+        self.assertEqual(0, payload["aggregate_checks"])
+
+    def test_registration_race_with_malformed_recheck_fails_scrubbed_without_retry(self):
+        payload = self._registration_race_payload(
+            "not-a-count", 'return @("event_count,max_event_time", "0,")'
+        )
+
+        self.assertEqual("", payload["status"])
+        self.assertEqual("Fixed Iceberg catalog registration failed.", payload["failure"])
+        self.assertNotIn("not-a-count", payload["failure"])
+        self.assertEqual(2, payload["info_checks"])
+        self.assertEqual(1, payload["register_calls"])
+        self.assertEqual(0, payload["aggregate_checks"])
+
+    def test_registration_race_with_failed_verification_fails_scrubbed_without_retry(self):
+        payload = self._registration_race_payload(
+            "1", 'throw "verification-secret response-body"'
+        )
+
+        self.assertEqual("", payload["status"])
+        self.assertEqual("Fixed Iceberg catalog registration failed.", payload["failure"])
+        self.assertNotIn("verification-secret", payload["failure"])
+        self.assertEqual(2, payload["info_checks"])
+        self.assertEqual(1, payload["register_calls"])
+        self.assertEqual(1, payload["aggregate_checks"])
 
     def test_malformed_information_schema_output_fails_closed_before_metadata_access(self):
         payload = self._payload(
