@@ -323,16 +323,22 @@ function Get-Chapter105Task4RecoveryPlan {
 function Invoke-Chapter105JobsStage {
     param(
         [Parameter(Mandatory = $true)][string]$RepositoryRoot,
+        [string]$StateRoot,
         [Parameter(Mandatory = $true)][object]$Overview,
         [Parameter(Mandatory = $true)][string]$JobName,
         [Parameter(Mandatory = $true)][string]$SavepointUri,
         [Parameter(Mandatory = $true)][scriptblock]$SubmitAction
     )
 
-    $statePath = Get-CutoverProductionSubmitStatePath -RepositoryRoot $RepositoryRoot
+    $statePathArguments = @{ RepositoryRoot = $RepositoryRoot }
+    if ($PSBoundParameters.ContainsKey('StateRoot')) {
+        $statePathArguments['StateRoot'] = $StateRoot
+    }
+    $statePath = Get-CutoverProductionSubmitStatePath @statePathArguments
+    $legacyStatePath = Get-CutoverLegacyProductionSubmitStatePath -RepositoryRoot $RepositoryRoot
     $bootstrapSubmitAction = $SubmitAction
     return Invoke-CutoverProductionSubmitBoundary -Path $statePath -Jobs $Overview `
-        -ExpectedName $JobName -Action {
+        -ExpectedName $JobName -LegacyStatePath $legacyStatePath -Action {
             $recovery = Get-Chapter105Task4RecoveryPlan -RepositoryRoot $RepositoryRoot `
                 -SavepointUri $SavepointUri
             return & $bootstrapSubmitAction $recovery.savepoint_path
@@ -493,6 +499,7 @@ function Invoke-Chapter105Bootstrap {
             Assert-Chapter105Preflight -RepositoryRoot $context.RepositoryRoot -Environment $context.Environment
         }
         $repositoryRoot = $context.RepositoryRoot
+        $cutoverRepositoryRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..')).TrimEnd('\', '/')
         $envPath = $context.EnvPath
         Invoke-Chapter105BootstrapStage -Report $report -Name 'dependencies' -Action {
             Invoke-Chapter105Native -FilePath 'powershell' -Arguments @(
@@ -527,7 +534,7 @@ function Invoke-Chapter105Bootstrap {
         Invoke-Chapter105BootstrapStage -Report $report -Name 'jobs' -Action {
             . (Join-Path $PSScriptRoot 'run_chapter_9_production_cutover.ps1') -FunctionsOnly
             $overview = Invoke-Chapter105FlinkOverview -Port ([int]$context.Environment['FLINK_REST_PORT'])
-            $decision = Invoke-Chapter105JobsStage -RepositoryRoot $repositoryRoot -Overview $overview `
+            $decision = Invoke-Chapter105JobsStage -RepositoryRoot $cutoverRepositoryRoot -Overview $overview `
                 -JobName $jobName -SavepointUri $context.SavepointUri -SubmitAction {
                 param($savepointPath)
                 $id = Invoke-Chapter105JobSubmission -RepositoryRoot $repositoryRoot -ComposePrefix $context.ComposePrefix `

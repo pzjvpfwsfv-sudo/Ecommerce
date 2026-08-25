@@ -399,10 +399,112 @@ function Write-CutoverStateAtomic {
     Move-Item -LiteralPath $nextPath -Destination $Path -Force
 }
 
-function Get-CutoverProductionSubmitStatePath {
+function Assert-CutoverStateRoot {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    $safeError = "Production submission recovery state is unsafe."
+    try {
+        if ([string]::IsNullOrWhiteSpace($Path) -or -not [System.IO.Path]::IsPathRooted($Path)) {
+            throw $safeError
+        }
+        $fullPath = [System.IO.Path]::GetFullPath($Path).TrimEnd("\", "/")
+        if (-not (Test-Path -LiteralPath $fullPath -PathType Container)) { throw $safeError }
+
+        $pathRoot = [System.IO.Path]::GetPathRoot($fullPath)
+        $current = $pathRoot
+        $relative = $fullPath.Substring($pathRoot.Length)
+        foreach ($segment in $relative.Split(@("\", "/"), [System.StringSplitOptions]::RemoveEmptyEntries)) {
+            $current = Join-Path $current $segment
+            $item = Get-Item -LiteralPath $current -Force
+            if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw $safeError
+            }
+        }
+        return $fullPath
+    } catch {
+        throw $safeError
+    }
+}
+
+function Get-CutoverPrimaryRepositoryRoot {
     param([Parameter(Mandatory = $true)][string]$RepositoryRoot)
 
-    return [System.IO.Path]::GetFullPath((Join-Path $RepositoryRoot "tmp/chapter-9/production-submit-state.json"))
+    $safeError = "Production submission recovery state is unsafe."
+    try {
+        $startPath = [System.IO.Path]::GetFullPath($RepositoryRoot)
+        if (-not (Test-Path -LiteralPath $startPath -PathType Container)) { throw $safeError }
+        $commonDirectory = @(& git -C $startPath rev-parse --path-format=absolute --git-common-dir 2>$null)
+        if ($LASTEXITCODE -ne 0 -or $commonDirectory.Count -ne 1) { throw $safeError }
+        $commonPath = [System.IO.Path]::GetFullPath([string]$commonDirectory[0]).TrimEnd("\", "/")
+        if ([System.IO.Path]::GetFileName($commonPath) -cne ".git" -or
+            -not (Test-Path -LiteralPath $commonPath -PathType Container)) {
+            throw $safeError
+        }
+        $primaryRoot = Assert-CutoverStateRoot -Path (Split-Path -Parent $commonPath)
+        $insideWorkTree = @(& git -C $primaryRoot rev-parse --is-inside-work-tree 2>$null)
+        if ($LASTEXITCODE -ne 0 -or $insideWorkTree.Count -ne 1 -or [string]$insideWorkTree[0] -cne "true") {
+            throw $safeError
+        }
+        return $primaryRoot
+    } catch {
+        throw $safeError
+    }
+}
+
+function Get-CutoverProductionSubmitStatePath {
+    param(
+        [Parameter(Mandatory = $true)][string]$RepositoryRoot,
+        [string]$StateRoot
+    )
+
+    $safeError = "Production submission recovery state is unsafe."
+    try {
+        $resolvedRoot = if ($PSBoundParameters.ContainsKey("StateRoot")) {
+            Assert-CutoverStateRoot -Path $StateRoot
+        } else {
+            Get-CutoverPrimaryRepositoryRoot -RepositoryRoot $RepositoryRoot
+        }
+        $current = $resolvedRoot
+        foreach ($segment in @("tmp", "chapter-9")) {
+            $current = Join-Path $current $segment
+            if (Test-Path -LiteralPath $current) {
+                $item = Get-Item -LiteralPath $current -Force
+                if (-not $item.PSIsContainer -or
+                    ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+                    throw $safeError
+                }
+            }
+        }
+        return [System.IO.Path]::GetFullPath((Join-Path $current "production-submit-state.json"))
+    } catch {
+        throw $safeError
+    }
+}
+
+function Get-CutoverLegacyProductionSubmitStatePath {
+    param(
+        [Parameter(Mandatory = $true)][string]$RepositoryRoot,
+        [string]$Path
+    )
+
+    $safeError = "Production submission recovery state is unsafe."
+    try {
+        $root = [System.IO.Path]::GetFullPath($RepositoryRoot).TrimEnd("\", "/")
+        if (-not (Test-Path -LiteralPath $root -PathType Container)) { throw $safeError }
+        $expected = [System.IO.Path]::GetFullPath((Join-Path $root "tmp/chapter-9/cutover-manifest.json.partial"))
+        if ($PSBoundParameters.ContainsKey("Path")) {
+            if ([string]::IsNullOrWhiteSpace($Path) -or -not [System.IO.Path]::IsPathRooted($Path)) {
+                throw $safeError
+            }
+            $candidate = [System.IO.Path]::GetFullPath($Path)
+            if (-not $candidate.Equals($expected, [System.StringComparison]::OrdinalIgnoreCase)) {
+                throw $safeError
+            }
+        }
+        return $expected
+    } catch {
+        throw $safeError
+    }
 }
 
 function Write-CutoverProductionSubmitStateAtomic {
@@ -467,64 +569,157 @@ function Test-CutoverRoundTripTimestamp {
     )
 }
 
+function Get-CutoverProductionSubmitIntentKind {
+    param(
+        [Parameter(Mandatory = $true)][object]$Intent,
+        [Parameter(Mandatory = $true)][string]$ExpectedName
+    )
+
+    $safeError = "Production submission recovery state is unsafe."
+    if (Test-CutoverExactProperties -Record $Intent -Names @("operation", "job_name", "created_at_utc")) {
+        if ($Intent.operation -isnot [string] -or
+            [string]$Intent.operation -cne "submit_chapter9_production" -or
+            $Intent.job_name -isnot [string] -or [string]$Intent.job_name -cne $ExpectedName -or
+            -not (Test-CutoverRoundTripTimestamp -Value $Intent.created_at_utc)) {
+            throw $safeError
+        }
+        return "canonical"
+    }
+    if (Test-CutoverExactProperties -Record $Intent -Names @("operation", "details", "created_at_utc")) {
+        if ($Intent.operation -isnot [string] -or
+            [string]$Intent.operation -cne "submit_production_from_savepoint" -or
+            -not (Test-CutoverExactProperties -Record $Intent.details -Names @("name", "savepoint_path")) -or
+            $Intent.details.name -isnot [string] -or [string]$Intent.details.name -cne $ExpectedName -or
+            $Intent.details.savepoint_path -isnot [string] -or
+            -not (Test-CutoverRoundTripTimestamp -Value $Intent.created_at_utc)) {
+            throw $safeError
+        }
+        Assert-CutoverSavepointPath -Path ([string]$Intent.details.savepoint_path) | Out-Null
+        return "legacy"
+    }
+    throw $safeError
+}
+
 function Assert-CutoverProductionSubmitState {
     param(
         [Parameter(Mandatory = $true)][object]$State,
         [Parameter(Mandatory = $true)][string]$ExpectedName
     )
 
-    if (-not (Test-CutoverExactProperties -Record $State -Names @(
-                "schema_version", "kind", "status", "intent", "result"
-            )) -or
-        $State.schema_version -isnot [int] -or [int]$State.schema_version -ne 1 -or
-        $State.kind -isnot [string] -or [string]$State.kind -cne "chapter9_production_submit" -or
-        $State.status -isnot [string]) {
-        throw "Production submission recovery state is unsafe."
-    }
-
-    $status = [string]$State.status
-    if ($status -ceq "not_started") {
-        if ($null -ne $State.intent -or $null -ne $State.result) {
-            throw "Production submission recovery state is unsafe."
+    $safeError = "Production submission recovery state is unsafe."
+    try {
+        if (-not (Test-CutoverExactProperties -Record $State -Names @(
+                    "schema_version", "kind", "status", "intent", "result"
+                )) -or
+            $State.schema_version -isnot [int] -or [int]$State.schema_version -ne 1 -or
+            $State.kind -isnot [string] -or [string]$State.kind -cne "chapter9_production_submit" -or
+            $State.status -isnot [string]) {
+            throw $safeError
         }
-        return
-    }
 
-    if (-not (Test-CutoverExactProperties -Record $State.intent -Names @(
-                "operation", "job_name", "created_at_utc"
-            )) -or
-        $State.intent.operation -isnot [string] -or
-        [string]$State.intent.operation -cne "submit_chapter9_production" -or
-        $State.intent.job_name -isnot [string] -or [string]$State.intent.job_name -cne $ExpectedName -or
-        -not (Test-CutoverRoundTripTimestamp -Value $State.intent.created_at_utc)) {
-        throw "Production submission recovery state is unsafe."
-    }
+        $status = [string]$State.status
+        if ($status -ceq "not_started") {
+            if ($null -ne $State.intent -or $null -ne $State.result) { throw $safeError }
+            return
+        }
 
-    if ($status -ceq "intent") {
-        if ($null -ne $State.result) { throw "Production submission recovery state is unsafe." }
-        return
-    }
+        $intentKind = Get-CutoverProductionSubmitIntentKind -Intent $State.intent -ExpectedName $ExpectedName
+        if ($status -ceq "intent") {
+            if ($null -ne $State.result) { throw $safeError }
+            return
+        }
 
-    $resultNames = if ($status -ceq "result") {
-        @("status", "job_id", "job_name", "completed_at_utc")
-    } elseif ($status -ceq "failed") {
-        @("status", "job_name", "completed_at_utc")
-    } else {
-        throw "Production submission recovery state is unsafe."
+        if ($status -ceq "result" -and $intentKind -ceq "legacy") {
+            if (-not (Test-CutoverExactProperties -Record $State.result -Names @(
+                        "status", "details", "completed_at_utc", "job_id"
+                    )) -or
+                $State.result.status -isnot [string] -or [string]$State.result.status -cne "result" -or
+                -not (Test-CutoverExactProperties -Record $State.result.details -Names @("job_id")) -or
+                $State.result.job_id -isnot [string] -or [string]$State.result.job_id -cnotmatch "^[0-9a-f]{32}$" -or
+                $State.result.details.job_id -isnot [string] -or
+                [string]$State.result.details.job_id -cne [string]$State.result.job_id -or
+                -not (Test-CutoverRoundTripTimestamp -Value $State.result.completed_at_utc)) {
+                throw $safeError
+            }
+        } else {
+            if ($intentKind -cne "canonical") { throw $safeError }
+            $resultNames = if ($status -ceq "result") {
+                @("status", "job_id", "job_name", "completed_at_utc")
+            } elseif ($status -ceq "failed") {
+                @("status", "job_name", "completed_at_utc")
+            } else {
+                throw $safeError
+            }
+            if (-not (Test-CutoverExactProperties -Record $State.result -Names $resultNames) -or
+                $State.result.status -isnot [string] -or [string]$State.result.status -cne $status -or
+                $State.result.job_name -isnot [string] -or [string]$State.result.job_name -cne $ExpectedName -or
+                -not (Test-CutoverRoundTripTimestamp -Value $State.result.completed_at_utc)) {
+                throw $safeError
+            }
+            if ($status -ceq "result" -and
+                ($State.result.job_id -isnot [string] -or [string]$State.result.job_id -cnotmatch "^[0-9a-f]{32}$")) {
+                throw $safeError
+            }
+        }
+
+        $created = [DateTimeOffset]::Parse(
+            [string]$State.intent.created_at_utc,
+            [System.Globalization.CultureInfo]::InvariantCulture
+        )
+        $completed = [DateTimeOffset]::Parse(
+            [string]$State.result.completed_at_utc,
+            [System.Globalization.CultureInfo]::InvariantCulture
+        )
+        if ($completed -lt $created) { throw $safeError }
+    } catch {
+        throw $safeError
     }
-    if (-not (Test-CutoverExactProperties -Record $State.result -Names $resultNames) -or
-        $State.result.status -isnot [string] -or [string]$State.result.status -cne $status -or
-        $State.result.job_name -isnot [string] -or [string]$State.result.job_name -cne $ExpectedName -or
-        -not (Test-CutoverRoundTripTimestamp -Value $State.result.completed_at_utc)) {
-        throw "Production submission recovery state is unsafe."
+}
+
+function Test-CutoverProductionSubmitStatesEquivalent {
+    param(
+        [Parameter(Mandatory = $true)][object]$Left,
+        [Parameter(Mandatory = $true)][object]$Right,
+        [Parameter(Mandatory = $true)][string]$ExpectedName
+    )
+
+    try {
+        Assert-CutoverProductionSubmitState -State $Left -ExpectedName $ExpectedName
+        Assert-CutoverProductionSubmitState -State $Right -ExpectedName $ExpectedName
+        if ([string]$Left.status -cne [string]$Right.status) { return $false }
+        $status = [string]$Left.status
+        if ($status -ceq "not_started") { return $true }
+
+        $leftKind = Get-CutoverProductionSubmitIntentKind -Intent $Left.intent -ExpectedName $ExpectedName
+        $rightKind = Get-CutoverProductionSubmitIntentKind -Intent $Right.intent -ExpectedName $ExpectedName
+        if ($leftKind -cne $rightKind -or
+            [string]$Left.intent.operation -cne [string]$Right.intent.operation -or
+            [string]$Left.intent.created_at_utc -cne [string]$Right.intent.created_at_utc) {
+            return $false
+        }
+        if ($leftKind -ceq "canonical") {
+            if ([string]$Left.intent.job_name -cne [string]$Right.intent.job_name) { return $false }
+        } elseif ([string]$Left.intent.details.name -cne [string]$Right.intent.details.name -or
+            [string]$Left.intent.details.savepoint_path -cne [string]$Right.intent.details.savepoint_path) {
+            return $false
+        }
+        if ($status -ceq "intent") { return $true }
+
+        if ([string]$Left.result.status -cne [string]$Right.result.status -or
+            [string]$Left.result.completed_at_utc -cne [string]$Right.result.completed_at_utc) {
+            return $false
+        }
+        if ($status -ceq "failed") {
+            return [string]$Left.result.job_name -ceq [string]$Right.result.job_name
+        }
+        if ([string]$Left.result.job_id -cne [string]$Right.result.job_id) { return $false }
+        if ($leftKind -ceq "canonical") {
+            return [string]$Left.result.job_name -ceq [string]$Right.result.job_name
+        }
+        return [string]$Left.result.details.job_id -ceq [string]$Right.result.details.job_id
+    } catch {
+        return $false
     }
-    if ($status -ceq "result" -and
-        ($State.result.job_id -isnot [string] -or [string]$State.result.job_id -cnotmatch "^[0-9a-f]{32}$")) {
-        throw "Production submission recovery state is unsafe."
-    }
-    $created = [DateTimeOffset]::Parse([string]$State.intent.created_at_utc, [System.Globalization.CultureInfo]::InvariantCulture)
-    $completed = [DateTimeOffset]::Parse([string]$State.result.completed_at_utc, [System.Globalization.CultureInfo]::InvariantCulture)
-    if ($completed -lt $created) { throw "Production submission recovery state is unsafe." }
 }
 
 function New-CutoverMutationState {
@@ -790,63 +985,86 @@ function ConvertFrom-CutoverLegacyProductionSubmitState {
 
     $safeError = "Production submission recovery state is unsafe."
     try {
-        if (-not (Test-CutoverRecord -Value $Mutation) -or $Mutation.status -isnot [string]) { throw $safeError }
+        if (-not (Test-CutoverExactProperties -Record $Mutation -Names @("status", "intent", "result")) -or
+            $Mutation.status -isnot [string]) {
+            throw $safeError
+        }
         $status = [string]$Mutation.status
+        $projectedId = $Manifest.production_job_id
         if ($status -ceq "not_started") {
-            if ($null -ne $Mutation.intent -or $null -ne $Mutation.result) { throw $safeError }
-            return [pscustomobject]@{
-                schema_version = 1; kind = "chapter9_production_submit"; status = "not_started"
-                intent = $null; result = $null
+            if ($null -ne $Mutation.intent -or $null -ne $Mutation.result -or $null -ne $projectedId) {
+                throw $safeError
+            }
+            return [pscustomobject][ordered]@{
+                schema_version = 1
+                kind = "chapter9_production_submit"
+                status = "not_started"
+                intent = $null
+                result = $null
             }
         }
-        if (-not (Test-CutoverRecord -Value $Mutation.intent) -or
+        if ($status -ceq "failed") { throw $safeError }
+        if ($status -cnotin @("intent", "result") -or
+            -not (Test-CutoverExactProperties -Record $Mutation.intent -Names @(
+                    "operation", "details", "created_at_utc"
+                )) -or
             $Mutation.intent.operation -isnot [string] -or
-            [string]::IsNullOrWhiteSpace([string]$Mutation.intent.operation) -or
-            -not (Test-CutoverRecord -Value $Mutation.intent.details) -or
+            [string]$Mutation.intent.operation -cne "submit_production_from_savepoint" -or
+            -not (Test-CutoverExactProperties -Record $Mutation.intent.details -Names @(
+                    "name", "savepoint_path"
+                )) -or
+            $Mutation.intent.details.name -isnot [string] -or
+            [string]$Mutation.intent.details.name -cne $ExpectedName -or
+            $Mutation.intent.details.savepoint_path -isnot [string] -or
             -not (Test-CutoverRoundTripTimestamp -Value $Mutation.intent.created_at_utc)) {
             throw $safeError
         }
-        $intent = [pscustomobject]@{
-            operation = "submit_chapter9_production"
-            job_name = $ExpectedName
-            created_at_utc = [string]$Mutation.intent.created_at_utc
+        $savepointPath = Assert-CutoverSavepointPath -Path ([string]$Mutation.intent.details.savepoint_path)
+        if ($Manifest.savepoint_path -isnot [string] -or
+            [string]$Manifest.savepoint_path -cne $savepointPath) {
+            throw $safeError
         }
+        $manifestCreated = [DateTimeOffset]::Parse(
+            [string]$Manifest.created_at,
+            [System.Globalization.CultureInfo]::InvariantCulture
+        )
+        $intentCreated = [DateTimeOffset]::Parse(
+            [string]$Mutation.intent.created_at_utc,
+            [System.Globalization.CultureInfo]::InvariantCulture
+        )
+        if ($intentCreated -lt $manifestCreated) { throw $safeError }
+
         if ($status -ceq "intent") {
-            if ($null -ne $Mutation.result) { throw $safeError }
-            return [pscustomobject]@{
-                schema_version = 1; kind = "chapter9_production_submit"; status = "intent"
-                intent = $intent; result = $null
+            if ($null -ne $Mutation.result -or $null -ne $projectedId) { throw $safeError }
+            $state = [pscustomobject][ordered]@{
+                schema_version = 1
+                kind = "chapter9_production_submit"
+                status = "intent"
+                intent = $Mutation.intent
+                result = $null
             }
+            Assert-CutoverProductionSubmitState -State $state -ExpectedName $ExpectedName
+            return $state
         }
-        if ($status -cnotin @("result", "failed") -or
-            -not (Test-CutoverRecord -Value $Mutation.result) -or
-            $Mutation.result.status -isnot [string] -or [string]$Mutation.result.status -cne $status -or
-            -not (Test-CutoverRecord -Value $Mutation.result.details) -or
+
+        if (-not (Test-CutoverExactProperties -Record $Mutation.result -Names @(
+                    "status", "details", "completed_at_utc", "job_id"
+                )) -or
+            $Mutation.result.status -isnot [string] -or [string]$Mutation.result.status -cne "result" -or
+            -not (Test-CutoverExactProperties -Record $Mutation.result.details -Names @("job_id")) -or
+            $Mutation.result.job_id -isnot [string] -or [string]$Mutation.result.job_id -cnotmatch "^[0-9a-f]{32}$" -or
+            $Mutation.result.details.job_id -isnot [string] -or
+            [string]$Mutation.result.details.job_id -cne [string]$Mutation.result.job_id -or
+            $projectedId -isnot [string] -or [string]$projectedId -cne [string]$Mutation.result.job_id -or
             -not (Test-CutoverRoundTripTimestamp -Value $Mutation.result.completed_at_utc)) {
             throw $safeError
         }
-        if ($status -ceq "result") {
-            $jobId = [string]$Mutation.result.job_id
-            if ($Mutation.result.job_id -isnot [string] -or $jobId -cnotmatch "^[0-9a-f]{32}$" -or
-                $Mutation.result.details.job_id -isnot [string] -or
-                [string]$Mutation.result.details.job_id -cne $jobId) {
-                throw $safeError
-            }
-            $projectedId = [string]$Manifest.production_job_id
-            if ($projectedId -and $projectedId -cne $jobId) { throw $safeError }
-            $result = [pscustomobject]@{
-                status = "result"; job_id = $jobId; job_name = $ExpectedName
-                completed_at_utc = [string]$Mutation.result.completed_at_utc
-            }
-        } else {
-            $result = [pscustomobject]@{
-                status = "failed"; job_name = $ExpectedName
-                completed_at_utc = [string]$Mutation.result.completed_at_utc
-            }
-        }
-        $state = [pscustomobject]@{
-            schema_version = 1; kind = "chapter9_production_submit"; status = $status
-            intent = $intent; result = $result
+        $state = [pscustomobject][ordered]@{
+            schema_version = 1
+            kind = "chapter9_production_submit"
+            status = "result"
+            intent = $Mutation.intent
+            result = $Mutation.result
         }
         Assert-CutoverProductionSubmitState -State $state -ExpectedName $ExpectedName
         return $state
@@ -855,49 +1073,96 @@ function ConvertFrom-CutoverLegacyProductionSubmitState {
     }
 }
 
+function Assert-CutoverProductionSubmitManifestEnvelope {
+    param([Parameter(Mandatory = $true)][object]$Manifest)
+
+    $safeError = "Production submission recovery state is unsafe."
+    try {
+        if (-not (Test-CutoverExactProperties -Record $Manifest -Names @(
+                    "schema_version", "cutover_id", "phase", "created_at", "raw_offsets",
+                    "shadow_job_id", "savepoint_path", "production_job_id", "doris_job_id",
+                    "iceberg_job_id", "mutations"
+                )) -or
+            $Manifest.schema_version -isnot [int] -or [int]$Manifest.schema_version -ne 2 -or
+            $Manifest.cutover_id -isnot [string] -or [string]::IsNullOrWhiteSpace([string]$Manifest.cutover_id) -or
+            $Manifest.phase -isnot [string] -or [string]::IsNullOrWhiteSpace([string]$Manifest.phase) -or
+            -not (Test-CutoverRoundTripTimestamp -Value $Manifest.created_at) -or
+            $Manifest.raw_offsets -isnot [System.Collections.IList] -or $Manifest.raw_offsets -is [string] -or
+            @($Manifest.raw_offsets).Count -lt 1 -or
+            $Manifest.shadow_job_id -isnot [string] -or [string]$Manifest.shadow_job_id -cnotmatch "^[0-9a-f]{32}$" -or
+            -not (Test-CutoverRecord -Value $Manifest.mutations)) {
+            throw $safeError
+        }
+        foreach ($offset in @($Manifest.raw_offsets)) {
+            if ($offset -isnot [string] -or [string]::IsNullOrWhiteSpace([string]$offset)) { throw $safeError }
+        }
+        if ($null -ne $Manifest.savepoint_path) {
+            if ($Manifest.savepoint_path -isnot [string]) { throw $safeError }
+            Assert-CutoverSavepointPath -Path ([string]$Manifest.savepoint_path) | Out-Null
+        }
+        foreach ($jobId in @($Manifest.production_job_id, $Manifest.doris_job_id, $Manifest.iceberg_job_id)) {
+            if ($null -ne $jobId -and ($jobId -isnot [string] -or [string]$jobId -cnotmatch "^[0-9a-f]{32}$")) {
+                throw $safeError
+            }
+        }
+    } catch {
+        throw $safeError
+    }
+}
+
+function Remove-CutoverLegacyProductionSubmitProperty {
+    param([Parameter(Mandatory = $true)][object]$Manifest)
+
+    if ($Manifest.mutations -is [System.Collections.IDictionary]) {
+        [void]$Manifest.mutations.Remove("production_submit")
+    } else {
+        $Manifest.mutations.PSObject.Properties.Remove("production_submit")
+    }
+}
+
 function Move-CutoverLegacyProductionSubmitState {
     param(
-        [Parameter(Mandatory = $true)][object]$Manifest,
         [Parameter(Mandatory = $true)][string]$ManifestPath,
         [Parameter(Mandatory = $true)][string]$ProductionStatePath,
+        [AllowNull()][object]$CanonicalState,
+        [AllowNull()][object]$LegacyStateProjection,
         [Parameter(Mandatory = $true)][string]$ExpectedName
     )
 
     $safeError = "Production submission recovery state is unsafe."
     try {
-        if (-not (Test-CutoverRecord -Value $Manifest.mutations)) { throw $safeError }
-        $legacyProperty = if ($Manifest.mutations -is [System.Collections.IDictionary]) {
-            if ($Manifest.mutations.Contains("production_submit")) { $Manifest.mutations["production_submit"] } else { $null }
-        } else {
-            $property = $Manifest.mutations.PSObject.Properties["production_submit"]
-            if ($null -ne $property) { $property.Value } else { $null }
-        }
-        if ($null -eq $legacyProperty) { return }
+        if (-not (Test-Path -LiteralPath $ManifestPath)) { return $CanonicalState }
+        if (-not (Test-Path -LiteralPath $ManifestPath -PathType Leaf)) { throw $safeError }
+        $manifest = Get-Content -LiteralPath $ManifestPath -Raw -Encoding UTF8 | ConvertFrom-Json -ErrorAction Stop
+        Assert-CutoverProductionSubmitManifestEnvelope -Manifest $manifest
 
-        $mapped = ConvertFrom-CutoverLegacyProductionSubmitState -Mutation $legacyProperty `
-            -Manifest $Manifest -ExpectedName $ExpectedName
-        if (Test-Path -LiteralPath $ProductionStatePath -PathType Leaf) {
-            $existing = Get-Content -LiteralPath $ProductionStatePath -Raw -Encoding UTF8 | ConvertFrom-Json -ErrorAction Stop
-            Assert-CutoverProductionSubmitState -State $existing -ExpectedName $ExpectedName
-            if ([string]$existing.status -cne [string]$mapped.status -or
-                [string]$existing.intent.created_at_utc -cne [string]$mapped.intent.created_at_utc -or
-                [string]$existing.result.status -cne [string]$mapped.result.status -or
-                [string]$existing.result.job_id -cne [string]$mapped.result.job_id -or
-                [string]$existing.result.completed_at_utc -cne [string]$mapped.result.completed_at_utc) {
+        $currentNames = @("shadow_stop", "doris_submit", "iceberg_submit", "finalization")
+        $legacyNames = @("shadow_stop", "production_submit", "doris_submit", "iceberg_submit", "finalization")
+        if (Test-CutoverExactProperties -Record $manifest.mutations -Names $currentNames) {
+            return $CanonicalState
+        }
+        if (-not (Test-CutoverExactProperties -Record $manifest.mutations -Names $legacyNames)) {
+            throw $safeError
+        }
+
+        $mapped = ConvertFrom-CutoverLegacyProductionSubmitState `
+            -Mutation $manifest.mutations.production_submit -Manifest $manifest -ExpectedName $ExpectedName
+        if ($null -ne $CanonicalState) {
+            if (-not (Test-CutoverProductionSubmitStatesEquivalent `
+                    -Left $CanonicalState -Right $mapped -ExpectedName $ExpectedName)) {
                 throw $safeError
             }
-        } elseif (Test-Path -LiteralPath $ProductionStatePath) {
-            throw $safeError
         } else {
             Write-CutoverProductionSubmitStateAtomic -State $mapped -Path $ProductionStatePath
+            $CanonicalState = $mapped
         }
 
-        if ($Manifest.mutations -is [System.Collections.IDictionary]) {
-            $Manifest.mutations.Remove("production_submit")
-        } else {
-            $Manifest.mutations.PSObject.Properties.Remove("production_submit")
+        Remove-CutoverLegacyProductionSubmitProperty -Manifest $manifest
+        Write-CutoverStateAtomic -State $manifest -Path $ManifestPath
+        if ($null -ne $LegacyStateProjection) {
+            Remove-CutoverLegacyProductionSubmitProperty -Manifest $LegacyStateProjection
         }
-        Write-CutoverStateAtomic -State $Manifest -Path $ManifestPath
+        return $CanonicalState
     } catch {
         throw $safeError
     }
@@ -908,6 +1173,8 @@ function Invoke-CutoverProductionSubmitBoundary {
         [Parameter(Mandatory = $true)][string]$Path,
         [Parameter(Mandatory = $true)][object]$Jobs,
         [Parameter(Mandatory = $true)][string]$ExpectedName,
+        [string]$LegacyStatePath,
+        [AllowNull()][object]$LegacyStateProjection,
         [Parameter(Mandatory = $true)][scriptblock]$Action
     )
 
@@ -927,8 +1194,17 @@ function Invoke-CutoverProductionSubmitBoundary {
         } elseif (Test-Path -LiteralPath $Path) {
             throw $safeError
         } else {
-            New-CutoverProductionSubmitState -Path $Path
+            $null
         }
+        if ($null -ne $state) {
+            Assert-CutoverProductionSubmitState -State $state -ExpectedName $ExpectedName
+        }
+        if ($PSBoundParameters.ContainsKey("LegacyStatePath")) {
+            $state = Move-CutoverLegacyProductionSubmitState -ManifestPath $LegacyStatePath `
+                -ProductionStatePath $Path -CanonicalState $state `
+                -LegacyStateProjection $LegacyStateProjection -ExpectedName $ExpectedName
+        }
+        if ($null -eq $state) { $state = New-CutoverProductionSubmitState -Path $Path }
         Assert-CutoverProductionSubmitState -State $state -ExpectedName $ExpectedName
         $status = [string]$state.status
         if ($status -ceq "intent" -or $status -ceq "failed") { throw $safeError }
@@ -1000,6 +1276,7 @@ function Invoke-CutoverProductionSubmitBoundary {
 function Invoke-CutoverProductionSubmitStage {
     param(
         [Parameter(Mandatory = $true)][string]$RepositoryRoot,
+        [string]$StateRoot,
         [Parameter(Mandatory = $true)][object]$Jobs,
         [Parameter(Mandatory = $true)][string]$ExpectedName,
         [object]$CutoverState,
@@ -1007,16 +1284,22 @@ function Invoke-CutoverProductionSubmitStage {
         [Parameter(Mandatory = $true)][scriptblock]$Action
     )
 
-    $statePath = Get-CutoverProductionSubmitStatePath -RepositoryRoot $RepositoryRoot
-    if (($null -eq $CutoverState) -ne [string]::IsNullOrWhiteSpace($CutoverStatePath)) {
+    if ($null -ne $CutoverState -and [string]::IsNullOrWhiteSpace($CutoverStatePath)) {
         throw "Production submission recovery state is unsafe."
     }
-    if ($null -ne $CutoverState) {
-        Move-CutoverLegacyProductionSubmitState -Manifest $CutoverState `
-            -ManifestPath $CutoverStatePath -ProductionStatePath $statePath -ExpectedName $ExpectedName
+    $statePathArguments = @{ RepositoryRoot = $RepositoryRoot }
+    if ($PSBoundParameters.ContainsKey("StateRoot")) {
+        $statePathArguments["StateRoot"] = $StateRoot
     }
+    $statePath = Get-CutoverProductionSubmitStatePath @statePathArguments
+    $legacyPathArguments = @{ RepositoryRoot = $RepositoryRoot }
+    if (-not [string]::IsNullOrWhiteSpace($CutoverStatePath)) {
+        $legacyPathArguments["Path"] = $CutoverStatePath
+    }
+    $legacyStatePath = Get-CutoverLegacyProductionSubmitStatePath @legacyPathArguments
     return Invoke-CutoverProductionSubmitBoundary -Path $statePath -Jobs $Jobs `
-        -ExpectedName $ExpectedName -Action $Action
+        -ExpectedName $ExpectedName -LegacyStatePath $legacyStatePath `
+        -LegacyStateProjection $CutoverState -Action $Action
 }
 
 function Complete-CutoverManifest {

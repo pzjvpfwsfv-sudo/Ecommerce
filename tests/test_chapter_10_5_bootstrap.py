@@ -27,6 +27,32 @@ class Chapter105BootstrapTest(unittest.TestCase):
         self.assertEqual(0, result.returncode, result.stderr or result.stdout)
         return json.loads(result.stdout.strip().splitlines()[-1])
 
+    def _run_git(self, cwd, *arguments):
+        result = subprocess.run(
+            ["git", *arguments],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+        self.assertEqual(0, result.returncode, result.stderr or result.stdout)
+        return result.stdout.strip()
+
+    def _create_linked_worktrees(self, directory, name):
+        primary = Path(directory) / f"{name}-primary"
+        bootstrap_worktree = Path(directory) / f"{name}-bootstrap"
+        task4_worktree = Path(directory) / f"{name}-task4"
+        primary.mkdir()
+        self._run_git(primary, "init")
+        self._run_git(primary, "config", "user.email", "task9@example.invalid")
+        self._run_git(primary, "config", "user.name", "Task 9 Test")
+        self._run_git(primary, "commit", "--allow-empty", "-m", "fixture")
+        self._run_git(primary, "worktree", "add", "-b", "bootstrap", bootstrap_worktree)
+        self._run_git(primary, "worktree", "add", "-b", "task4", task4_worktree)
+        return primary, bootstrap_worktree, task4_worktree
+
     def test_functions_only_parses_env_and_rejects_duplicate_or_empty_keys(self):
         with tempfile.TemporaryDirectory() as directory:
             env_file = Path(directory) / ".env"
@@ -63,6 +89,907 @@ $path = Get-Chapter105StableMinioDataPath -RepositoryRoot $root
         self.assertEqual(str(expected_root), payload["root"])
         self.assertEqual(str(expected_root / "infra" / "compose" / "minio" / "data"), payload["path"])
         self.assertFalse(payload["inside_worktree"])
+
+    def test_linked_worktree_defaults_share_primary_production_state_and_lock(self):
+        with tempfile.TemporaryDirectory() as directory:
+            primary, bootstrap_worktree, task4_worktree = self._create_linked_worktrees(
+                directory, "roots"
+            )
+            for root in (primary, bootstrap_worktree, task4_worktree):
+                (root / "tmp" / "chapter-9").mkdir(parents=True)
+            payload = self._powershell_payload(
+                rf'''
+. "scripts/bootstrap_chapter_10_5.ps1" -FunctionsOnly
+. "scripts/run_chapter_9_production_cutover.ps1" -FunctionsOnly
+$bootstrapState = Get-CutoverProductionSubmitStatePath -RepositoryRoot "{bootstrap_worktree}"
+$task4State = Get-CutoverProductionSubmitStatePath -RepositoryRoot "{task4_worktree}"
+[ordered]@{{
+    bootstrap_state = $bootstrapState
+    task4_state = $task4State
+    bootstrap_lock = "$bootstrapState.lock"
+    task4_lock = "$task4State.lock"
+}} | ConvertTo-Json -Compress
+'''
+            )
+
+            expected_state = primary / "tmp" / "chapter-9" / "production-submit-state.json"
+            expected_directory = expected_state.parent
+            self.assertEqual("production-submit-state.json", Path(payload["bootstrap_state"]).name)
+            self.assertEqual("production-submit-state.json", Path(payload["task4_state"]).name)
+            self.assertEqual("production-submit-state.json.lock", Path(payload["bootstrap_lock"]).name)
+            self.assertEqual("production-submit-state.json.lock", Path(payload["task4_lock"]).name)
+            self.assertTrue(
+                os.path.samefile(expected_directory, Path(payload["bootstrap_state"]).parent)
+            )
+            self.assertTrue(
+                os.path.samefile(expected_directory, Path(payload["task4_state"]).parent)
+            )
+            self.assertTrue(
+                os.path.samefile(expected_directory, Path(payload["bootstrap_lock"]).parent)
+            )
+            self.assertTrue(
+                os.path.samefile(expected_directory, Path(payload["task4_lock"]).parent)
+            )
+
+    def test_explicit_state_root_is_absolute_fixed_and_reparse_safe(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repository = root / "repository"
+            state_root = root / "isolated-state"
+            outside = root / "outside"
+            junction = root / "state-junction"
+            state_file = root / "state-file"
+            for path in (repository, state_root, outside):
+                path.mkdir()
+            state_file.write_text("not a directory", encoding="utf-8")
+            payload = self._powershell_payload(
+                rf'''
+. "scripts/run_chapter_9_production_cutover.ps1" -FunctionsOnly
+New-Item -ItemType Junction -Path "{junction}" -Target "{outside}" | Out-Null
+$valid = Get-CutoverProductionSubmitStatePath -RepositoryRoot "{repository}" -StateRoot "{state_root}"
+$relativeRejected = $false
+$junctionRejected = $false
+$nestedJunctionRejected = $false
+$fileRejected = $false
+try {{
+    Get-CutoverProductionSubmitStatePath -RepositoryRoot "{repository}" -StateRoot "relative-state" | Out-Null
+}} catch {{ $relativeRejected = $_.Exception.Message -ceq "Production submission recovery state is unsafe." }}
+try {{
+    Get-CutoverProductionSubmitStatePath -RepositoryRoot "{repository}" -StateRoot "{junction}" | Out-Null
+}} catch {{ $junctionRejected = $_.Exception.Message -ceq "Production submission recovery state is unsafe." }}
+New-Item -ItemType Junction -Path (Join-Path "{state_root}" "tmp") -Target "{outside}" | Out-Null
+try {{
+    Get-CutoverProductionSubmitStatePath -RepositoryRoot "{repository}" -StateRoot "{state_root}" | Out-Null
+}} catch {{ $nestedJunctionRejected = $_.Exception.Message -ceq "Production submission recovery state is unsafe." }}
+try {{
+    Get-CutoverProductionSubmitStatePath -RepositoryRoot "{repository}" -StateRoot "{state_file}" | Out-Null
+}} catch {{ $fileRejected = $_.Exception.Message -ceq "Production submission recovery state is unsafe." }}
+[ordered]@{{
+    valid = $valid
+    relative_rejected = $relativeRejected
+    junction_rejected = $junctionRejected
+    nested_junction_rejected = $nestedJunctionRejected
+    file_rejected = $fileRejected
+}} | ConvertTo-Json -Compress
+'''
+            )
+
+            valid_path = Path(payload["valid"])
+            self.assertEqual(
+                ("tmp", "chapter-9", "production-submit-state.json"),
+                tuple(valid_path.parts[-3:]),
+            )
+            self.assertTrue(os.path.samefile(state_root, valid_path.parents[2]))
+            self.assertTrue(payload["relative_rejected"])
+            self.assertTrue(payload["junction_rejected"])
+            self.assertTrue(payload["nested_junction_rejected"])
+            self.assertTrue(payload["file_rejected"])
+
+    def test_linked_worktree_production_orchestrators_share_defaults_in_both_orders(self):
+        with tempfile.TemporaryDirectory() as directory:
+            first_primary, first_bootstrap, first_task4 = self._create_linked_worktrees(
+                directory, "bootstrap-first"
+            )
+            second_primary, second_bootstrap, second_task4 = self._create_linked_worktrees(
+                directory, "task4-first"
+            )
+            payload = self._powershell_payload(
+                rf'''
+. "scripts/bootstrap_chapter_10_5.ps1" -FunctionsOnly
+. "scripts/run_chapter_9_production_cutover.ps1" -FunctionsOnly
+$name = "chapter-9-datastream-quality-production"
+$emptyJobs = [pscustomobject]@{{ jobs = @() }}
+$script:mutations = 0
+$errors = @()
+
+$bootstrapFirst = Invoke-Chapter105JobsStage -RepositoryRoot "{first_bootstrap}" `
+    -Overview $emptyJobs -JobName $name -SavepointUri "s3a://flink-state/savepoints/chapter-9" `
+    -SubmitAction {{
+        param($savepointPath)
+        $script:mutations++
+        [pscustomobject]@{{ job_id = "33333333333333333333333333333333" }}
+    }}
+$firstRunning = [pscustomobject]@{{ jobs = @(
+    [pscustomobject]@{{ jid = $bootstrapFirst.job_id; name = $name; state = "RUNNING" }}
+) }}
+$task4AfterBootstrap = $null
+try {{
+    $task4AfterBootstrap = Invoke-CutoverProductionSubmitStage -RepositoryRoot "{first_task4}" `
+        -Jobs $firstRunning -ExpectedName $name -Action {{
+            $script:mutations++
+            [pscustomobject]@{{ job_id = "ffffffffffffffffffffffffffffffff" }}
+        }}
+}} catch {{ $errors += $_.Exception.Message }}
+
+$task4First = Invoke-CutoverProductionSubmitStage -RepositoryRoot "{second_task4}" `
+    -Jobs $emptyJobs -ExpectedName $name -Action {{
+        $script:mutations++
+        [pscustomobject]@{{ job_id = "44444444444444444444444444444444" }}
+    }}
+$secondRunning = [pscustomobject]@{{ jobs = @(
+    [pscustomobject]@{{ jid = $task4First.job_id; name = $name; state = "RUNNING" }}
+) }}
+$bootstrapAfterTask4 = $null
+try {{
+    $bootstrapAfterTask4 = Invoke-Chapter105JobsStage -RepositoryRoot "{second_bootstrap}" `
+        -Overview $secondRunning -JobName $name -SavepointUri "s3a://flink-state/savepoints/chapter-9" `
+        -SubmitAction {{
+            param($savepointPath)
+            $script:mutations++
+            [pscustomobject]@{{ job_id = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee" }}
+        }}
+}} catch {{ $errors += $_.Exception.Message }}
+
+[ordered]@{{
+    errors = $errors
+    mutations = $script:mutations
+    bootstrap_first_action = $bootstrapFirst.action
+    task4_after_bootstrap_action = if ($null -ne $task4AfterBootstrap) {{ $task4AfterBootstrap.action }} else {{ $null }}
+    task4_first_action = $task4First.action
+    bootstrap_after_task4_action = if ($null -ne $bootstrapAfterTask4) {{ $bootstrapAfterTask4.action }} else {{ $null }}
+    first_state = Get-CutoverProductionSubmitStatePath -RepositoryRoot "{first_task4}"
+    second_state = Get-CutoverProductionSubmitStatePath -RepositoryRoot "{second_bootstrap}"
+}} | ConvertTo-Json -Depth 4 -Compress
+'''
+            )
+
+            self.assertEqual([], payload["errors"])
+            self.assertEqual(2, payload["mutations"])
+            self.assertEqual("submitted", payload["bootstrap_first_action"])
+            self.assertEqual("no_op", payload["task4_after_bootstrap_action"])
+            self.assertEqual("submitted", payload["task4_first_action"])
+            self.assertEqual("no_op", payload["bootstrap_after_task4_action"])
+            self.assertTrue(
+                os.path.samefile(
+                    first_primary / "tmp" / "chapter-9" / "production-submit-state.json",
+                    payload["first_state"],
+                )
+            )
+            self.assertTrue(
+                os.path.samefile(
+                    second_primary / "tmp" / "chapter-9" / "production-submit-state.json",
+                    payload["second_state"],
+                )
+            )
+
+    def test_bootstrap_orchestrator_passes_its_worktree_to_shared_jobs_boundary(self):
+        payload = self._powershell_payload(
+            r'''
+. "scripts/bootstrap_chapter_10_5.ps1" -FunctionsOnly
+$primaryRoot = Get-Chapter105PrimaryRepositoryRoot -StartPath (Get-Location)
+$worktreeRoot = (Resolve-Path ".").Path
+$script:capturedRoot = $null
+function Get-Chapter105PrimaryRepositoryRoot { param($StartPath) return $primaryRoot }
+function Resolve-Chapter105RepositoryPath {
+    param($RepositoryRoot, $Path, $AllowedRelativeRoot)
+    return [System.IO.Path]::GetFullPath((Join-Path $RepositoryRoot $Path))
+}
+function Assert-Chapter105ReportPathWritable { param($Path) }
+function Read-Chapter105EnvFile {
+    param($Path)
+    return [ordered]@{
+        FLINK_REST_PORT = "8081"
+        API_PORT = "8000"
+        FLINK_CHECKPOINT_MAX_AGE_SECONDS = "300"
+        CHAPTER9_CHECKPOINT_URI = "s3a://flink-state/checkpoints/chapter-9"
+        CHAPTER9_SAVEPOINT_URI = "s3a://flink-state/savepoints/chapter-9"
+    }
+}
+function Get-Chapter105StableMinioDataPath { param($RepositoryRoot) return (Join-Path $RepositoryRoot "infra/compose/minio/data") }
+function Assert-Chapter105Preflight { param($RepositoryRoot, $Environment) }
+function Invoke-Chapter105Native { param($FilePath, $Arguments, $FailureMessage) return @() }
+function Wait-Chapter105ComposeReady { param($ComposePrefix) }
+function Invoke-Chapter105FlinkOverview { param($Port) return [pscustomobject]@{ jobs = @() } }
+function Invoke-Chapter105JobsStage {
+    param($RepositoryRoot, $StateRoot, $Overview, $JobName, $SavepointUri, $SubmitAction)
+    $script:capturedRoot = $RepositoryRoot
+    throw "stop-after-capture"
+}
+function Write-Chapter105BootstrapReport { param($Report, $Path) }
+$errorMessage = $null
+try { Invoke-Chapter105Bootstrap } catch { $errorMessage = $_.Exception.Message }
+[ordered]@{
+    captured_root = $script:capturedRoot
+    primary_root = $primaryRoot
+    worktree_root = $worktreeRoot
+    error = $errorMessage
+} | ConvertTo-Json -Compress
+'''
+        )
+
+        self.assertTrue(os.path.samefile(ROOT, payload["captured_root"]))
+        self.assertTrue(os.path.samefile(ROOT.parent.parent, payload["primary_root"]))
+        self.assertNotEqual(
+            os.path.normcase(payload["primary_root"]),
+            os.path.normcase(payload["worktree_root"]),
+        )
+        self.assertEqual(
+            "Chapter 10.5 bootstrap failed. See the bootstrap report for safe stage status.",
+            payload["error"],
+        )
+
+    def test_legacy_migration_waits_for_state_lock_and_never_overwrites_result(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _, _, task4_worktree = self._create_linked_worktrees(directory, "interleaved")
+            partial = task4_worktree / "tmp" / "chapter-9" / "cutover-manifest.json.partial"
+            started = Path(directory) / "migration-started.txt"
+            action_log = Path(directory) / "actions.txt"
+            payload = self._powershell_payload(
+                rf'''
+. "scripts/run_chapter_9_production_cutover.ps1" -FunctionsOnly
+$task4Script = (Resolve-Path "scripts/run_chapter_9_production_cutover.ps1").Path
+$name = "chapter-9-datastream-quality-production"
+$legacyJobId = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+$canonicalJobId = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+$created = "2026-08-25T00:01:00.0000000+00:00"
+$completed = "2026-08-25T00:02:00.0000000+00:00"
+$partialPath = "{partial}"
+$statePath = Get-CutoverProductionSubmitStatePath -RepositoryRoot "{task4_worktree}"
+$legacy = [ordered]@{{
+    schema_version = 2
+    cutover_id = "interleaved-cutover"
+    phase = "production_submit"
+    created_at = "2026-08-25T00:00:00.0000000+00:00"
+    raw_offsets = @("partition:0,offset:42")
+    shadow_job_id = "11111111111111111111111111111111"
+    savepoint_path = "s3a://flink-state/savepoints/chapter-9/savepoint-fixed"
+    production_job_id = $legacyJobId
+    doris_job_id = $null
+    iceberg_job_id = $null
+    mutations = [ordered]@{{
+        shadow_stop = [ordered]@{{ status = "result"; intent = @{{}}; result = @{{}} }}
+        production_submit = [ordered]@{{
+            status = "result"
+            intent = [ordered]@{{
+                operation = "submit_production_from_savepoint"
+                details = [ordered]@{{
+                    name = $name
+                    savepoint_path = "s3a://flink-state/savepoints/chapter-9/savepoint-fixed"
+                }}
+                created_at_utc = $created
+            }}
+            result = [ordered]@{{
+                status = "result"
+                details = [ordered]@{{ job_id = $legacyJobId }}
+                completed_at_utc = $completed
+                job_id = $legacyJobId
+            }}
+        }}
+        doris_submit = [ordered]@{{ status = "not_started"; intent = $null; result = $null }}
+        iceberg_submit = [ordered]@{{ status = "not_started"; intent = $null; result = $null }}
+        finalization = [ordered]@{{ status = "not_started"; intent = $null; result = $null }}
+    }}
+}}
+Write-CutoverStateAtomic -State $legacy -Path $partialPath
+New-Item -ItemType Directory -Force -Path (Split-Path -Parent $statePath) | Out-Null
+$lock = [System.IO.File]::Open(
+    "$statePath.lock",
+    [System.IO.FileMode]::OpenOrCreate,
+    [System.IO.FileAccess]::ReadWrite,
+    [System.IO.FileShare]::None
+)
+$job = Start-Job -ScriptBlock {{
+    param($scriptPath, $repositoryRoot, $manifestPath, $startedPath, $actionPath, $jobName, $runningId)
+    . $scriptPath -FunctionsOnly
+    [System.IO.File]::WriteAllText($startedPath, "started")
+    $manifest = Get-Content -LiteralPath $manifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    $running = [pscustomobject]@{{ jobs = @(
+        [pscustomobject]@{{ jid = $runningId; name = $jobName; state = "RUNNING" }}
+    ) }}
+    try {{
+        Invoke-CutoverProductionSubmitStage -RepositoryRoot $repositoryRoot -Jobs $running `
+            -ExpectedName $jobName -CutoverState $manifest -CutoverStatePath $manifestPath -Action {{
+                [System.IO.File]::AppendAllText($actionPath, "mutation`n")
+                [pscustomobject]@{{ job_id = "cccccccccccccccccccccccccccccccc" }}
+            }} | Out-Null
+        "NO_ERROR"
+    }} catch {{
+        $_.Exception.Message
+    }}
+}} -ArgumentList $task4Script, "{task4_worktree}", $partialPath, "{started}", "{action_log}", $name, $canonicalJobId
+
+try {{
+    for ($attempt = 0; $attempt -lt 100 -and -not (Test-Path -LiteralPath "{started}"); $attempt++) {{
+        Start-Sleep -Milliseconds 25
+    }}
+    if (-not (Test-Path -LiteralPath "{started}")) {{ throw "Migration worker did not start." }}
+    for ($attempt = 0; $attempt -lt 40 -and -not (Test-Path -LiteralPath $statePath); $attempt++) {{
+        Start-Sleep -Milliseconds 25
+    }}
+    $stateBeforeRelease = Test-Path -LiteralPath $statePath
+    $canonical = [ordered]@{{
+        schema_version = 1
+        kind = "chapter9_production_submit"
+        status = "result"
+        intent = [ordered]@{{
+            operation = "submit_chapter9_production"
+            job_name = $name
+            created_at_utc = $created
+        }}
+        result = [ordered]@{{
+            status = "result"
+            job_id = $canonicalJobId
+            job_name = $name
+            completed_at_utc = $completed
+        }}
+    }}
+    Write-CutoverProductionSubmitStateAtomic -State $canonical -Path $statePath
+}} finally {{
+    $lock.Dispose()
+}}
+$null = Wait-Job -Job $job -Timeout 10
+$childOutcome = @((Receive-Job -Job $job))[-1]
+Remove-Job -Job $job -Force
+$saved = Get-Content -LiteralPath $statePath -Raw -Encoding UTF8 | ConvertFrom-Json
+$legacyAfter = Get-Content -LiteralPath $partialPath -Raw -Encoding UTF8 | ConvertFrom-Json
+$actionCount = if (Test-Path -LiteralPath "{action_log}") {{
+    @(Get-Content -LiteralPath "{action_log}").Count
+}} else {{ 0 }}
+[ordered]@{{
+    state_existed_before_release = $stateBeforeRelease
+    child_outcome = [string]$childOutcome
+    canonical_job_id = [string]$saved.result.job_id
+    legacy_preserved = $null -ne $legacyAfter.mutations.PSObject.Properties["production_submit"]
+    mutations = $actionCount
+}} | ConvertTo-Json -Compress
+'''
+            )
+
+        self.assertFalse(payload["state_existed_before_release"])
+        self.assertEqual(
+            "Production submission recovery state is unsafe.", payload["child_outcome"]
+        )
+        self.assertEqual("b" * 32, payload["canonical_job_id"])
+        self.assertTrue(payload["legacy_preserved"])
+        self.assertLessEqual(payload["mutations"], 1)
+
+    def test_both_entries_migrate_only_an_exact_complete_legacy_result(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for entry in ("bootstrap", "task4"):
+                (root / entry).mkdir()
+                (root / f"{entry}-state").mkdir()
+            payload = self._powershell_payload(
+                rf'''
+. "scripts/bootstrap_chapter_10_5.ps1" -FunctionsOnly
+. "scripts/run_chapter_9_production_cutover.ps1" -FunctionsOnly
+$name = "chapter-9-datastream-quality-production"
+$jobId = "99999999999999999999999999999999"
+$created = "2026-08-25T00:01:00.0000000+00:00"
+$completed = "2026-08-25T00:02:00.0000000+00:00"
+$savepoint = "s3a://flink-state/savepoints/chapter-9/savepoint-fixed"
+$script:mutations = 0
+$records = @()
+$running = [pscustomobject]@{{ jobs = @(
+    [pscustomobject]@{{ jid = $jobId; name = $name; state = "RUNNING" }}
+) }}
+foreach ($entry in @("bootstrap", "task4")) {{
+    $repositoryRoot = Join-Path "{root}" $entry
+    $stateRoot = Join-Path "{root}" "$entry-state"
+    $partialPath = Join-Path $repositoryRoot "tmp/chapter-9/cutover-manifest.json.partial"
+    $legacy = [ordered]@{{
+        schema_version = 2
+        cutover_id = "legacy-$entry"
+        phase = "production_submit"
+        created_at = "2026-08-25T00:00:00.0000000+00:00"
+        raw_offsets = @("partition:0,offset:42")
+        shadow_job_id = "11111111111111111111111111111111"
+        savepoint_path = $savepoint
+        production_job_id = $jobId
+        doris_job_id = $null
+        iceberg_job_id = $null
+        mutations = [ordered]@{{
+            shadow_stop = [ordered]@{{ status = "result"; intent = @{{}}; result = @{{}} }}
+            production_submit = [ordered]@{{
+                status = "result"
+                intent = [ordered]@{{
+                    operation = "submit_production_from_savepoint"
+                    details = [ordered]@{{ name = $name; savepoint_path = $savepoint }}
+                    created_at_utc = $created
+                }}
+                result = [ordered]@{{
+                    status = "result"
+                    details = [ordered]@{{ job_id = $jobId }}
+                    completed_at_utc = $completed
+                    job_id = $jobId
+                }}
+            }}
+            doris_submit = [ordered]@{{ status = "not_started"; intent = $null; result = $null }}
+            iceberg_submit = [ordered]@{{ status = "not_started"; intent = $null; result = $null }}
+            finalization = [ordered]@{{ status = "not_started"; intent = $null; result = $null }}
+        }}
+    }}
+    Write-CutoverStateAtomic -State $legacy -Path $partialPath
+    $result = $null
+    $errorMessage = $null
+    try {{
+        if ($entry -ceq "bootstrap") {{
+            $result = Invoke-Chapter105JobsStage -RepositoryRoot $repositoryRoot -StateRoot $stateRoot `
+                -Overview $running -JobName $name -SavepointUri "s3a://flink-state/savepoints/chapter-9" `
+                -SubmitAction {{
+                    param($savepointPath)
+                    $script:mutations++
+                    [pscustomobject]@{{ job_id = "ffffffffffffffffffffffffffffffff" }}
+                }}
+        }} else {{
+            $result = Invoke-CutoverProductionSubmitStage -RepositoryRoot $repositoryRoot -StateRoot $stateRoot `
+                -Jobs $running -ExpectedName $name -CutoverState $legacy -CutoverStatePath $partialPath `
+                -Action {{
+                    $script:mutations++
+                    [pscustomobject]@{{ job_id = "ffffffffffffffffffffffffffffffff" }}
+                }}
+        }}
+    }} catch {{ $errorMessage = $_.Exception.Message }}
+    $statePath = Join-Path $stateRoot "tmp/chapter-9/production-submit-state.json"
+    $canonical = if (Test-Path -LiteralPath $statePath -PathType Leaf) {{
+        Get-Content -LiteralPath $statePath -Raw -Encoding UTF8 | ConvertFrom-Json
+    }} else {{ $null }}
+    $legacyAfter = Get-Content -LiteralPath $partialPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    $records += [pscustomobject]@{{
+        entry = $entry
+        error = $errorMessage
+        action = if ($null -ne $result) {{ $result.action }} else {{ $null }}
+        job_id = if ($null -ne $result) {{ $result.job_id }} else {{ $null }}
+        canonical_status = if ($null -ne $canonical) {{ $canonical.status }} else {{ $null }}
+        operation = if ($null -ne $canonical) {{ $canonical.intent.operation }} else {{ $null }}
+        detail_names = if ($null -ne $canonical) {{ @($canonical.intent.details.PSObject.Properties.Name) }} else {{ @() }}
+        detail_name = if ($null -ne $canonical) {{ $canonical.intent.details.name }} else {{ $null }}
+        detail_savepoint = if ($null -ne $canonical) {{ $canonical.intent.details.savepoint_path }} else {{ $null }}
+        result_detail_names = if ($null -ne $canonical) {{ @($canonical.result.details.PSObject.Properties.Name) }} else {{ @() }}
+        result_detail_job_id = if ($null -ne $canonical) {{ $canonical.result.details.job_id }} else {{ $null }}
+        legacy_removed = $null -eq $legacyAfter.mutations.PSObject.Properties["production_submit"]
+        lock_exists = Test-Path -LiteralPath "$statePath.lock" -PathType Leaf
+    }}
+}}
+[ordered]@{{ mutations = $script:mutations; records = $records }} | ConvertTo-Json -Depth 8 -Compress
+'''
+            )
+
+        self.assertEqual(0, payload["mutations"])
+        self.assertEqual(2, len(payload["records"]))
+        for record in payload["records"]:
+            self.assertIsNone(record["error"])
+            self.assertEqual("no_op", record["action"])
+            self.assertEqual("9" * 32, record["job_id"])
+            self.assertEqual("result", record["canonical_status"])
+            self.assertEqual("submit_production_from_savepoint", record["operation"])
+            self.assertEqual(["name", "savepoint_path"], record["detail_names"])
+            self.assertEqual("chapter-9-datastream-quality-production", record["detail_name"])
+            self.assertEqual(
+                "s3a://flink-state/savepoints/chapter-9/savepoint-fixed",
+                record["detail_savepoint"],
+            )
+            self.assertEqual("job_id", record["result_detail_names"])
+            self.assertEqual("9" * 32, record["result_detail_job_id"])
+            self.assertTrue(record["legacy_removed"])
+            self.assertTrue(record["lock_exists"])
+
+    def test_equivalent_interrupted_migration_ignores_property_order_without_rewrite(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repository = root / "repository"
+            state_root = root / "state"
+            repository.mkdir()
+            state_root.mkdir()
+            payload = self._powershell_payload(
+                rf'''
+. "scripts/run_chapter_9_production_cutover.ps1" -FunctionsOnly
+$name = "chapter-9-datastream-quality-production"
+$jobId = "99999999999999999999999999999999"
+$savepoint = "s3a://flink-state/savepoints/chapter-9/savepoint-fixed"
+$created = "2026-08-25T00:01:00.0000000+00:00"
+$completed = "2026-08-25T00:02:00.0000000+00:00"
+$partialPath = Join-Path "{repository}" "tmp/chapter-9/cutover-manifest.json.partial"
+$statePath = Get-CutoverProductionSubmitStatePath -RepositoryRoot "{repository}" -StateRoot "{state_root}"
+$legacy = [ordered]@{{
+    schema_version = 2
+    cutover_id = "interrupted-migration"
+    phase = "production_submit"
+    created_at = "2026-08-25T00:00:00.0000000+00:00"
+    raw_offsets = @("partition:0,offset:42")
+    shadow_job_id = "11111111111111111111111111111111"
+    savepoint_path = $savepoint
+    production_job_id = $jobId
+    doris_job_id = $null
+    iceberg_job_id = $null
+    mutations = [ordered]@{{
+        shadow_stop = [ordered]@{{ status = "result"; intent = @{{}}; result = @{{}} }}
+        production_submit = [ordered]@{{
+            status = "result"
+            intent = [ordered]@{{
+                operation = "submit_production_from_savepoint"
+                details = [ordered]@{{ name = $name; savepoint_path = $savepoint }}
+                created_at_utc = $created
+            }}
+            result = [ordered]@{{
+                status = "result"
+                details = [ordered]@{{ job_id = $jobId }}
+                completed_at_utc = $completed
+                job_id = $jobId
+            }}
+        }}
+        doris_submit = [ordered]@{{ status = "not_started"; intent = $null; result = $null }}
+        iceberg_submit = [ordered]@{{ status = "not_started"; intent = $null; result = $null }}
+        finalization = [ordered]@{{ status = "not_started"; intent = $null; result = $null }}
+    }}
+}}
+$reorderedCanonical = [ordered]@{{
+    result = [ordered]@{{
+        job_id = $jobId
+        completed_at_utc = $completed
+        details = [ordered]@{{ job_id = $jobId }}
+        status = "result"
+    }}
+    intent = [ordered]@{{
+        created_at_utc = $created
+        details = [ordered]@{{ savepoint_path = $savepoint; name = $name }}
+        operation = "submit_production_from_savepoint"
+    }}
+    status = "result"
+    kind = "chapter9_production_submit"
+    schema_version = 1
+}}
+Write-CutoverStateAtomic -State $legacy -Path $partialPath
+Write-CutoverProductionSubmitStateAtomic -State $reorderedCanonical -Path $statePath
+$canonicalBefore = Get-Content -LiteralPath $statePath -Raw -Encoding UTF8
+$script:mutations = 0
+$errorMessage = $null
+$result = $null
+try {{
+    $result = Invoke-CutoverProductionSubmitStage -RepositoryRoot "{repository}" -StateRoot "{state_root}" `
+        -Jobs ([pscustomobject]@{{ jobs = @(
+            [pscustomobject]@{{ jid = $jobId; name = $name; state = "RUNNING" }}
+        ) }}) -ExpectedName $name -CutoverState $legacy -CutoverStatePath $partialPath -Action {{
+            $script:mutations++
+            [pscustomobject]@{{ job_id = "ffffffffffffffffffffffffffffffff" }}
+        }}
+}} catch {{ $errorMessage = $_.Exception.Message }}
+$canonicalAfter = Get-Content -LiteralPath $statePath -Raw -Encoding UTF8
+$legacyAfter = Get-Content -LiteralPath $partialPath -Raw -Encoding UTF8 | ConvertFrom-Json
+[ordered]@{{
+    error = $errorMessage
+    action = if ($null -ne $result) {{ $result.action }} else {{ $null }}
+    job_id = if ($null -ne $result) {{ $result.job_id }} else {{ $null }}
+    canonical_unchanged = $canonicalBefore -ceq $canonicalAfter
+    legacy_removed = $null -eq $legacyAfter.mutations.PSObject.Properties["production_submit"]
+    mutations = $script:mutations
+}} | ConvertTo-Json -Compress
+'''
+            )
+
+        self.assertIsNone(payload["error"])
+        self.assertEqual("no_op", payload["action"])
+        self.assertEqual("9" * 32, payload["job_id"])
+        self.assertTrue(payload["canonical_unchanged"])
+        self.assertTrue(payload["legacy_removed"])
+        self.assertEqual(0, payload["mutations"])
+
+    def test_both_entries_preserve_exact_legacy_intent_then_fail_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for entry in ("bootstrap", "task4"):
+                (root / entry).mkdir()
+                (root / f"{entry}-state").mkdir()
+            payload = self._powershell_payload(
+                rf'''
+. "scripts/bootstrap_chapter_10_5.ps1" -FunctionsOnly
+. "scripts/run_chapter_9_production_cutover.ps1" -FunctionsOnly
+$name = "chapter-9-datastream-quality-production"
+$safeError = "Production submission recovery state is unsafe."
+$savepoint = "s3a://flink-state/savepoints/chapter-9/savepoint-fixed"
+$script:mutations = 0
+$records = @()
+foreach ($entry in @("bootstrap", "task4")) {{
+    $repositoryRoot = Join-Path "{root}" $entry
+    $stateRoot = Join-Path "{root}" "$entry-state"
+    $partialPath = Join-Path $repositoryRoot "tmp/chapter-9/cutover-manifest.json.partial"
+    $legacy = [ordered]@{{
+        schema_version = 2
+        cutover_id = "legacy-intent-$entry"
+        phase = "production_submit"
+        created_at = "2026-08-25T00:00:00.0000000+00:00"
+        raw_offsets = @("partition:0,offset:42")
+        shadow_job_id = "11111111111111111111111111111111"
+        savepoint_path = $savepoint
+        production_job_id = $null
+        doris_job_id = $null
+        iceberg_job_id = $null
+        mutations = [ordered]@{{
+            shadow_stop = [ordered]@{{ status = "result"; intent = @{{}}; result = @{{}} }}
+            production_submit = [ordered]@{{
+                status = "intent"
+                intent = [ordered]@{{
+                    operation = "submit_production_from_savepoint"
+                    details = [ordered]@{{ name = $name; savepoint_path = $savepoint }}
+                    created_at_utc = "2026-08-25T00:01:00.0000000+00:00"
+                }}
+                result = $null
+            }}
+            doris_submit = [ordered]@{{ status = "not_started"; intent = $null; result = $null }}
+            iceberg_submit = [ordered]@{{ status = "not_started"; intent = $null; result = $null }}
+            finalization = [ordered]@{{ status = "not_started"; intent = $null; result = $null }}
+        }}
+    }}
+    Write-CutoverStateAtomic -State $legacy -Path $partialPath
+    $errorMessage = $null
+    try {{
+        if ($entry -ceq "bootstrap") {{
+            Invoke-Chapter105JobsStage -RepositoryRoot $repositoryRoot -StateRoot $stateRoot `
+                -Overview ([pscustomobject]@{{ jobs = @() }}) -JobName $name `
+                -SavepointUri "s3a://flink-state/savepoints/chapter-9" -SubmitAction {{
+                    param($savepointPath)
+                    $script:mutations++
+                    [pscustomobject]@{{ job_id = "ffffffffffffffffffffffffffffffff" }}
+                }} | Out-Null
+        }} else {{
+            Invoke-CutoverProductionSubmitStage -RepositoryRoot $repositoryRoot -StateRoot $stateRoot `
+                -Jobs ([pscustomobject]@{{ jobs = @() }}) -ExpectedName $name `
+                -CutoverState $legacy -CutoverStatePath $partialPath -Action {{
+                    $script:mutations++
+                    [pscustomobject]@{{ job_id = "ffffffffffffffffffffffffffffffff" }}
+                }} | Out-Null
+        }}
+    }} catch {{ $errorMessage = $_.Exception.Message }}
+    $statePath = Join-Path $stateRoot "tmp/chapter-9/production-submit-state.json"
+    $canonical = if (Test-Path -LiteralPath $statePath -PathType Leaf) {{
+        Get-Content -LiteralPath $statePath -Raw -Encoding UTF8 | ConvertFrom-Json
+    }} else {{ $null }}
+    $legacyAfter = Get-Content -LiteralPath $partialPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    $records += [pscustomobject]@{{
+        entry = $entry
+        error = $errorMessage
+        canonical_status = if ($null -ne $canonical) {{ $canonical.status }} else {{ $null }}
+        operation = if ($null -ne $canonical) {{ $canonical.intent.operation }} else {{ $null }}
+        detail_names = if ($null -ne $canonical) {{ @($canonical.intent.details.PSObject.Properties.Name) }} else {{ @() }}
+        detail_name = if ($null -ne $canonical) {{ $canonical.intent.details.name }} else {{ $null }}
+        detail_savepoint = if ($null -ne $canonical) {{ $canonical.intent.details.savepoint_path }} else {{ $null }}
+        legacy_removed = $null -eq $legacyAfter.mutations.PSObject.Properties["production_submit"]
+    }}
+}}
+[ordered]@{{ mutations = $script:mutations; safe_error = $safeError; records = $records }} | ConvertTo-Json -Depth 7 -Compress
+'''
+            )
+
+        self.assertEqual(0, payload["mutations"])
+        for record in payload["records"]:
+            self.assertEqual(payload["safe_error"], record["error"])
+            self.assertEqual("intent", record["canonical_status"])
+            self.assertEqual("submit_production_from_savepoint", record["operation"])
+            self.assertEqual(["name", "savepoint_path"], record["detail_names"])
+            self.assertEqual("chapter-9-datastream-quality-production", record["detail_name"])
+            self.assertEqual(
+                "s3a://flink-state/savepoints/chapter-9/savepoint-fixed",
+                record["detail_savepoint"],
+            )
+            self.assertTrue(record["legacy_removed"])
+
+    def test_legacy_schema_matrix_rejects_and_preserves_every_unsafe_tuple(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            payload = self._powershell_payload(
+                rf'''
+. "scripts/bootstrap_chapter_10_5.ps1" -FunctionsOnly
+. "scripts/run_chapter_9_production_cutover.ps1" -FunctionsOnly
+$name = "chapter-9-datastream-quality-production"
+$safeError = "Production submission recovery state is unsafe."
+$legacyJobId = "99999999999999999999999999999999"
+$canonicalJobId = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+$savepoint = "s3a://flink-state/savepoints/chapter-9/savepoint-fixed"
+$created = "2026-08-25T00:01:00.0000000+00:00"
+$completed = "2026-08-25T00:02:00.0000000+00:00"
+$script:mutations = 0
+$records = @()
+$cases = @(
+    "failed", "malformed_json", "malformed_record", "tuple_extra", "tuple_missing",
+    "property_case", "status_case", "operation_case", "details_extra", "details_missing",
+    "result_extra", "result_details_extra", "savepoint_conflict", "projection_conflict",
+    "time_inversion", "canonical_conflict"
+)
+
+function New-TestLegacyManifest {{
+    return ([ordered]@{{
+        schema_version = 2
+        cutover_id = "legacy-matrix"
+        phase = "production_submit"
+        created_at = "2026-08-25T00:00:00.0000000+00:00"
+        raw_offsets = @("partition:0,offset:42")
+        shadow_job_id = "11111111111111111111111111111111"
+        savepoint_path = $savepoint
+        production_job_id = $legacyJobId
+        doris_job_id = $null
+        iceberg_job_id = $null
+        mutations = [ordered]@{{
+            shadow_stop = [ordered]@{{ status = "result"; intent = @{{}}; result = @{{}} }}
+            production_submit = [ordered]@{{
+                status = "result"
+                intent = [ordered]@{{
+                    operation = "submit_production_from_savepoint"
+                    details = [ordered]@{{ name = $name; savepoint_path = $savepoint }}
+                    created_at_utc = $created
+                }}
+                result = [ordered]@{{
+                    status = "result"
+                    details = [ordered]@{{ job_id = $legacyJobId }}
+                    completed_at_utc = $completed
+                    job_id = $legacyJobId
+                }}
+            }}
+            doris_submit = [ordered]@{{ status = "not_started"; intent = $null; result = $null }}
+            iceberg_submit = [ordered]@{{ status = "not_started"; intent = $null; result = $null }}
+            finalization = [ordered]@{{ status = "not_started"; intent = $null; result = $null }}
+        }}
+    }} | ConvertTo-Json -Depth 12 | ConvertFrom-Json)
+}}
+
+foreach ($caseName in $cases) {{
+    foreach ($entry in @("bootstrap", "task4")) {{
+        $repositoryRoot = Join-Path "{root}" "$caseName-$entry-code"
+        $stateRoot = Join-Path "{root}" "$caseName-$entry-state"
+        New-Item -ItemType Directory -Force -Path $repositoryRoot, $stateRoot | Out-Null
+        $partialPath = Join-Path $repositoryRoot "tmp/chapter-9/cutover-manifest.json.partial"
+        $statePath = Join-Path $stateRoot "tmp/chapter-9/production-submit-state.json"
+        $legacy = New-TestLegacyManifest
+        switch -CaseSensitive ($caseName) {{
+            "failed" {{
+                $legacy.production_job_id = $null
+                $legacy.mutations.production_submit.status = "failed"
+                $legacy.mutations.production_submit.result = [pscustomobject][ordered]@{{
+                    status = "failed"
+                    details = [pscustomobject][ordered]@{{ error = "PASSWORD=legacy-secret" }}
+                    completed_at_utc = $completed
+                }}
+            }}
+            "malformed_record" {{ $legacy.mutations.production_submit.intent = "malformed" }}
+            "tuple_extra" {{
+                $legacy.mutations.production_submit | Add-Member -NotePropertyName unexpected -NotePropertyValue "SECRET=extra"
+            }}
+            "tuple_missing" {{ $legacy.mutations.production_submit.PSObject.Properties.Remove("result") }}
+            "property_case" {{
+                $value = $legacy.mutations.production_submit.status
+                $legacy.mutations.production_submit.PSObject.Properties.Remove("status")
+                $legacy.mutations.production_submit | Add-Member -NotePropertyName Status -NotePropertyValue $value
+            }}
+            "status_case" {{ $legacy.mutations.production_submit.status = "Result" }}
+            "operation_case" {{
+                $legacy.mutations.production_submit.intent.operation = "Submit_Production_From_Savepoint"
+            }}
+            "details_extra" {{
+                $legacy.mutations.production_submit.intent.details | Add-Member -NotePropertyName extra -NotePropertyValue "API_KEY=extra"
+            }}
+            "details_missing" {{
+                $legacy.mutations.production_submit.intent.details.PSObject.Properties.Remove("savepoint_path")
+            }}
+            "result_extra" {{
+                $legacy.mutations.production_submit.result | Add-Member -NotePropertyName extra -NotePropertyValue "PASSWORD=extra"
+            }}
+            "result_details_extra" {{
+                $legacy.mutations.production_submit.result.details | Add-Member -NotePropertyName extra -NotePropertyValue "SECRET=extra"
+            }}
+            "savepoint_conflict" {{
+                $legacy.mutations.production_submit.intent.details.savepoint_path = "s3a://flink-state/savepoints/chapter-9/savepoint-other"
+            }}
+            "projection_conflict" {{ $legacy.production_job_id = "88888888888888888888888888888888" }}
+            "time_inversion" {{
+                $legacy.mutations.production_submit.intent.created_at_utc = "2026-08-25T00:03:00.0000000+00:00"
+            }}
+        }}
+        if ($caseName -ceq "malformed_json") {{
+            New-Item -ItemType Directory -Force -Path (Split-Path -Parent $partialPath) | Out-Null
+            [System.IO.File]::WriteAllText($partialPath, '{{"mutations":', (New-Object System.Text.UTF8Encoding($false)))
+            $legacyArgument = $null
+        }} else {{
+            Write-CutoverStateAtomic -State $legacy -Path $partialPath
+            $legacyArgument = $legacy
+        }}
+        if ($caseName -ceq "canonical_conflict") {{
+            $canonical = [ordered]@{{
+                schema_version = 1
+                kind = "chapter9_production_submit"
+                status = "result"
+                intent = [ordered]@{{
+                    operation = "submit_chapter9_production"
+                    job_name = $name
+                    created_at_utc = $created
+                }}
+                result = [ordered]@{{
+                    status = "result"
+                    job_id = $canonicalJobId
+                    job_name = $name
+                    completed_at_utc = $completed
+                }}
+            }}
+            Write-CutoverProductionSubmitStateAtomic -State $canonical -Path $statePath
+        }}
+        $legacyBefore = Get-Content -LiteralPath $partialPath -Raw -Encoding UTF8
+        $canonicalBefore = if (Test-Path -LiteralPath $statePath -PathType Leaf) {{
+            Get-Content -LiteralPath $statePath -Raw -Encoding UTF8
+        }} else {{ $null }}
+        $runningId = if ($caseName -ceq "canonical_conflict") {{ $canonicalJobId }} else {{ $legacyJobId }}
+        $running = [pscustomobject]@{{ jobs = @(
+            [pscustomobject]@{{ jid = $runningId; name = $name; state = "RUNNING" }}
+        ) }}
+        $errorMessage = $null
+        try {{
+            if ($entry -ceq "bootstrap") {{
+                Invoke-Chapter105JobsStage -RepositoryRoot $repositoryRoot -StateRoot $stateRoot `
+                    -Overview $running -JobName $name -SavepointUri "s3a://flink-state/savepoints/chapter-9" `
+                    -SubmitAction {{
+                        param($savepointPath)
+                        $script:mutations++
+                        [pscustomobject]@{{ job_id = "ffffffffffffffffffffffffffffffff" }}
+                    }} | Out-Null
+            }} else {{
+                $stageArguments = @{{
+                    RepositoryRoot = $repositoryRoot
+                    StateRoot = $stateRoot
+                    Jobs = $running
+                    ExpectedName = $name
+                    CutoverStatePath = $partialPath
+                    Action = {{
+                        $script:mutations++
+                        [pscustomobject]@{{ job_id = "ffffffffffffffffffffffffffffffff" }}
+                    }}
+                }}
+                if ($null -ne $legacyArgument) {{ $stageArguments["CutoverState"] = $legacyArgument }}
+                Invoke-CutoverProductionSubmitStage @stageArguments | Out-Null
+            }}
+        }} catch {{ $errorMessage = $_.Exception.Message }}
+        $legacyAfter = Get-Content -LiteralPath $partialPath -Raw -Encoding UTF8
+        $canonicalAfter = if (Test-Path -LiteralPath $statePath -PathType Leaf) {{
+            Get-Content -LiteralPath $statePath -Raw -Encoding UTF8
+        }} else {{ $null }}
+        $records += [pscustomobject]@{{
+            case_name = $caseName
+            entry = $entry
+            error = $errorMessage
+            scrubbed = [string]$errorMessage -notmatch "PASSWORD|SECRET|API_KEY|legacy-secret"
+            legacy_unchanged = $legacyBefore -ceq $legacyAfter
+            canonical_unchanged = $canonicalBefore -ceq $canonicalAfter
+            canonical_absent = $null -eq $canonicalAfter
+            lock_exists = Test-Path -LiteralPath "$statePath.lock" -PathType Leaf
+        }}
+    }}
+}}
+[ordered]@{{
+    safe_error = $safeError
+    mutations = $script:mutations
+    records = $records
+}} | ConvertTo-Json -Depth 6 -Compress
+'''
+            )
+
+        self.assertEqual(0, payload["mutations"])
+        self.assertEqual(32, len(payload["records"]))
+        for record in payload["records"]:
+            self.assertEqual(payload["safe_error"], record["error"], record)
+            self.assertTrue(record["scrubbed"], record)
+            self.assertTrue(record["legacy_unchanged"], record)
+            self.assertTrue(record["canonical_unchanged"], record)
+            if record["case_name"] == "canonical_conflict":
+                self.assertFalse(record["canonical_absent"], record)
+            else:
+                self.assertTrue(record["canonical_absent"], record)
+            self.assertTrue(record["lock_exists"], record)
 
     def test_native_failure_is_scrubbed_and_retry_stops_at_limit(self):
         payload = self._powershell_payload(
@@ -429,7 +1356,8 @@ $name = "chapter-9-datastream-quality-production"
 $emptyJobs = [pscustomobject]@{{ jobs = @() }}
 
 $bootstrapFirstRoot = "{root / 'bootstrap-first'}"
-$bootstrapResult = Invoke-Chapter105JobsStage -RepositoryRoot $bootstrapFirstRoot `
+New-Item -ItemType Directory -Force -Path $bootstrapFirstRoot | Out-Null
+$bootstrapResult = Invoke-Chapter105JobsStage -RepositoryRoot $bootstrapFirstRoot -StateRoot $bootstrapFirstRoot `
     -Overview $emptyJobs -JobName $name -SavepointUri "s3a://flink-state/savepoints/chapter-9" -SubmitAction {{
         param($savepointPath)
         $script:mutations++
@@ -439,17 +1367,18 @@ $afterBootstrap = $script:mutations
 $bootstrapRunning = [pscustomobject]@{{ jobs = @(
     [pscustomobject]@{{ jid = $bootstrapResult.job_id; name = $name; state = "RUNNING" }}
 ) }}
-$task4AfterBootstrap = Invoke-CutoverProductionSubmitStage -RepositoryRoot $bootstrapFirstRoot `
+$task4AfterBootstrap = Invoke-CutoverProductionSubmitStage -RepositoryRoot $bootstrapFirstRoot -StateRoot $bootstrapFirstRoot `
     -Jobs $bootstrapRunning -ExpectedName $name -Action {{
         $script:mutations++
         [pscustomobject]@{{ job_id = "ffffffffffffffffffffffffffffffff" }}
     }}
 $afterTask4 = $script:mutations
-$bootstrapFirstPath = Get-CutoverProductionSubmitStatePath -RepositoryRoot $bootstrapFirstRoot
+$bootstrapFirstPath = Get-CutoverProductionSubmitStatePath -RepositoryRoot $bootstrapFirstRoot -StateRoot $bootstrapFirstRoot
 $bootstrapSaved = Get-Content -Raw $bootstrapFirstPath | ConvertFrom-Json
 
 $task4FirstRoot = "{root / 'task4-first'}"
-$task4Result = Invoke-CutoverProductionSubmitStage -RepositoryRoot $task4FirstRoot `
+New-Item -ItemType Directory -Force -Path $task4FirstRoot | Out-Null
+$task4Result = Invoke-CutoverProductionSubmitStage -RepositoryRoot $task4FirstRoot -StateRoot $task4FirstRoot `
     -Jobs $emptyJobs -ExpectedName $name -Action {{
         $script:mutations++
         [pscustomobject]@{{ job_id = "44444444444444444444444444444444" }}
@@ -458,14 +1387,14 @@ $afterTask4First = $script:mutations
 $task4Running = [pscustomobject]@{{ jobs = @(
     [pscustomobject]@{{ jid = $task4Result.job_id; name = $name; state = "RUNNING" }}
 ) }}
-$bootstrapAfterTask4 = Invoke-Chapter105JobsStage -RepositoryRoot $task4FirstRoot `
+$bootstrapAfterTask4 = Invoke-Chapter105JobsStage -RepositoryRoot $task4FirstRoot -StateRoot $task4FirstRoot `
     -Overview $task4Running -JobName $name -SavepointUri "s3a://flink-state/savepoints/chapter-9" -SubmitAction {{
         param($savepointPath)
         $script:mutations++
         [pscustomobject]@{{ job_id = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee" }}
     }}
 $afterBootstrapSecond = $script:mutations
-$task4FirstPath = Get-CutoverProductionSubmitStatePath -RepositoryRoot $task4FirstRoot
+$task4FirstPath = Get-CutoverProductionSubmitStatePath -RepositoryRoot $task4FirstRoot -StateRoot $task4FirstRoot
 $task4Saved = Get-Content -Raw $task4FirstPath | ConvertFrom-Json
 
 [ordered]@{{
@@ -531,7 +1460,8 @@ $running = [pscustomobject]@{{ jobs = @(
 ) }}
 
 $completeRoot = "{root / 'complete'}"
-$completePath = Get-CutoverProductionSubmitStatePath -RepositoryRoot $completeRoot
+New-Item -ItemType Directory -Force -Path $completeRoot | Out-Null
+$completePath = Get-CutoverProductionSubmitStatePath -RepositoryRoot $completeRoot -StateRoot $completeRoot
 $completeState = [ordered]@{{
     schema_version = 1
     kind = "chapter9_production_submit"
@@ -540,13 +1470,13 @@ $completeState = [ordered]@{{
     result = [ordered]@{{ status = "result"; job_id = $jobId; job_name = $name; completed_at_utc = $completed }}
 }}
 Write-CutoverProductionSubmitStateAtomic -State $completeState -Path $completePath
-$bootstrapComplete = Invoke-Chapter105JobsStage -RepositoryRoot $completeRoot -Overview $running `
+$bootstrapComplete = Invoke-Chapter105JobsStage -RepositoryRoot $completeRoot -StateRoot $completeRoot -Overview $running `
     -JobName $name -SavepointUri "s3a://flink-state/savepoints/chapter-9" -SubmitAction {{
         param($savepointPath)
         $script:mutations++
         [pscustomobject]@{{ job_id = "77777777777777777777777777777777" }}
     }}
-$task4Complete = Invoke-CutoverProductionSubmitStage -RepositoryRoot $completeRoot `
+$task4Complete = Invoke-CutoverProductionSubmitStage -RepositoryRoot $completeRoot -StateRoot $completeRoot `
     -Jobs $running -ExpectedName $name -Action {{
         $script:mutations++
         [pscustomobject]@{{ job_id = "77777777777777777777777777777777" }}
@@ -562,18 +1492,19 @@ $cases = @(
 foreach ($case in $cases) {{
     foreach ($entry in @("bootstrap", "task4")) {{
         $caseRoot = Join-Path "{root}" "$($case.name)-$entry"
-        $path = Get-CutoverProductionSubmitStatePath -RepositoryRoot $caseRoot
+        New-Item -ItemType Directory -Force -Path $caseRoot | Out-Null
+        $path = Get-CutoverProductionSubmitStatePath -RepositoryRoot $caseRoot -StateRoot $caseRoot
         Write-CutoverProductionSubmitStateAtomic -State $case.state -Path $path
         try {{
             if ($entry -eq "bootstrap") {{
-                Invoke-Chapter105JobsStage -RepositoryRoot $caseRoot -Overview $case.jobs `
+                Invoke-Chapter105JobsStage -RepositoryRoot $caseRoot -StateRoot $caseRoot -Overview $case.jobs `
                     -JobName $name -SavepointUri "s3a://flink-state/savepoints/chapter-9" -SubmitAction {{
                         param($savepointPath)
                         $script:mutations++
                         [pscustomobject]@{{ job_id = "77777777777777777777777777777777" }}
                     }} | Out-Null
             }} else {{
-                Invoke-CutoverProductionSubmitStage -RepositoryRoot $caseRoot `
+                Invoke-CutoverProductionSubmitStage -RepositoryRoot $caseRoot -StateRoot $caseRoot `
                     -Jobs $case.jobs -ExpectedName $name -Action {{
                         $script:mutations++
                         [pscustomobject]@{{ job_id = "77777777777777777777777777777777" }}
@@ -621,16 +1552,17 @@ $running = [pscustomobject]@{{ jobs = @(
 
 foreach ($first in @("bootstrap", "task4")) {{
     $caseRoot = Join-Path "{root}" $first
+    New-Item -ItemType Directory -Force -Path $caseRoot | Out-Null
     try {{
         if ($first -eq "bootstrap") {{
-            Invoke-Chapter105JobsStage -RepositoryRoot $caseRoot -Overview $emptyJobs `
+            Invoke-Chapter105JobsStage -RepositoryRoot $caseRoot -StateRoot $caseRoot -Overview $emptyJobs `
                 -JobName $name -SavepointUri "s3a://flink-state/savepoints/chapter-9" -SubmitAction {{
                     param($savepointPath)
                     $script:mutations++
                     throw $secret
                 }} | Out-Null
         }} else {{
-            Invoke-CutoverProductionSubmitStage -RepositoryRoot $caseRoot `
+            Invoke-CutoverProductionSubmitStage -RepositoryRoot $caseRoot -StateRoot $caseRoot `
                 -Jobs $emptyJobs -ExpectedName $name -Action {{
                     $script:mutations++
                     throw $secret
@@ -640,16 +1572,16 @@ foreach ($first in @("bootstrap", "task4")) {{
 
     try {{
         if ($first -eq "bootstrap") {{
-            Invoke-CutoverProductionSubmitStage -RepositoryRoot $caseRoot `
+            Invoke-CutoverProductionSubmitStage -RepositoryRoot $caseRoot -StateRoot $caseRoot `
                 -Jobs $running -ExpectedName $name -Action {{ $script:mutations++; throw "retried" }} | Out-Null
         }} else {{
-            Invoke-Chapter105JobsStage -RepositoryRoot $caseRoot -Overview $running `
+            Invoke-Chapter105JobsStage -RepositoryRoot $caseRoot -StateRoot $caseRoot -Overview $running `
                 -JobName $name -SavepointUri "s3a://flink-state/savepoints/chapter-9" `
                 -SubmitAction {{ param($savepointPath); $script:mutations++; throw "retried" }} | Out-Null
         }}
     }} catch {{ $errors += $_.Exception.Message }}
 
-    $statePath = Get-CutoverProductionSubmitStatePath -RepositoryRoot $caseRoot
+    $statePath = Get-CutoverProductionSubmitStatePath -RepositoryRoot $caseRoot -StateRoot $caseRoot
     $saved = Get-Content -Raw $statePath | ConvertFrom-Json
     $statuses += [pscustomobject]@{{
         status = $saved.status
@@ -697,11 +1629,13 @@ $manifest = [ordered]@{{
     shadow_job_id = "11111111111111111111111111111111"
     savepoint_path = "s3a://flink-state/savepoints/chapter-9/savepoint-fixed"
     production_job_id = $jobId
+    doris_job_id = $null
+    iceberg_job_id = $null
     mutations = [ordered]@{{
         shadow_stop = [ordered]@{{ status = "result"; intent = @{{}}; result = @{{}} }}
         production_submit = [ordered]@{{
             status = "result"
-            intent = [ordered]@{{ operation = "submit_production_from_savepoint"; details = [ordered]@{{ name = $name }}; created_at_utc = "2026-08-25T00:01:00.0000000+00:00" }}
+            intent = [ordered]@{{ operation = "submit_production_from_savepoint"; details = [ordered]@{{ name = $name; savepoint_path = "s3a://flink-state/savepoints/chapter-9/savepoint-fixed" }}; created_at_utc = "2026-08-25T00:01:00.0000000+00:00" }}
             result = [ordered]@{{ status = "result"; job_id = $jobId; details = [ordered]@{{ job_id = $jobId }}; completed_at_utc = "2026-08-25T00:02:00.0000000+00:00" }}
         }}
         doris_submit = [ordered]@{{ status = "not_started"; intent = $null; result = $null }}
@@ -714,12 +1648,12 @@ $script:mutations = 0
 $running = [pscustomobject]@{{ jobs = @(
     [pscustomobject]@{{ jid = $jobId; name = $name; state = "RUNNING" }}
 ) }}
-$result = Invoke-CutoverProductionSubmitStage -RepositoryRoot "{root}" -Jobs $running `
+$result = Invoke-CutoverProductionSubmitStage -RepositoryRoot "{root}" -StateRoot "{root}" -Jobs $running `
     -ExpectedName $name -CutoverState $manifest -CutoverStatePath $partialPath -Action {{
         $script:mutations++
         [pscustomobject]@{{ job_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }}
     }}
-$statePath = Get-CutoverProductionSubmitStatePath -RepositoryRoot "{root}"
+$statePath = Get-CutoverProductionSubmitStatePath -RepositoryRoot "{root}" -StateRoot "{root}"
 $canonical = Get-Content -Raw $statePath | ConvertFrom-Json
 $migratedPartial = Get-Content -Raw $partialPath | ConvertFrom-Json
 [ordered]@{{
@@ -799,7 +1733,7 @@ $configured = [ordered]@{{
 $checkpoint = Get-Chapter9StateUri -Kind checkpoint -Environment $configured
 $savepoint = Get-Chapter9StateUri -Kind savepoint -Environment $configured
 $script:submissions = 0
-$result = Invoke-Chapter105JobsStage -RepositoryRoot "{repository_root}" `
+$result = Invoke-Chapter105JobsStage -RepositoryRoot "{repository_root}" -StateRoot "{repository_root}" `
     -Overview ([pscustomobject]@{{ jobs = @() }}) -JobName "chapter-9-datastream-quality-production" `
     -SavepointUri $savepoint -SubmitAction {{
     param($savepointPath)
@@ -809,13 +1743,13 @@ $result = Invoke-Chapter105JobsStage -RepositoryRoot "{repository_root}" `
 $running = [pscustomobject]@{{ jobs = @([pscustomobject]@{{
     jid = $result.job_id; name = "chapter-9-datastream-quality-production"; state = "RUNNING"
 }}) }}
-$replay = Invoke-Chapter105JobsStage -RepositoryRoot "{repository_root}" -Overview $running `
+$replay = Invoke-Chapter105JobsStage -RepositoryRoot "{repository_root}" -StateRoot "{repository_root}" -Overview $running `
     -JobName "chapter-9-datastream-quality-production" -SavepointUri $savepoint -SubmitAction {{
     param($savepointPath)
     $script:submissions++
     throw "must not replay"
 }}
-$statePath = Get-CutoverProductionSubmitStatePath -RepositoryRoot "{repository_root}"
+$statePath = Get-CutoverProductionSubmitStatePath -RepositoryRoot "{repository_root}" -StateRoot "{repository_root}"
 $saved = Get-Content -Raw $statePath | ConvertFrom-Json
 [ordered]@{{
     checkpoint = $checkpoint
