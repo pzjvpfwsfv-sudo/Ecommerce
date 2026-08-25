@@ -1,10 +1,13 @@
 import json
 from pathlib import Path
+import subprocess
 import unittest
 
 
 ROOT = Path(__file__).resolve().parent.parent
 LOCK_FILE = ROOT / "infra" / "runtime-dependencies.lock.json"
+COMPOSE_FILE = ROOT / "infra" / "docker-compose.yml"
+ENV_FILE = ROOT / "infra" / ".env.example"
 
 
 class Chapter105ArtifactsTest(unittest.TestCase):
@@ -95,6 +98,105 @@ class Chapter105ArtifactsTest(unittest.TestCase):
         self.assertIn("infra/compose/flink/lib", module)
         self.assertIn("infra/compose/hive-metastore/lib", module)
         self.assertIn("infra/compose/hive-metastore/lib/", (ROOT / ".gitignore").read_text("utf-8"))
+
+    def test_compose_persists_state_and_configures_postgres_metastore(self):
+        compose_text = COMPOSE_FILE.read_text(encoding="utf-8")
+        env_text = ENV_FILE.read_text(encoding="utf-8")
+        result = subprocess.run(
+            [
+                "docker",
+                "compose",
+                "--env-file",
+                str(ENV_FILE),
+                "-f",
+                str(COMPOSE_FILE),
+                "--profile",
+                "flink",
+                "--profile",
+                "serving",
+                "--profile",
+                "lakehouse",
+                "config",
+                "--format",
+                "json",
+            ],
+            cwd=ROOT,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        config = json.loads(result.stdout)
+        services = config["services"]
+
+        self.assertIn("metastore-postgres", services)
+        self.assertEqual("postgres:16.4-alpine", services["metastore-postgres"]["image"])
+        self.assertIn("pg_isready", " ".join(services["metastore-postgres"]["healthcheck"]["test"]))
+        self.assertEqual("metastore", services["metastore-postgres"]["environment"]["POSTGRES_DB"])
+        self.assertEqual("hive", services["metastore-postgres"]["environment"]["POSTGRES_USER"])
+        self.assertEqual("hive", services["metastore-postgres"]["environment"]["POSTGRES_PASSWORD"])
+        self.assertEqual("postgres", services["hive-metastore"]["environment"]["DB_DRIVER"])
+        self.assertIn(
+            "jdbc:postgresql://metastore-postgres:5432/metastore",
+            services["hive-metastore"]["environment"]["SERVICE_OPTS"],
+        )
+        self.assertIn(
+            "org.postgresql.Driver", services["hive-metastore"]["environment"]["SERVICE_OPTS"]
+        )
+        self.assertEqual(
+            "service_healthy",
+            services["hive-metastore"]["depends_on"]["metastore-postgres"]["condition"],
+        )
+        self.assertEqual(
+            "service_healthy", services["hive-metastore"]["depends_on"]["minio"]["condition"]
+        )
+        self.assertEqual(
+            "service_completed_successfully",
+            services["hive-metastore"]["depends_on"]["minio-init"]["condition"],
+        )
+        self.assertTrue(
+            any(
+                mount["target"] == "/opt/hive/lib/postgresql-42.7.4.jar"
+                and mount["read_only"]
+                and mount["source"].endswith("postgresql-42.7.4.jar")
+                for mount in services["hive-metastore"]["volumes"]
+            )
+        )
+
+        minio_block = compose_text.split("  minio-init:")[0].split("  minio:")[1]
+        self.assertIn("- ${MINIO_DATA_DIR}:/data", minio_block)
+        self.assertIn("mc ready local", " ".join(services["minio"]["healthcheck"]["test"]))
+        for variable in (
+            "MINIO_DATA_DIR=./compose/minio/data",
+            "METASTORE_POSTGRES_DB=metastore",
+            "METASTORE_POSTGRES_USER=hive",
+            "METASTORE_POSTGRES_PASSWORD=hive",
+            "API_BIND_HOST=127.0.0.1",
+        ):
+            self.assertIn(variable, env_text)
+        self.assertIn("mc mb --ignore-existing local/warehouse", services["minio-init"]["entrypoint"][-1])
+        self.assertIn("mc mb --ignore-existing local/flink-state", services["minio-init"]["entrypoint"][-1])
+        self.assertNotIn("tail -f /dev/null", services["minio-init"]["entrypoint"][-1])
+        self.assertEqual("127.0.0.1", services["api"]["ports"][0]["host_ip"])
+
+        for volume in (
+            "kafka-controller-data",
+            "kafka-broker-data",
+            "doris-fe-meta",
+            "doris-be-storage",
+            "metastore-postgres-data",
+        ):
+            self.assertIn(volume, config["volumes"])
+
+        volume_section = compose_text.split("\nvolumes:\n", 1)[1]
+        self.assertNotIn("name:", volume_section)
+        self.assertIn("kafka-controller-data:/var/lib/kafka/data", compose_text)
+        self.assertIn("kafka-broker-data:/var/lib/kafka/data", compose_text)
+        self.assertIn("doris-fe-meta:/opt/apache-doris/fe/doris-meta", compose_text)
+        self.assertIn("doris-be-storage:/opt/apache-doris/be/storage", compose_text)
+        self.assertIn("metastore-postgres-data:/var/lib/postgresql/data", compose_text)
+
+        self.assertNotIn("DB_DRIVER: derby", compose_text)
+        self.assertNotIn("tail -f /dev/null", compose_text.split("  minio-init:")[1].split("  hive-metastore:")[0])
 
 
 if __name__ == "__main__":
