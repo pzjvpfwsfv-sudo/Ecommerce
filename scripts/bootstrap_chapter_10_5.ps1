@@ -285,12 +285,14 @@ function Get-Chapter105Task4RecoveryPlan {
     $stateRoot = Join-Path $RepositoryRoot 'tmp\chapter-9'
     $finalPath = Join-Path $stateRoot 'cutover-manifest.json'
     $partialPath = Join-Path $stateRoot 'cutover-manifest.json.partial'
-    $statePath = if (Test-Path -LiteralPath $finalPath -PathType Leaf) {
-        $finalPath
-    } elseif (Test-Path -LiteralPath $partialPath -PathType Leaf) {
+    $statePath = if (Test-Path -LiteralPath $partialPath -PathType Leaf) {
         $partialPath
+    } elseif (Test-Path -LiteralPath $finalPath -PathType Leaf) {
+        throw 'Task 4 recovery state is invalid.'
     } else {
-        return [pscustomobject]@{ action = 'fresh'; savepoint_path = $null; state_path = $null }
+        return [pscustomobject]@{
+            action = 'fresh'; savepoint_path = $null; state_path = $partialPath; state = $null
+        }
     }
     try {
         $state = Get-Content -LiteralPath $statePath -Raw -Encoding UTF8 | ConvertFrom-Json -ErrorAction Stop
@@ -299,36 +301,37 @@ function Get-Chapter105Task4RecoveryPlan {
             throw 'invalid state'
         }
         $mutation = $state.PSObject.Properties['mutations'].Value.PSObject.Properties['production_submit'].Value
-        if ($mutation -isnot [System.Management.Automation.PSCustomObject] -or
-            $mutation.PSObject.Properties['status'].Value -isnot [string] -or
-            [string]$mutation.PSObject.Properties['status'].Value -cne 'not_started' -or
-            $null -ne $mutation.PSObject.Properties['intent'].Value -or
-            $null -ne $mutation.PSObject.Properties['result'].Value) {
+        if ($mutation -isnot [System.Management.Automation.PSCustomObject]) {
             throw 'unsafe production mutation'
         }
-        $savepointPath = Assert-CutoverSavepointPath -Path ([string]$state.savepoint_path)
-        if (-not $savepointPath.StartsWith($validatedSavepointUri.TrimEnd('/') + '/', [System.StringComparison]::Ordinal)) {
-            throw 'savepoint base mismatch'
+        $savepointPath = [string]$state.savepoint_path
+        if ($savepointPath) {
+            $savepointPath = Assert-CutoverSavepointPath -Path $savepointPath
+            if (-not $savepointPath.StartsWith($validatedSavepointUri.TrimEnd('/') + '/', [System.StringComparison]::Ordinal)) {
+                throw 'savepoint base mismatch'
+            }
         }
     } catch {
         throw 'Task 4 recovery state is invalid.'
     }
-    return [pscustomobject]@{ action = 'restore'; savepoint_path = $savepointPath; state_path = $statePath }
+    $action = if ($savepointPath) { 'restore' } else { 'fresh' }
+    return [pscustomobject]@{
+        action = $action; savepoint_path = $savepointPath; state_path = $statePath; state = $state
+    }
 }
 
-function Invoke-Chapter105PersistentJobMutation {
+function Invoke-Chapter105ProductionSubmitBoundary {
     param(
         [Parameter(Mandatory = $true)][object]$State,
         [Parameter(Mandatory = $true)][string]$StatePath,
+        [Parameter(Mandatory = $true)][object]$Jobs,
+        [Parameter(Mandatory = $true)][string]$JobName,
         [Parameter(Mandatory = $true)][scriptblock]$SubmitAction
     )
 
-    $mutation = $State.mutations.production_submit
-    if ($null -eq $mutation -or [string]$mutation.status -cne 'not_started') {
-        throw 'Persisted production submission outcome is ambiguous.'
-    }
-    return Invoke-CutoverMutation -State $State -Path $StatePath -Stage 'production_submit' `
-        -Operation 'bootstrap_production_submit' -Details @{ source = 'bootstrap' } -Action $SubmitAction
+    return Invoke-CutoverProductionSubmitBoundary -State $State -Path $StatePath -Jobs $Jobs `
+        -ExpectedName $JobName -Operation 'bootstrap_production_submit' `
+        -Details @{ source = 'bootstrap' } -Action $SubmitAction
 }
 
 function Assert-Chapter105FreshCheckpoint {
@@ -522,15 +525,13 @@ function Invoke-Chapter105Bootstrap {
             $decision = Invoke-Chapter105EnsureJob -Overview $overview -JobName $jobName -SubmitAction {
                 $recovery = Get-Chapter105Task4RecoveryPlan -RepositoryRoot $repositoryRoot `
                     -SavepointUri $context.SavepointUri
-                $statePath = Resolve-Chapter105RepositoryPath -RepositoryRoot $repositoryRoot `
-                    -Path 'tmp/chapter-10-5/job-recovery.json' -AllowedRelativeRoot 'tmp/chapter-10-5'
-                $state = if (Test-Path -LiteralPath $statePath -PathType Leaf) {
-                    $loaded = Get-Content -LiteralPath $statePath -Raw -Encoding UTF8 | ConvertFrom-Json -ErrorAction Stop
-                    Ensure-CutoverRecoveryState -State $loaded -Path $statePath
+                $state = if ($null -ne $recovery.state) {
+                    $recovery.state
                 } else {
-                    New-CutoverRecoveryState -CutoverId 'chapter-10-5-bootstrap' -Path $statePath
+                    New-CutoverRecoveryState -CutoverId 'chapter-10-5-bootstrap' -Path $recovery.state_path
                 }
-                $submission = Invoke-Chapter105PersistentJobMutation -State $state -StatePath $statePath -SubmitAction {
+                $submission = Invoke-Chapter105ProductionSubmitBoundary -State $state `
+                    -StatePath $recovery.state_path -Jobs $overview -JobName $jobName -SubmitAction {
                     $id = Invoke-Chapter105JobSubmission -RepositoryRoot $repositoryRoot -ComposePrefix $context.ComposePrefix `
                         -CheckpointUri $context.CheckpointUri -SavepointPath $recovery.savepoint_path -SkipBuild:$SkipBuild
                     [pscustomobject]@{ job_id = $id }

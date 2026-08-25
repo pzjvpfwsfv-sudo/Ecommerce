@@ -215,7 +215,7 @@ $fromSingle = @(ConvertFrom-Chapter105ComposePsOutput -Lines $single)
             recovery_root = Path(directory)
             (recovery_root / "tmp" / "chapter-9").mkdir(parents=True)
             (recovery_root / "jobs" / "datastream-quality").mkdir(parents=True)
-            (recovery_root / "tmp" / "chapter-9" / "cutover-manifest.json").write_text(
+            (recovery_root / "tmp" / "chapter-9" / "cutover-manifest.json.partial").write_text(
                 json.dumps(
                     {
                         "savepoint_path": "s3a://flink-state/savepoints/chapter-9/savepoint-fixed",
@@ -243,7 +243,7 @@ function Invoke-Chapter105Native {{
 }}
 $recovery = Get-Chapter105Task4RecoveryPlan -RepositoryRoot "{recovery_root}" -SavepointUri "s3a://flink-state/savepoints/chapter-9"
 $restoredId = Invoke-Chapter105JobSubmission -RepositoryRoot "{recovery_root}" -ComposePrefix @("compose") -CheckpointUri "s3a://flink-state/checkpoints/chapter-9" -SavepointPath $recovery.savepoint_path -SkipBuild
-Remove-Item -LiteralPath "{recovery_root / 'tmp' / 'chapter-9' / 'cutover-manifest.json'}" -Force
+Remove-Item -LiteralPath "{recovery_root / 'tmp' / 'chapter-9' / 'cutover-manifest.json.partial'}" -Force
 $fresh = Get-Chapter105Task4RecoveryPlan -RepositoryRoot "{recovery_root}" -SavepointUri "s3a://flink-state/savepoints/chapter-9"
 $freshId = Invoke-Chapter105JobSubmission -RepositoryRoot "{recovery_root}" -ComposePrefix @("compose") -CheckpointUri "s3a://flink-state/checkpoints/chapter-9" -SkipBuild
 [ordered]@{{
@@ -376,60 +376,188 @@ foreach ($json in $payloads) {
         )
         self.assertEqual({"rejected": 3, "mutations": 0}, payload)
 
-    def test_task4_and_chapter105_production_submit_state_matrix_fails_closed(self):
+    def test_bootstrap_and_task4_share_one_authoritative_submit_boundary_in_both_orders(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            state_dir = root / "tmp" / "chapter-9"
-            state_dir.mkdir(parents=True)
-            manifest = state_dir / "cutover-manifest.json"
             payload = self._powershell_payload(
                 rf'''
 . "scripts/bootstrap_chapter_10_5.ps1" -FunctionsOnly
 . "scripts/run_chapter_9_production_cutover.ps1" -FunctionsOnly
-$task4Statuses = @("not_started", "intent", "failed", "result")
-$bootstrapStatuses = @("not_started", "intent", "failed", "result")
 $script:mutations = 0
-$accepted = 0
-$rejected = 0
-function Invoke-CutoverMutation {{
-    param($State, $Path, $Stage, $Operation, $Details, [scriptblock]$Action)
-    $script:mutations++
-    & $Action
-}}
-foreach ($task4Status in $task4Statuses) {{
-    foreach ($bootstrapStatus in $bootstrapStatuses) {{
-        $task4State = [ordered]@{{
-            savepoint_path = "s3a://flink-state/savepoints/chapter-9/custom/savepoint-fixed"
-            mutations = [ordered]@{{
-                production_submit = [ordered]@{{ status = $task4Status; intent = $null; result = $null }}
-            }}
-        }}
-        $task4State | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath "{manifest}" -Encoding UTF8
-        $bootstrapState = [pscustomobject]@{{
-            mutations = [pscustomobject]@{{
-                production_submit = [pscustomobject]@{{ status = $bootstrapStatus; intent = $null; result = $null }}
-            }}
-        }}
-        try {{
-            $plan = Get-Chapter105Task4RecoveryPlan -RepositoryRoot "{root}" -SavepointUri "s3a://flink-state/savepoints/chapter-9/custom"
-            Invoke-Chapter105PersistentJobMutation -State $bootstrapState -StatePath "{root / 'tmp' / 'chapter-10-5-state.json'}" -SubmitAction {{
-                [pscustomobject]@{{ job_id = "33333333333333333333333333333333"; savepoint = $plan.savepoint_path }}
-            }} | Out-Null
-            $accepted++
-        }} catch {{ $rejected++ }}
+$name = "chapter-9-datastream-quality-production"
+$emptyJobs = [pscustomobject]@{{ jobs = @() }}
+
+$bootstrapFirstPath = "{root / 'bootstrap-first.partial'}"
+$bootstrapFirst = New-CutoverRecoveryState -CutoverId "bootstrap-first" -Path $bootstrapFirstPath
+$bootstrapResult = Invoke-Chapter105ProductionSubmitBoundary -State $bootstrapFirst `
+    -StatePath $bootstrapFirstPath -Jobs $emptyJobs -JobName $name -SubmitAction {{
+        $script:mutations++
+        [pscustomobject]@{{ job_id = "33333333333333333333333333333333" }}
     }}
-}}
-[ordered]@{{ accepted = $accepted; rejected = $rejected; mutations = $script:mutations }} | ConvertTo-Json -Compress
+$afterBootstrap = $script:mutations
+$bootstrapPersisted = Get-Content -Raw $bootstrapFirstPath | ConvertFrom-Json
+$bootstrapRunning = [pscustomobject]@{{ jobs = @(
+    [pscustomobject]@{{ jid = $bootstrapResult.job_id; name = $name; state = "RUNNING" }}
+) }}
+$task4AfterBootstrap = Invoke-CutoverProductionSubmitBoundary -State $bootstrapPersisted `
+    -Path $bootstrapFirstPath -Jobs $bootstrapRunning -ExpectedName $name `
+    -Operation "submit_production_from_savepoint" -Details @{{ source = "task4" }} -Action {{
+        $script:mutations++
+        [pscustomobject]@{{ job_id = "ffffffffffffffffffffffffffffffff" }}
+    }}
+$afterTask4 = $script:mutations
+
+$task4FirstPath = "{root / 'task4-first.partial'}"
+$task4First = New-CutoverRecoveryState -CutoverId "task4-first" -Path $task4FirstPath
+$task4Result = Invoke-CutoverProductionSubmitBoundary -State $task4First `
+    -Path $task4FirstPath -Jobs $emptyJobs -ExpectedName $name `
+    -Operation "submit_production_from_savepoint" -Details @{{ source = "task4" }} -Action {{
+        $script:mutations++
+        [pscustomobject]@{{ job_id = "44444444444444444444444444444444" }}
+    }}
+$afterTask4First = $script:mutations
+$task4Persisted = Get-Content -Raw $task4FirstPath | ConvertFrom-Json
+$task4Running = [pscustomobject]@{{ jobs = @(
+    [pscustomobject]@{{ jid = $task4Result.job_id; name = $name; state = "RUNNING" }}
+) }}
+$bootstrapAfterTask4 = Invoke-Chapter105ProductionSubmitBoundary -State $task4Persisted `
+    -StatePath $task4FirstPath -Jobs $task4Running -JobName $name -SubmitAction {{
+        $script:mutations++
+        [pscustomobject]@{{ job_id = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee" }}
+    }}
+$afterBootstrapSecond = $script:mutations
+$bootstrapSaved = Get-Content -Raw $bootstrapFirstPath | ConvertFrom-Json
+$task4Saved = Get-Content -Raw $task4FirstPath | ConvertFrom-Json
+
+[ordered]@{{
+    bootstrap_then_task4 = $afterTask4 - $afterBootstrap + 1
+    task4_then_bootstrap = $afterBootstrapSecond - $afterTask4First + 1
+    total_mutations = $script:mutations
+    bootstrap_job_id = $task4AfterBootstrap.job_id
+    task4_job_id = $bootstrapAfterTask4.job_id
+    bootstrap_status = $bootstrapSaved.mutations.production_submit.status
+    task4_status = $task4Saved.mutations.production_submit.status
+    bootstrap_atomic_job_id = $bootstrapSaved.mutations.production_submit.result.job_id
+    task4_atomic_job_id = $task4Saved.mutations.production_submit.result.job_id
+}} | ConvertTo-Json -Compress
 '''
             )
-        self.assertEqual({"accepted": 1, "rejected": 15, "mutations": 1}, payload)
+        self.assertEqual(1, payload["bootstrap_then_task4"])
+        self.assertEqual(1, payload["task4_then_bootstrap"])
+        self.assertEqual(2, payload["total_mutations"])
+        self.assertEqual("3" * 32, payload["bootstrap_job_id"])
+        self.assertEqual("4" * 32, payload["task4_job_id"])
+        self.assertEqual("result", payload["bootstrap_status"])
+        self.assertEqual("result", payload["task4_status"])
+        self.assertEqual("3" * 32, payload["bootstrap_atomic_job_id"])
+        self.assertEqual("4" * 32, payload["task4_atomic_job_id"])
+        cutover_source = (ROOT / "scripts" / "run_chapter_9_production_cutover.ps1").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(
+            "$productionResult = Invoke-CutoverProductionSubmitBoundary -State $recoveryState",
+            cutover_source,
+        )
+        self.assertIn(
+            "$productionResult = Invoke-CutoverProductionSubmitBoundary -State $manifest",
+            cutover_source,
+        )
+
+    def test_shared_submit_boundary_reconciles_intent_and_rejects_unsafe_tuples_without_mutation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            payload = self._powershell_payload(
+                rf'''
+. "scripts/bootstrap_chapter_10_5.ps1" -FunctionsOnly
+. "scripts/run_chapter_9_production_cutover.ps1" -FunctionsOnly
+$name = "chapter-9-datastream-quality-production"
+$jobId = "55555555555555555555555555555555"
+$safeError = "Production submission recovery state is unsafe."
+$secret = "PASSWORD=do-not-leak"
+$script:mutations = 0
+$errors = @()
+$cases = @(
+    [pscustomobject]@{{ name = "intent_missing_job"; mutation = [pscustomobject]@{{ status = "intent"; intent = [pscustomobject]@{{ operation = "submit"; details = [pscustomobject]@{{}} }}; result = $null }}; jobs = [pscustomobject]@{{ jobs = @() }} }},
+    [pscustomobject]@{{ name = "intent_ambiguous"; mutation = [pscustomobject]@{{ status = "intent"; intent = [pscustomobject]@{{ operation = "submit"; details = [pscustomobject]@{{}} }}; result = $null }}; jobs = [pscustomobject]@{{ jobs = @(
+        [pscustomobject]@{{ jid = $jobId; name = $name; state = "RUNNING" }},
+        [pscustomobject]@{{ jid = "66666666666666666666666666666666"; name = $name; state = "RUNNING" }}
+    ) }} }},
+    [pscustomobject]@{{ name = "failed"; mutation = [pscustomobject]@{{ status = "failed"; intent = [pscustomobject]@{{ operation = "submit" }}; result = [pscustomobject]@{{ status = "failed"; details = [pscustomobject]@{{ error = $secret }} }} }}; jobs = [pscustomobject]@{{ jobs = @() }} }},
+    [pscustomobject]@{{ name = "mixed_case"; mutation = [pscustomobject]@{{ status = "Result"; intent = [pscustomobject]@{{ operation = "submit" }}; result = [pscustomobject]@{{ status = "result"; job_id = $jobId }} }}; jobs = [pscustomobject]@{{ jobs = @() }} }},
+    [pscustomobject]@{{ name = "partial_not_started"; mutation = [pscustomobject]@{{ status = "not_started"; intent = [pscustomobject]@{{ operation = "submit" }}; result = $null }}; jobs = [pscustomobject]@{{ jobs = @() }} }},
+    [pscustomobject]@{{ name = "partial_result"; mutation = [pscustomobject]@{{ status = "result"; intent = $null; result = [pscustomobject]@{{ status = "result"; job_id = $jobId }} }}; jobs = [pscustomobject]@{{ jobs = @() }} }},
+    [pscustomobject]@{{ name = "partial_intent_record"; mutation = [pscustomobject]@{{ status = "intent"; intent = [pscustomobject]@{{ details = [pscustomobject]@{{}} }}; result = $null }}; jobs = [pscustomobject]@{{ jobs = @([pscustomobject]@{{ jid = $jobId; name = $name; state = "RUNNING" }}) }} }},
+    [pscustomobject]@{{ name = "partial_result_intent"; mutation = [pscustomobject]@{{ status = "result"; intent = [pscustomobject]@{{ details = [pscustomobject]@{{}} }}; result = [pscustomobject]@{{ status = "result"; job_id = $jobId }} }}; jobs = [pscustomobject]@{{ jobs = @([pscustomobject]@{{ jid = $jobId; name = $name; state = "RUNNING" }}) }} }}
+)
+foreach ($case in $cases) {{
+    foreach ($entry in @("bootstrap", "task4")) {{
+        $path = Join-Path "{root}" "$($case.name)-$entry.partial"
+        $state = [pscustomobject]@{{
+            schema_version = 2
+            cutover_id = "$($case.name)-$entry"
+            phase = "production_submit"
+            mutations = [pscustomobject]@{{ production_submit = $case.mutation }}
+        }}
+        Write-CutoverStateAtomic -State $state -Path $path
+        try {{
+            if ($entry -eq "bootstrap") {{
+                Invoke-Chapter105ProductionSubmitBoundary -State $state -StatePath $path `
+                    -Jobs $case.jobs -JobName $name -SubmitAction {{
+                        $script:mutations++
+                        [pscustomobject]@{{ job_id = "77777777777777777777777777777777" }}
+                    }} | Out-Null
+            }} else {{
+                Invoke-CutoverProductionSubmitBoundary -State $state -Path $path `
+                    -Jobs $case.jobs -ExpectedName $name -Operation "submit" -Details @{{}} -Action {{
+                        $script:mutations++
+                        [pscustomobject]@{{ job_id = "77777777777777777777777777777777" }}
+                    }} | Out-Null
+            }}
+            $errors += "NO_ERROR"
+        }} catch {{ $errors += $_.Exception.Message }}
+    }}
+}}
+
+$intentPath = Join-Path "{root}" "intent-reconcile.partial"
+$intentState = [pscustomobject]@{{
+    schema_version = 2; cutover_id = "intent-reconcile"; phase = "production_submit"
+    mutations = [pscustomobject]@{{ production_submit = [pscustomobject]@{{
+        status = "intent"; intent = [pscustomobject]@{{ operation = "submit"; details = [pscustomobject]@{{}} }}; result = $null
+    }} }}
+}}
+Write-CutoverStateAtomic -State $intentState -Path $intentPath
+$running = [pscustomobject]@{{ jobs = @([pscustomobject]@{{ jid = $jobId; name = $name; state = "RUNNING" }}) }}
+$intentBootstrap = Invoke-Chapter105ProductionSubmitBoundary -State $intentState -StatePath $intentPath `
+    -Jobs $running -JobName $name -SubmitAction {{ $script:mutations++; throw $secret }}
+$intentPersisted = Get-Content -Raw $intentPath | ConvertFrom-Json
+$intentTask4 = Invoke-CutoverProductionSubmitBoundary -State $intentPersisted -Path $intentPath `
+    -Jobs $running -ExpectedName $name -Operation "submit" -Details @{{}} -Action {{ $script:mutations++; throw $secret }}
+
+[ordered]@{{
+    rejected = @($errors | Where-Object {{ $_ -ceq $safeError }}).Count
+    error_count = $errors.Count
+    safe = (@($errors | Where-Object {{ $_ -match "do-not-leak|PASSWORD|NO_ERROR" }}).Count -eq 0)
+    mutations = $script:mutations
+    adopted_bootstrap = $intentBootstrap.job_id
+    adopted_task4 = $intentTask4.job_id
+    adopted_status = (Get-Content -Raw $intentPath | ConvertFrom-Json).mutations.production_submit.status
+}} | ConvertTo-Json -Compress
+'''
+            )
+        self.assertEqual(16, payload["rejected"])
+        self.assertEqual(16, payload["error_count"])
+        self.assertTrue(payload["safe"])
+        self.assertEqual(0, payload["mutations"])
+        self.assertEqual("5" * 32, payload["adopted_bootstrap"])
+        self.assertEqual("5" * 32, payload["adopted_task4"])
+        self.assertEqual("result", payload["adopted_status"])
 
     def test_custom_savepoint_uri_is_validated_and_constrains_recovery(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             state_dir = root / "tmp" / "chapter-9"
             state_dir.mkdir(parents=True)
-            manifest = state_dir / "cutover-manifest.json"
+            manifest = state_dir / "cutover-manifest.json.partial"
             payload = self._powershell_payload(
                 rf'''
 . "scripts/bootstrap_chapter_10_5.ps1" -FunctionsOnly
@@ -463,9 +591,9 @@ try {{ Get-Chapter105Task4RecoveryPlan -RepositoryRoot "{root}" -SavepointUri $s
             payload,
         )
 
-    def test_task4_uri_reads_the_controlled_env_map_and_mutation_state_is_persisted(self):
+    def test_task4_uri_reads_the_controlled_env_map_and_authoritative_state_is_persisted(self):
         with tempfile.TemporaryDirectory() as directory:
-            state_path = Path(directory) / "job-recovery.json"
+            state_path = Path(directory) / "cutover-manifest.json.partial"
             payload = self._powershell_payload(
                 rf'''
 . (Resolve-Path "scripts/bootstrap_chapter_10_5.ps1") -FunctionsOnly
@@ -478,16 +606,19 @@ $checkpoint = Get-Chapter9StateUri -Kind checkpoint -Environment $configured
 $savepoint = Get-Chapter9StateUri -Kind savepoint -Environment $configured
 $state = New-CutoverRecoveryState -CutoverId "bootstrap-test" -Path "{state_path}"
 $script:submissions = 0
-$result = Invoke-Chapter105PersistentJobMutation -State $state -StatePath "{state_path}" -SubmitAction {{
+$result = Invoke-Chapter105ProductionSubmitBoundary -State $state -StatePath "{state_path}" `
+    -Jobs ([pscustomobject]@{{ jobs = @() }}) -JobName "chapter-9-datastream-quality-production" -SubmitAction {{
     $script:submissions++
     [pscustomobject]@{{ job_id = "33333333333333333333333333333333" }}
 }}
-$replayRejected = $false
-try {{
-    Invoke-Chapter105PersistentJobMutation -State $state -StatePath "{state_path}" -SubmitAction {{
+$running = [pscustomobject]@{{ jobs = @([pscustomobject]@{{
+    jid = $result.job_id; name = "chapter-9-datastream-quality-production"; state = "RUNNING"
+}}) }}
+$replay = Invoke-Chapter105ProductionSubmitBoundary -State $state -StatePath "{state_path}" `
+    -Jobs $running -JobName "chapter-9-datastream-quality-production" -SubmitAction {{
         $script:submissions++
-    }} | Out-Null
-}} catch {{ $replayRejected = $true }}
+        throw "must not replay"
+    }}
 $saved = Get-Content -Raw "{state_path}" | ConvertFrom-Json
 [ordered]@{{
     checkpoint = $checkpoint
@@ -496,7 +627,7 @@ $saved = Get-Content -Raw "{state_path}" | ConvertFrom-Json
     status = $saved.mutations.production_submit.status
     operation = $saved.mutations.production_submit.intent.operation
     persisted_job_id = $saved.mutations.production_submit.result.details.job_id
-    replay_rejected = $replayRejected
+    replay_job_id = $replay.job_id
     submissions = $script:submissions
 }} | ConvertTo-Json -Compress
 '''
@@ -509,7 +640,7 @@ $saved = Get-Content -Raw "{state_path}" | ConvertFrom-Json
                 "status": "result",
                 "operation": "bootstrap_production_submit",
                 "persisted_job_id": "3" * 32,
-                "replay_rejected": True,
+                "replay_job_id": "3" * 32,
                 "submissions": 1,
             },
             payload,
@@ -635,12 +766,12 @@ try { Invoke-Chapter105Bootstrap } catch { $reportOnlyError = $_.Exception.Messa
         payload = self._powershell_payload(
             r'''
 Set-StrictMode -Off
-$beforeModules = @((Get-Module).Name)
 $beforeUndefinedThrows = $false
 try { $null = $undefinedBefore } catch { $beforeUndefinedThrows = $true }
 function Test-DependencyHash { return "caller-private-helper" }
 $beforePrivate = (Get-Command Test-DependencyHash).ScriptBlock.ToString()
 $beforeAbsent = $null -eq (Get-Command Get-RuntimeDependencyArtifacts -ErrorAction SilentlyContinue)
+$beforeModules = @((Get-Module).Name)
 . "scripts/bootstrap_chapter_10_5.ps1" -FunctionsOnly
 $afterModules = @((Get-Module).Name)
 $afterUndefinedThrows = $false

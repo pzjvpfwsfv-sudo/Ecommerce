@@ -465,11 +465,15 @@ function Set-CutoverMutationResult {
         throw "Cutover mutation result requires a persisted intent: $Stage"
     }
     $mutation.status = $Status
-    $mutation.result = [pscustomobject]@{
+    $result = [ordered]@{
         status = $Status
         details = [pscustomobject]$Details
         completed_at_utc = [DateTimeOffset]::UtcNow.ToString("o")
     }
+    if ($Details.ContainsKey("job_id")) {
+        $result["job_id"] = [string]$Details["job_id"]
+    }
+    $mutation.result = [pscustomobject]$result
     Write-CutoverStateAtomic -State $State -Path $Path
 }
 
@@ -651,6 +655,99 @@ function Resolve-CutoverJobReference {
     })
     return Sync-CutoverResolvedJobId -State $State -Stage $Stage `
         -JobId $jobId -Path $Path
+}
+
+function Invoke-CutoverProductionSubmitBoundary {
+    param(
+        [Parameter(Mandatory = $true)][object]$State,
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][object]$Jobs,
+        [Parameter(Mandatory = $true)][string]$ExpectedName,
+        [Parameter(Mandatory = $true)][string]$Operation,
+        [hashtable]$Details = @{},
+        [Parameter(Mandatory = $true)][scriptblock]$Action
+    )
+
+    $safeError = "Production submission recovery state is unsafe."
+    try {
+        $mutation = $State.mutations.production_submit
+        if ($null -eq $mutation -or $mutation.status -isnot [string]) { throw $safeError }
+        $status = [string]$mutation.status
+        $intentIsRecord = $mutation.intent -is [System.Management.Automation.PSCustomObject] -or
+            $mutation.intent -is [System.Collections.IDictionary]
+        $resultIsRecord = $mutation.result -is [System.Management.Automation.PSCustomObject] -or
+            $mutation.result -is [System.Collections.IDictionary]
+        $intentIsComplete = $false
+        if ($intentIsRecord) {
+            $intentDetailsIsRecord = $mutation.intent.details -is [System.Management.Automation.PSCustomObject] -or
+                $mutation.intent.details -is [System.Collections.IDictionary]
+            $intentIsComplete = $mutation.intent.operation -is [string] -and
+                -not [string]::IsNullOrWhiteSpace([string]$mutation.intent.operation) -and
+                $intentDetailsIsRecord
+        }
+
+        if ($Jobs -isnot [System.Management.Automation.PSCustomObject]) { throw $safeError }
+        $jobsProperty = @($Jobs.PSObject.Properties | Where-Object { $_.Name -ceq "jobs" })
+        if ($jobsProperty.Count -ne 1 -or $jobsProperty[0].Value -isnot [System.Collections.IList] -or
+            $jobsProperty[0].Value -is [string]) {
+            throw $safeError
+        }
+        $seenIds = @{}
+        $namedJobs = @()
+        foreach ($job in @($jobsProperty[0].Value)) {
+            if ($job -isnot [System.Management.Automation.PSCustomObject] -or
+                $job.jid -isnot [string] -or [string]$job.jid -cnotmatch "^[0-9a-f]{32}$" -or
+                $job.name -isnot [string] -or [string]::IsNullOrWhiteSpace([string]$job.name) -or
+                $job.state -isnot [string] -or $seenIds.ContainsKey([string]$job.jid)) {
+                throw $safeError
+            }
+            $seenIds[[string]$job.jid] = $true
+            if ([string]$job.name -ceq $ExpectedName) { $namedJobs += $job }
+        }
+
+        switch -CaseSensitive ($status) {
+            "not_started" {
+                if ($null -ne $mutation.intent -or $null -ne $mutation.result -or $namedJobs.Count -ne 0) {
+                    throw $safeError
+                }
+            }
+            "intent" {
+                if (-not $intentIsComplete -or $null -ne $mutation.result) { throw $safeError }
+                $jobId = Resolve-CutoverJobReference -State $State -Stage "production_submit" `
+                    -ExpectedName $ExpectedName -Jobs $Jobs -Path $Path
+                return [pscustomobject]@{ action = "reconciled"; job_id = $jobId }
+            }
+            "failed" { throw $safeError }
+            "result" {
+                if (-not $intentIsComplete -or -not $resultIsRecord -or
+                    $mutation.result.status -isnot [string] -or
+                    [string]$mutation.result.status -cne "result") {
+                    throw $safeError
+                }
+                $jobId = Resolve-CutoverJobReference -State $State -Stage "production_submit" `
+                    -ExpectedName $ExpectedName -Jobs $Jobs -Path $Path
+                return [pscustomobject]@{ action = "reconciled"; job_id = $jobId }
+            }
+            default { throw $safeError }
+        }
+
+        $submitAction = $Action
+        $submission = Invoke-CutoverMutation -State $State -Path $Path -Stage "production_submit" `
+            -Operation $Operation -Details $Details -Action {
+                try { $candidate = & $submitAction } catch { throw $safeError }
+                if ($candidate -isnot [System.Management.Automation.PSCustomObject] -or
+                    $candidate.job_id -isnot [string] -or
+                    [string]$candidate.job_id -cnotmatch "^[0-9a-f]{32}$") {
+                    throw $safeError
+                }
+                return $candidate
+            }
+        $jobId = [string]$submission.job_id
+        Sync-CutoverResolvedJobId -State $State -Stage "production_submit" -JobId $jobId -Path $Path | Out-Null
+        return [pscustomobject]@{ action = "submitted"; job_id = $jobId }
+    } catch {
+        throw $safeError
+    }
 }
 
 function Complete-CutoverManifest {
@@ -1139,10 +1236,6 @@ if ($ResumePartial) {
     $productionJobId = $null
     $dorisJobId = $null
     $icebergJobId = $null
-    if ($recoveryState.mutations.production_submit.intent) {
-        $productionJobId = Resolve-CutoverJobReference -State $recoveryState -Stage "production_submit" `
-            -ExpectedName $productionJobName -Jobs $resumeJobs -Path $manifestPartialPath
-    }
     if ($recoveryState.mutations.doris_submit.intent) {
         $dorisJobId = Resolve-CutoverJobReference -State $recoveryState -Stage "doris_submit" `
             -ExpectedName $dorisJobName -Jobs $resumeJobs -Path $manifestPartialPath
@@ -1152,27 +1245,23 @@ if ($ResumePartial) {
             -ExpectedName $icebergJobName -Jobs $resumeJobs -Path $manifestPartialPath
     }
 
-    if (-not $productionJobId) {
-        $productionResult = Invoke-CutoverMutation -State $recoveryState -Path $manifestPartialPath `
-            -Stage "production_submit" -Operation "submit_production_from_savepoint" `
-            -Details @{ name = $productionJobName; savepoint_path = $savepointPath } -Action {
-                $output = Invoke-FlinkJobManagerCommand -Command @(
-                    "/opt/flink/bin/flink", "run", "-d", "-s", $savepointPath,
-                    "-c", "com.ecommerce.quality.DataQualityJob", "/tmp/datastream-quality-1.0.0.jar",
-                    "--bootstrap-servers", "kafka:29092", "--input-topic", "user_behavior_events",
-                    "--mode", "production", "--consumer-group", "chapter9-quality-production",
-                    "--checkpoint-uri", $checkpointUri,
-                    "--transaction-prefix", "chapter9-production", "--job-version", "chapter-9-v1"
-                ) -FailureMessage "Production resume submission failed."
-                $id = Get-SubmittedJobId $output
-                Wait-FlinkJobRunning -JobId $id -ExpectedName $productionJobName | Out-Null
-                [pscustomobject]@{ job_id = $id }
-            }
-        $productionJobId = [string]$productionResult.job_id
-        Set-CutoverMutationJobId -State $recoveryState -Path $manifestPartialPath -Stage "production_submit" -JobId $productionJobId
-        $savedManifest.production_job_id = $productionJobId
-        Write-ManifestPartial -Manifest $savedManifest -PartialPath $manifestPartialPath
-    }
+    $productionResult = Invoke-CutoverProductionSubmitBoundary -State $recoveryState -Path $manifestPartialPath `
+        -Jobs $resumeJobs -ExpectedName $productionJobName `
+        -Operation "submit_production_from_savepoint" `
+        -Details @{ name = $productionJobName; savepoint_path = $savepointPath } -Action {
+            $output = Invoke-FlinkJobManagerCommand -Command @(
+                "/opt/flink/bin/flink", "run", "-d", "-s", $savepointPath,
+                "-c", "com.ecommerce.quality.DataQualityJob", "/tmp/datastream-quality-1.0.0.jar",
+                "--bootstrap-servers", "kafka:29092", "--input-topic", "user_behavior_events",
+                "--mode", "production", "--consumer-group", "chapter9-quality-production",
+                "--checkpoint-uri", $checkpointUri,
+                "--transaction-prefix", "chapter9-production", "--job-version", "chapter-9-v1"
+            ) -FailureMessage "Production resume submission failed."
+            $id = Get-SubmittedJobId $output
+            Wait-FlinkJobRunning -JobId $id -ExpectedName $productionJobName | Out-Null
+            [pscustomobject]@{ job_id = $id }
+        }
+    $productionJobId = [string]$productionResult.job_id
     $productionCheckpoints = Wait-NewCompletedCheckpoint -JobId $productionJobId -ExpectedName $productionJobName
 
     if (-not $dorisJobId) {
@@ -1283,8 +1372,9 @@ $savepointPath = [string]$stopResult.savepoint_path
 Write-Host "[cutover] starting production DataStream from Savepoint"
 # Restore contract: flink run -d -s $savepointPath.
 # Production contract: --mode production --consumer-group chapter9-quality-production --transaction-prefix chapter9-production.
-$productionResult = Invoke-CutoverMutation -State $manifest -Path $manifestPartialPath `
-    -Stage "production_submit" -Operation "submit_production_from_savepoint" `
+$productionResult = Invoke-CutoverProductionSubmitBoundary -State $manifest -Path $manifestPartialPath `
+    -Jobs (Get-FlinkJobs) -ExpectedName $productionJobName `
+    -Operation "submit_production_from_savepoint" `
     -Details @{ name = $productionJobName; savepoint_path = $savepointPath } -Action {
         $output = Invoke-FlinkJobManagerCommand -Command @(
             "/opt/flink/bin/flink", "run", "-d", "-s", $savepointPath,
@@ -1300,10 +1390,7 @@ $productionResult = Invoke-CutoverMutation -State $manifest -Path $manifestParti
         [pscustomobject]@{ job_id = $id }
     }
 $productionJobId = [string]$productionResult.job_id
-Set-CutoverMutationJobId -State $manifest -Path $manifestPartialPath -Stage "production_submit" -JobId $productionJobId
 $productionCheckpoints = Wait-NewCompletedCheckpoint -JobId $productionJobId -ExpectedName $productionJobName
-$manifest["production_job_id"] = $productionJobId
-Write-ManifestPartial -Manifest $manifest -PartialPath $manifestPartialPath
 
 Write-Host "[cutover] submitting Doris clean SQL job"
 $dorisResult = Invoke-CutoverMutation -State $manifest -Path $manifestPartialPath `
