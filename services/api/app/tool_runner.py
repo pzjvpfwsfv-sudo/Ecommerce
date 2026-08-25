@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+from concurrent.futures import CancelledError, Future, ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from threading import BoundedSemaphore, Lock
 from typing import TypeVar
 
@@ -25,22 +25,20 @@ class BoundedToolRunner:
     def run(self, operation: Callable[[], Result], timeout_seconds: float) -> Result:
         if not self._capacity.acquire(blocking=False):
             raise ToolRunnerUnavailableError("tool runner unavailable")
-        try:
-            with self._lock:
-                if self._closed:
-                    raise ToolRunnerUnavailableError("tool runner unavailable")
+        with self._lock:
+            if self._closed:
+                self._capacity.release()
+                raise ToolRunnerUnavailableError("tool runner unavailable")
+            try:
                 future = self._executor.submit(operation)
-        except ToolRunnerUnavailableError:
-            self._capacity.release()
-            raise
-        except RuntimeError:
-            self._capacity.release()
-            raise ToolRunnerUnavailableError("tool runner unavailable") from None
+            except Exception:
+                self._capacity.release()
+                raise ToolRunnerUnavailableError("tool runner unavailable") from None
 
         future.add_done_callback(self._release_capacity)
         try:
             return future.result(timeout=timeout_seconds)
-        except FutureTimeoutError:
+        except (CancelledError, FutureTimeoutError):
             future.cancel()
             raise ToolRunnerUnavailableError("tool runner unavailable") from None
 

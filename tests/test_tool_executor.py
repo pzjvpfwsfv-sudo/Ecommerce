@@ -117,19 +117,44 @@ class CapturingHandler(logging.Handler):
 class ToolExecutorTest(unittest.TestCase):
     def test_executor_maps_runner_unavailability_to_the_existing_safe_error(self):
         class UnavailableRunner:
+            def __init__(self):
+                self.call_count = 0
+
             def run(self, operation, timeout_seconds):
+                self.call_count += 1
+                if self.call_count == 1:
+                    return operation()
                 raise ToolRunnerUnavailableError("password=secret")
 
             def close(self):
                 pass
 
-        executor = ToolExecutor(Mock(), Mock(), Mock(), 3, 1, 20, runner=UnavailableRunner())
+        realtime = Mock()
+        realtime.fetch_all_metrics.return_value = {"pv": 2, "uv": 2}
+        runner = UnavailableRunner()
+        executor = ToolExecutor(realtime, Mock(), Mock(), 3, 1, 20, runner=runner)
+        plan = ToolPlan(
+            calls=[
+                ToolCall(tool_id=ToolId.REALTIME),
+                ToolCall(tool_id=ToolId.HISTORICAL),
+            ]
+        )
+        logger = logging.getLogger("app.tool_executor")
+        handler = CapturingHandler()
+        old_level = logger.level
+        logger.setLevel(logging.INFO)
+        logger.addHandler(handler)
 
-        with self.assertRaisesRegex(ToolExecutionUnavailableError, "^tool execution unavailable$") as error:
-            executor.execute(realtime_plan(), "audit-runner-unavailable")
+        try:
+            with self.assertRaisesRegex(ToolExecutionUnavailableError, "^tool execution unavailable$") as error:
+                executor.execute(plan, "audit-runner-unavailable")
+        finally:
+            logger.removeHandler(handler)
+            logger.setLevel(old_level)
 
         self.assertIsNone(error.exception.__cause__)
         self.assertNotIn("secret", "".join(traceback.format_exception(error.exception)))
+        self.assertEqual([None, "budget_exceeded"], [record.error_type for record in handler.records])
 
     def test_executor_runs_fixed_registry_in_plan_order_and_builds_evidence(self):
         executor, realtime, historical, quality = make_executor()
