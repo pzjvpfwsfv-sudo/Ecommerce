@@ -15,6 +15,12 @@ JOBS_README = ROOT / "jobs" / "README.md"
 
 
 class Chapter4ArtifactsTest(unittest.TestCase):
+    def test_doris_initializer_accepts_and_uses_custom_env_file(self):
+        text = DORIS_RUNNER.read_text(encoding="utf-8")
+
+        self.assertIn("[string]$EnvFile", text)
+        self.assertIn("--env-file", text)
+        self.assertIn("$EnvFile", text)
     def test_env_file_includes_doris_and_api_variables(self):
         text = ENV_FILE.read_text(encoding="utf-8")
 
@@ -58,10 +64,9 @@ class Chapter4ArtifactsTest(unittest.TestCase):
         self.assertIn("function Invoke-CheckedCommand", text)
         self.assertIn("function Assert-DockerAvailable", text)
         self.assertIn("docker version", text)
-        self.assertIn('$feContainerName = "ecom-doris-fe"', text)
-        self.assertIn("docker compose", text)
-        self.assertIn("--profile serving up -d --quiet-pull doris-fe doris-be", text)
-        self.assertIn("docker exec $feContainerName sh -lc", text)
+        self.assertIn("$composePrefix", text)
+        self.assertIn("docker @composePrefix up -d --quiet-pull doris-fe doris-be", text)
+        self.assertIn("docker @composePrefix exec -T doris-fe sh -lc", text)
         self.assertIn("mysql -uroot -h127.0.0.1 -P9030", text)
         self.assertIn("SHOW BACKENDS", text)
         self.assertIn('$backendStatus -join "`n"', text)

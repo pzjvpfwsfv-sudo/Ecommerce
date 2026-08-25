@@ -1,4 +1,14 @@
-param([switch]$FunctionsOnly)
+param(
+    [switch]$FunctionsOnly,
+    [string]$EnvFile = "infra/.env.example"
+)
+
+$script:Chapter105CatalogRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+$script:Chapter105CatalogEnvFile = if ([System.IO.Path]::IsPathRooted($EnvFile)) {
+    [System.IO.Path]::GetFullPath($EnvFile)
+} else {
+    [System.IO.Path]::GetFullPath((Join-Path $script:Chapter105CatalogRoot $EnvFile))
+}
 
 function Invoke-Chapter105Compose {
     param(
@@ -6,11 +16,10 @@ function Invoke-Chapter105Compose {
         [Parameter(Mandatory = $true)][string]$FailureMessage
     )
 
-    $repositoryRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
     $composeArguments = @(
         "compose",
-        "--env-file", (Join-Path $repositoryRoot "infra/.env.example"),
-        "-f", (Join-Path $repositoryRoot "infra/docker-compose.yml"),
+        "--env-file", $script:Chapter105CatalogEnvFile,
+        "-f", (Join-Path $script:Chapter105CatalogRoot "infra/docker-compose.yml"),
         "--profile", "lakehouse"
     ) + $Arguments
 

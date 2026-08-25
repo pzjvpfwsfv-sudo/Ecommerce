@@ -55,12 +55,17 @@ function Assert-Chapter9StateUri {
 
 function Get-Chapter9StateUri {
     param(
-        [Parameter(Mandatory = $true)][ValidateSet("checkpoint", "savepoint")][string]$Kind
+        [Parameter(Mandatory = $true)][ValidateSet("checkpoint", "savepoint")][string]$Kind,
+        [System.Collections.IDictionary]$Environment
     )
 
     $default = "s3a://flink-state/$($Kind)s/chapter-9"
     $name = "CHAPTER9_$($Kind.ToUpperInvariant())_URI"
-    $configured = [Environment]::GetEnvironmentVariable($name)
+    $configured = if ($null -ne $Environment -and $Environment.Contains($name)) {
+        [string]$Environment[$name]
+    } else {
+        [Environment]::GetEnvironmentVariable($name)
+    }
     if ([string]::IsNullOrWhiteSpace($configured)) { $configured = $default }
     return Assert-Chapter9StateUri -Path $configured.Trim() -Kind $Kind
 }

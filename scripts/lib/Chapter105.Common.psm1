@@ -1,5 +1,3 @@
-Set-StrictMode -Version Latest
-
 function Test-DependencyHash {
     param(
         [Parameter(Mandatory = $true)][string]$Path,
@@ -218,6 +216,40 @@ function Get-Chapter105StableMinioDataPath {
     return Join-Path $root 'infra\compose\minio\data'
 }
 
+function Resolve-Chapter105RepositoryPath {
+    param(
+        [Parameter(Mandatory = $true)][string]$RepositoryRoot,
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$AllowedRelativeRoot
+    )
+
+    $root = [System.IO.Path]::GetFullPath($RepositoryRoot).TrimEnd('\', '/')
+    $allowedRoot = [System.IO.Path]::GetFullPath((Join-Path $root $AllowedRelativeRoot)).TrimEnd('\', '/')
+    $segments = @($Path.Split(@('\', '/'), [System.StringSplitOptions]::RemoveEmptyEntries))
+    if ($segments -contains '..') { throw 'Repository path traversal is not allowed.' }
+    $candidate = if ([System.IO.Path]::IsPathRooted($Path)) {
+        [System.IO.Path]::GetFullPath($Path)
+    } else {
+        [System.IO.Path]::GetFullPath((Join-Path $root $Path))
+    }
+    if (-not $candidate.StartsWith($allowedRoot + [System.IO.Path]::DirectorySeparatorChar,
+            [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw 'Repository path is outside its allowed root.'
+    }
+
+    $current = $root
+    $relative = $candidate.Substring($root.Length).TrimStart('\', '/')
+    foreach ($segment in $relative.Split(@('\', '/'), [System.StringSplitOptions]::RemoveEmptyEntries)) {
+        $current = Join-Path $current $segment
+        if (-not (Test-Path -LiteralPath $current)) { break }
+        $item = Get-Item -LiteralPath $current -Force
+        if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw 'Repository path contains a reparse point.'
+        }
+    }
+    return $candidate
+}
+
 function Invoke-Chapter105Native {
     param(
         [Parameter(Mandatory = $true)][string]$FilePath,
@@ -268,8 +300,11 @@ function ConvertTo-Chapter105RedactedValue {
         $result = [ordered]@{}
         foreach ($key in $Value.Keys) {
             $safeKey = [string]$key
-            if ($safeKey -match '(?i)password|secret|api[_-]?key|token') { $safeKey = '[REDACTED]' }
-            $result[$safeKey] = ConvertTo-Chapter105RedactedValue -Value $Value[$key]
+            if ($safeKey -match '(?i)password|secret|api[_-]?key|token') {
+                $result['[REDACTED]'] = '[REDACTED]'
+            } else {
+                $result[$safeKey] = ConvertTo-Chapter105RedactedValue -Value $Value[$key]
+            }
         }
         return $result
     }
@@ -277,8 +312,11 @@ function ConvertTo-Chapter105RedactedValue {
         $result = [ordered]@{}
         foreach ($property in $Value.PSObject.Properties) {
             $safeKey = [string]$property.Name
-            if ($safeKey -match '(?i)password|secret|api[_-]?key|token') { $safeKey = '[REDACTED]' }
-            $result[$safeKey] = ConvertTo-Chapter105RedactedValue -Value $property.Value
+            if ($safeKey -match '(?i)password|secret|api[_-]?key|token') {
+                $result['[REDACTED]'] = '[REDACTED]'
+            } else {
+                $result[$safeKey] = ConvertTo-Chapter105RedactedValue -Value $property.Value
+            }
         }
         return $result
     }
@@ -314,12 +352,16 @@ function Write-Chapter105BootstrapReport {
     }
 }
 
-Export-ModuleMember -Function @(
-    'Install-RuntimeDependencies',
-    'Read-Chapter105EnvFile',
-    'Get-Chapter105PrimaryRepositoryRoot',
-    'Get-Chapter105StableMinioDataPath',
-    'Invoke-Chapter105Native',
-    'Invoke-Chapter105Retry',
-    'Write-Chapter105BootstrapReport'
-)
+if ($MyInvocation.InvocationName -ne '.') {
+    Export-ModuleMember -Function @(
+        'Install-RuntimeDependencies',
+        'Read-Chapter105EnvFile',
+        'Get-Chapter105PrimaryRepositoryRoot',
+        'Get-Chapter105StableMinioDataPath',
+        'Resolve-Chapter105RepositoryPath',
+        'Invoke-Chapter105Native',
+        'Invoke-Chapter105Retry',
+        'ConvertTo-Chapter105RedactedValue',
+        'Write-Chapter105BootstrapReport'
+    )
+}

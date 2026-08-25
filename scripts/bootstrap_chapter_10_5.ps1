@@ -6,9 +6,8 @@ param(
     [switch]$FunctionsOnly
 )
 
-Set-StrictMode -Version Latest
-
-Import-Module (Join-Path $PSScriptRoot 'lib\Chapter105.Common.psm1') -Force
+. ([scriptblock]::Create([System.IO.File]::ReadAllText(
+            [System.IO.Path]::Combine($PSScriptRoot, 'lib', 'Chapter105.Common.psm1'))))
 
 function Get-Chapter105FlinkJobDecision {
     param(
@@ -16,21 +15,49 @@ function Get-Chapter105FlinkJobDecision {
         [Parameter(Mandatory = $true)][string]$JobName
     )
 
-    $jobsProperty = @($Overview.PSObject.Properties | Where-Object { $_.Name -ceq 'jobs' })
-    if ($Overview -isnot [System.Management.Automation.PSCustomObject] -or $jobsProperty.Count -ne 1 -or
-        $jobsProperty[0].Value -isnot [System.Collections.IEnumerable]) {
+    if ($Overview -isnot [System.Management.Automation.PSCustomObject]) {
         throw 'Flink jobs overview has an invalid structure.'
     }
-    $matches = @($jobsProperty[0].Value | Where-Object {
-        $_ -is [System.Management.Automation.PSCustomObject] -and [string]$_.name -ceq $JobName
-    })
-    if ($matches.Count -eq 0) { return [pscustomobject]@{ action = 'submit'; job_id = $null } }
-    if ($matches.Count -ne 1) { throw 'Flink job identity is ambiguous.' }
-    $job = $matches[0]
+    $jobsProperty = @($Overview.PSObject.Properties | Where-Object { $_.Name -ceq 'jobs' })
+    if ($jobsProperty.Count -ne 1 -or $jobsProperty[0].Value -isnot [System.Collections.IList] -or
+        $jobsProperty[0].Value -is [string]) {
+        throw 'Flink jobs overview has an invalid structure.'
+    }
+    $validStates = @('CREATED', 'RUNNING', 'FAILING', 'FAILED', 'CANCELLING', 'CANCELED', 'FINISHED', 'RESTARTING', 'SUSPENDED', 'RECONCILING', 'INITIALIZING')
+    $seenIds = @{}
+    $targetJobs = @()
+    foreach ($job in @($jobsProperty[0].Value)) {
+        if ($job -isnot [System.Management.Automation.PSCustomObject]) { throw 'Flink job entry has an invalid structure.' }
+        $jid = $job.PSObject.Properties['jid'].Value
+        $name = $job.PSObject.Properties['name'].Value
+        $state = $job.PSObject.Properties['state'].Value
+        if ($jid -isnot [string] -or $jid -cnotmatch '^[0-9a-f]{32}$' -or
+            $name -isnot [string] -or [string]::IsNullOrWhiteSpace($name) -or
+            $state -isnot [string] -or $validStates -notcontains $state -or $seenIds.ContainsKey($jid)) {
+            throw 'Flink job entry has an invalid structure.'
+        }
+        $seenIds[$jid] = $true
+        if ($name -ceq $JobName) { $targetJobs += $job }
+    }
+    if ($targetJobs.Count -eq 0) { return [pscustomobject]@{ action = 'submit'; job_id = $null } }
+    if ($targetJobs.Count -ne 1) { throw 'Flink job identity is ambiguous.' }
+    $job = $targetJobs[0]
     if ([string]$job.state -cne 'RUNNING' -or [string]$job.jid -cnotmatch '^[0-9a-f]{32}$') {
         throw 'Flink job identity is not a unique RUNNING job.'
     }
     return [pscustomobject]@{ action = 'no_op'; job_id = [string]$job.jid }
+}
+
+function Invoke-Chapter105EnsureJob {
+    param(
+        [Parameter(Mandatory = $true)][object]$Overview,
+        [Parameter(Mandatory = $true)][string]$JobName,
+        [Parameter(Mandatory = $true)][scriptblock]$SubmitAction
+    )
+
+    $decision = Get-Chapter105FlinkJobDecision -Overview $Overview -JobName $JobName
+    if ($decision.action -eq 'submit') { return & $SubmitAction }
+    return $decision
 }
 
 function Invoke-Chapter105FlinkOverview {
@@ -110,19 +137,53 @@ function Assert-Chapter105Preflight {
     return @{ repository_root = $RepositoryRoot; minio_data_dir = $minioDataPath }
 }
 
-function Wait-Chapter105ComposeReady {
-    param([Parameter(Mandatory = $true)][string[]]$ComposePrefix)
+function Assert-Chapter105ReportPathWritable {
+    param([Parameter(Mandatory = $true)][string]$Path)
 
-    Invoke-Chapter105Retry -Attempts 30 -SleepSeconds 2 -FailureMessage 'Compose services did not become ready.' -Action {
-        $raw = Invoke-Chapter105Native -FilePath 'docker' -Arguments ($ComposePrefix + @('ps', '--format', 'json')) -FailureMessage 'Compose status query failed.'
+    $directory = Split-Path -Parent $Path
+    [System.IO.Directory]::CreateDirectory($directory) | Out-Null
+    $probe = Join-Path $directory ".bootstrap-report-probe-$([Guid]::NewGuid().ToString('N'))"
+    try {
+        [System.IO.File]::WriteAllText($probe, '', [System.Text.UTF8Encoding]::new($false))
+    } catch {
+        throw 'Bootstrap report destination is not writable.'
+    } finally {
+        if (Test-Path -LiteralPath $probe -PathType Leaf) { Remove-Item -LiteralPath $probe -Force }
+    }
+}
+
+function Wait-Chapter105ComposeReady {
+    param(
+        [Parameter(Mandatory = $true)][string[]]$ComposePrefix,
+        [int]$Attempts = 30,
+        [int]$SleepSeconds = 2
+    )
+
+    Invoke-Chapter105Retry -Attempts $Attempts -SleepSeconds $SleepSeconds -FailureMessage 'Compose services did not become ready.' -Action {
+        $raw = Invoke-Chapter105Native -FilePath 'docker' -Arguments ($ComposePrefix + @('ps', '--all', '--format', 'json')) -FailureMessage 'Compose status query failed.'
         $services = @($raw | ForEach-Object { $_ | ConvertFrom-Json -ErrorAction Stop })
         $byService = @{}
-        foreach ($service in $services) { $byService[[string]$service.Service] = $service }
-        foreach ($serviceName in @('minio', 'minio-init', 'flink-jobmanager', 'flink-taskmanager', 'doris-fe', 'doris-be', 'trino')) {
+        foreach ($service in $services) {
+            $name = [string]$service.Service
+            if ([string]::IsNullOrWhiteSpace($name) -or $byService.ContainsKey($name)) { throw 'compose status is ambiguous' }
+            $byService[$name] = $service
+        }
+        $runningServices = @(
+            'kafka-controller', 'kafka-broker', 'api', 'flink-jobmanager', 'flink-taskmanager',
+            'flink-sql-client', 'doris-fe', 'doris-be', 'minio', 'metastore-postgres',
+            'hive-metastore', 'trino'
+        )
+        foreach ($serviceName in $runningServices + @('minio-init')) {
             if (-not $byService.ContainsKey($serviceName)) { throw 'required service is absent' }
         }
-        if ([string]$byService['minio'].Health -ne 'healthy' -or [string]$byService['minio-init'].State -ne 'exited' -or
-            [int]$byService['minio-init'].ExitCode -ne 0) { throw 'services are not ready' }
+        foreach ($serviceName in $runningServices) {
+            $service = $byService[$serviceName]
+            $health = [string]$service.Health
+            if ([string]$service.State -ne 'running' -or ($health -and $health -ne 'healthy')) { throw 'services are not ready' }
+        }
+        if ([string]$byService['minio-init'].State -ne 'exited' -or [int]$byService['minio-init'].ExitCode -ne 0) {
+            throw 'services are not ready'
+        }
         return @{ services = $byService.Count }
     }
 }
@@ -132,20 +193,65 @@ function Invoke-Chapter105JobSubmission {
         [Parameter(Mandatory = $true)][string]$RepositoryRoot,
         [Parameter(Mandatory = $true)][string[]]$ComposePrefix,
         [Parameter(Mandatory = $true)][string]$CheckpointUri,
+        [string]$SavepointPath,
         [switch]$SkipBuild
     )
 
     if (-not $SkipBuild) {
         Invoke-Chapter105Native -FilePath 'mvn' -Arguments @('-f', (Join-Path $RepositoryRoot 'jobs\datastream-quality\pom.xml'), '-DskipTests', 'package') -FailureMessage 'Flink job build failed.' | Out-Null
     }
-    Invoke-Chapter105Native -FilePath 'docker' -Arguments ($ComposePrefix + @(
-        'exec', '-T', 'flink-jobmanager', '/opt/flink/bin/flink', 'run', '-d',
+    $runArguments = @(
+        'exec', '-T', 'flink-jobmanager', '/opt/flink/bin/flink', 'run', '-d'
+    )
+    if ($SavepointPath) {
+        $runArguments += @('-s', (Assert-CutoverSavepointPath -Path $SavepointPath))
+    }
+    $runArguments += @(
         '-c', 'com.ecommerce.quality.DataQualityJob',
         '/workspace/jobs/datastream-quality/target/datastream-quality-1.0.0.jar',
         '--bootstrap-servers', 'kafka:29092', '--input-topic', 'user_behavior_events', '--mode', 'production',
         '--consumer-group', 'chapter9-quality-production', '--checkpoint-uri', $CheckpointUri,
         '--transaction-prefix', 'chapter9-production', '--job-version', 'chapter-9-v1'
-    )) -FailureMessage 'Flink job submission failed.' | Out-Null
+    )
+    $output = Invoke-Chapter105Native -FilePath 'docker' -Arguments ($ComposePrefix + $runArguments) -FailureMessage 'Flink job submission failed.'
+    return Get-SubmittedJobId -Lines $output
+}
+
+function Get-Chapter105Task4RecoveryPlan {
+    param([Parameter(Mandatory = $true)][string]$RepositoryRoot)
+
+    $stateRoot = Join-Path $RepositoryRoot 'tmp\chapter-9'
+    $finalPath = Join-Path $stateRoot 'cutover-manifest.json'
+    $partialPath = Join-Path $stateRoot 'cutover-manifest.json.partial'
+    $statePath = if (Test-Path -LiteralPath $finalPath -PathType Leaf) {
+        $finalPath
+    } elseif (Test-Path -LiteralPath $partialPath -PathType Leaf) {
+        $partialPath
+    } else {
+        return [pscustomobject]@{ action = 'fresh'; savepoint_path = $null; state_path = $null }
+    }
+    try {
+        $state = Get-Content -LiteralPath $statePath -Raw -Encoding UTF8 | ConvertFrom-Json -ErrorAction Stop
+        $savepointPath = Assert-CutoverSavepointPath -Path ([string]$state.savepoint_path)
+    } catch {
+        throw 'Task 4 recovery state is invalid.'
+    }
+    return [pscustomobject]@{ action = 'restore'; savepoint_path = $savepointPath; state_path = $statePath }
+}
+
+function Invoke-Chapter105PersistentJobMutation {
+    param(
+        [Parameter(Mandatory = $true)][object]$State,
+        [Parameter(Mandatory = $true)][string]$StatePath,
+        [Parameter(Mandatory = $true)][scriptblock]$SubmitAction
+    )
+
+    $mutation = $State.mutations.production_submit
+    if ($null -eq $mutation -or [string]$mutation.status -cne 'not_started') {
+        throw 'Persisted production submission outcome is ambiguous.'
+    }
+    return Invoke-CutoverMutation -State $State -Path $StatePath -Stage 'production_submit' `
+        -Operation 'bootstrap_production_submit' -Details @{ source = 'bootstrap' } -Action $SubmitAction
 }
 
 function Assert-Chapter105FreshCheckpoint {
@@ -160,12 +266,65 @@ function Assert-Chapter105FreshCheckpoint {
         $counts.PSObject.Properties['completed'].Value -isnot [System.ValueType] -or $latest.PSObject.Properties['completed'].Value -isnot [System.Management.Automation.PSCustomObject]) {
         throw 'Flink checkpoint response has an invalid structure.'
     }
+    $completedRecord = $latest.PSObject.Properties['completed'].Value
+    if ($completedRecord.PSObject.Properties['status'].Value -cne 'COMPLETED') {
+        throw 'Flink checkpoint response has no completed checkpoint.'
+    }
     $completed = [int64]$counts.PSObject.Properties['completed'].Value
-    $timestamp = [int64]$latest.PSObject.Properties['completed'].Value.PSObject.Properties['latest_ack_timestamp'].Value
+    $timestamp = [int64]$completedRecord.PSObject.Properties['latest_ack_timestamp'].Value
     $checkpointTime = [DateTimeOffset]::FromUnixTimeMilliseconds($timestamp)
     $age = [DateTimeOffset]::UtcNow - $checkpointTime
     if ($completed -lt 1 -or $age.TotalSeconds -lt 0 -or $age.TotalSeconds -gt $MaxAgeSeconds) {
         throw 'Flink checkpoint is not fresh.'
+    }
+}
+
+function Wait-Chapter105Ready {
+    param(
+        [Parameter(Mandatory = $true)][int]$ApiPort,
+        [int]$Attempts = 30,
+        [int]$SleepSeconds = 2
+    )
+
+    Invoke-Chapter105Retry -Attempts $Attempts -SleepSeconds $SleepSeconds -FailureMessage 'Readiness acceptance failed.' -Action {
+        $response = Invoke-WebRequest -UseBasicParsing -Uri "http://localhost:$ApiPort/ready" -TimeoutSec 5 -ErrorAction Stop
+        if ($response.StatusCode -ne 200) { throw 'not ready' }
+        $payload = $response.Content | ConvertFrom-Json -ErrorAction Stop
+        if ($payload -isnot [System.Management.Automation.PSCustomObject] -or [string]$payload.status -cne 'ready') {
+            throw 'not ready'
+        }
+        return 'ready'
+    }
+}
+
+function Wait-Chapter105UniqueRunningJob {
+    param(
+        [Parameter(Mandatory = $true)][int]$FlinkPort,
+        [Parameter(Mandatory = $true)][string]$JobName,
+        [int]$Attempts = 30,
+        [int]$SleepSeconds = 2
+    )
+
+    Invoke-Chapter105Retry -Attempts $Attempts -SleepSeconds $SleepSeconds -FailureMessage 'Flink job did not reach a unique RUNNING state.' -Action {
+        $decision = Get-Chapter105FlinkJobDecision -Overview (Invoke-Chapter105FlinkOverview -Port $FlinkPort) -JobName $JobName
+        if ($decision.action -ne 'no_op') { throw 'job pending' }
+        return $decision
+    }
+}
+
+function Wait-Chapter105CompletedCheckpoint {
+    param(
+        [Parameter(Mandatory = $true)][int]$FlinkPort,
+        [Parameter(Mandatory = $true)][string]$JobId,
+        [Parameter(Mandatory = $true)][int]$MaxAgeSeconds,
+        [int]$Attempts = 30,
+        [int]$SleepSeconds = 2
+    )
+
+    Invoke-Chapter105Retry -Attempts $Attempts -SleepSeconds $SleepSeconds -FailureMessage 'Flink completed checkpoint did not become fresh.' -Action {
+        $checkpoints = Invoke-Chapter105FlinkResource -Port $FlinkPort -Resource "/jobs/$JobId/checkpoints"
+        Assert-Chapter105FreshCheckpoint -Checkpoints $checkpoints -MaxAgeSeconds $MaxAgeSeconds
+        return 'completed'
     }
 }
 
@@ -178,14 +337,8 @@ function Invoke-Chapter105Acceptance {
         [Parameter(Mandatory = $true)][string[]]$ComposePrefix
     )
 
-    try {
-        $ready = Invoke-WebRequest -UseBasicParsing -Uri "http://localhost:$ApiPort/ready" -TimeoutSec 5 -ErrorAction Stop
-        if ($ready.StatusCode -ne 200) { throw 'not ready' }
-        $payload = $ready.Content | ConvertFrom-Json -ErrorAction Stop
-        if ([string]$payload.status -cne 'ready') { throw 'not ready' }
-    } catch { throw 'Readiness acceptance failed.' }
-    $decision = Get-Chapter105FlinkJobDecision -Overview (Invoke-Chapter105FlinkOverview -Port $FlinkPort) -JobName $JobName
-    if ($decision.action -ne 'no_op') { throw 'Flink job acceptance failed.' }
+    $null = Wait-Chapter105Ready -ApiPort $ApiPort
+    $decision = Wait-Chapter105UniqueRunningJob -FlinkPort $FlinkPort -JobName $JobName
     $doris = Invoke-Chapter105Native -FilePath 'docker' -Arguments ($ComposePrefix + @(
         'exec', '-T', 'doris-fe', 'mysql', '-h127.0.0.1', '-P9030', '-uroot', '-N', '-e',
         'SELECT COUNT(*) FROM analytics.realtime_metrics;'
@@ -197,66 +350,124 @@ function Invoke-Chapter105Acceptance {
     )) -FailureMessage 'Trino fixed table acceptance failed.'
     $trinoLines = @($trino | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
     if ($trinoLines.Count -ne 2 -or $trinoLines[0] -cne 'event_count' -or $trinoLines[1] -notmatch '^[0-9]+$') { throw 'Trino fixed table acceptance failed.' }
-    Assert-Chapter105FreshCheckpoint -Checkpoints (Invoke-Chapter105FlinkResource -Port $FlinkPort -Resource "/jobs/$($decision.job_id)/checkpoints") -MaxAgeSeconds $CheckpointMaxAgeSeconds
+    $null = Wait-Chapter105CompletedCheckpoint -FlinkPort $FlinkPort -JobId $decision.job_id -MaxAgeSeconds $CheckpointMaxAgeSeconds
     & (Join-Path $PSScriptRoot 'verify_chapter_10_tool_analysis.ps1') -AnalysisBaseUrl "http://localhost:$ApiPort" | Out-Null
     return @{ job_id = $decision.job_id; ready = $true; tools = 'rule_based' }
 }
 
 if ($FunctionsOnly) { return }
 
-$ErrorActionPreference = 'Stop'
-$report = New-Chapter105BootstrapReport
-try {
+& {
+    Set-StrictMode -Version Latest
+    $ErrorActionPreference = 'Stop'
+    $report = New-Chapter105BootstrapReport
     $repositoryRoot = Get-Chapter105PrimaryRepositoryRoot -StartPath $PSScriptRoot
-    $envPath = if ([System.IO.Path]::IsPathRooted($EnvFile)) { $EnvFile } else { Join-Path $repositoryRoot $EnvFile }
-    $environment = Read-Chapter105EnvFile -Path $envPath
-    $environment['MINIO_DATA_DIR'] = Get-Chapter105StableMinioDataPath -RepositoryRoot $repositoryRoot
-    $env:MINIO_DATA_DIR = $environment['MINIO_DATA_DIR']
-    $composePrefix = @('compose', '--env-file', $envPath, '-f', (Join-Path $repositoryRoot 'infra\docker-compose.yml'), '--profile', 'flink', '--profile', 'serving', '--profile', 'lakehouse')
+    $defaultReportPath = Resolve-Chapter105RepositoryPath -RepositoryRoot $repositoryRoot `
+        -Path 'tmp/chapter-10-5/bootstrap-report.json' -AllowedRelativeRoot 'tmp/chapter-10-5'
+    $context = [pscustomobject]@{
+        ReportPath = $defaultReportPath
+        EnvPath = $null
+        Environment = $null
+        ComposePrefix = $null
+    }
     $jobName = 'chapter-9-datastream-quality-production'
-
-    Invoke-Chapter105BootstrapStage -Report $report -Name 'preflight' -Action { Assert-Chapter105Preflight -RepositoryRoot $repositoryRoot -Environment $environment }
-    Invoke-Chapter105BootstrapStage -Report $report -Name 'dependencies' -Action {
-        Invoke-Chapter105Native -FilePath 'powershell' -Arguments @('-NoProfile', '-File', (Join-Path $PSScriptRoot 'install_runtime_dependencies.ps1'), '-RepositoryRoot', $repositoryRoot) -FailureMessage 'Runtime dependency installation failed.' | Out-Null
-        @{ installer = 'completed' }
-    }
-    Invoke-Chapter105BootstrapStage -Report $report -Name 'infrastructure' -Action {
-        Invoke-Chapter105Native -FilePath 'docker' -Arguments ($composePrefix + @('up', '-d')) -FailureMessage 'Infrastructure startup failed.' | Out-Null
-        Wait-Chapter105ComposeReady -ComposePrefix $composePrefix
-    }
-    Invoke-Chapter105BootstrapStage -Report $report -Name 'initialization' -Action {
-        Invoke-Chapter105Native -FilePath 'docker' -Arguments ($composePrefix + @('exec', '-T', 'kafka', 'kafka-topics', '--bootstrap-server', 'kafka:29092', '--create', '--if-not-exists', '--topic', 'user_behavior_events', '--partitions', '1', '--replication-factor', '1')) -FailureMessage 'Kafka topic initialization failed.' | Out-Null
-        Invoke-Chapter105Native -FilePath 'powershell' -Arguments @('-NoProfile', '-File', (Join-Path $PSScriptRoot 'init_doris_realtime_metrics.ps1')) -FailureMessage 'Doris initialization failed.' | Out-Null
-        @{ topic = 'user_behavior_events'; doris = 'initialized'; minio_buckets = 'compose-init' }
-    }
-    Invoke-Chapter105BootstrapStage -Report $report -Name 'catalog' -Action {
-        Invoke-Chapter105Native -FilePath 'powershell' -Arguments @('-NoProfile', '-File', (Join-Path $PSScriptRoot 'restore_chapter_10_5_catalog.ps1')) -FailureMessage 'Catalog recovery failed.' | Out-Null
-        @{ catalog = 'recovered' }
-    }
-    Invoke-Chapter105BootstrapStage -Report $report -Name 'jobs' -Action {
-        . (Join-Path $PSScriptRoot 'run_chapter_9_production_cutover.ps1') -FunctionsOnly
-        $decision = Get-Chapter105FlinkJobDecision -Overview (Invoke-Chapter105FlinkOverview -Port ([int]$environment['FLINK_REST_PORT'])) -JobName $jobName
-        if ($decision.action -eq 'submit') {
-            $checkpointUri = Get-Chapter9StateUri -Kind 'checkpoint'
-            Invoke-Chapter105JobSubmission -RepositoryRoot $repositoryRoot -ComposePrefix $composePrefix -CheckpointUri $checkpointUri -SkipBuild:$SkipBuild
-            $decision = Invoke-Chapter105Retry -Attempts 30 -SleepSeconds 2 -FailureMessage 'Flink job did not reach a unique RUNNING state.' -Action {
-                $current = Get-Chapter105FlinkJobDecision -Overview (Invoke-Chapter105FlinkOverview -Port ([int]$environment['FLINK_REST_PORT'])) -JobName $jobName
-                if ($current.action -ne 'no_op') { throw 'job pending' }
-                $current
-            }
+    $bootstrapFailed = $false
+    $reportWriteFailed = $false
+    $previousMinioDataDir = [Environment]::GetEnvironmentVariable('MINIO_DATA_DIR', 'Process')
+    try {
+        Invoke-Chapter105BootstrapStage -Report $report -Name 'preflight' -Action {
+            $requestedReportPath = Resolve-Chapter105RepositoryPath -RepositoryRoot $repositoryRoot `
+                -Path $ReportPath -AllowedRelativeRoot 'tmp/chapter-10-5'
+            Assert-Chapter105ReportPathWritable -Path $requestedReportPath
+            $context.ReportPath = $requestedReportPath
+            $context.EnvPath = Resolve-Chapter105RepositoryPath -RepositoryRoot $repositoryRoot `
+                -Path $EnvFile -AllowedRelativeRoot 'infra'
+            $context.Environment = Read-Chapter105EnvFile -Path $context.EnvPath
+            $context.Environment['MINIO_DATA_DIR'] = Get-Chapter105StableMinioDataPath -RepositoryRoot $repositoryRoot
+            [Environment]::SetEnvironmentVariable('MINIO_DATA_DIR', $context.Environment['MINIO_DATA_DIR'], 'Process')
+            $context.ComposePrefix = @(
+                'compose', '--env-file', $context.EnvPath, '-f', (Join-Path $repositoryRoot 'infra\docker-compose.yml'),
+                '--profile', 'flink', '--profile', 'serving', '--profile', 'lakehouse'
+            )
+            Assert-Chapter105Preflight -RepositoryRoot $repositoryRoot -Environment $context.Environment
         }
-        @{ job_id = $decision.job_id; action = $decision.action }
+        $envPath = $context.EnvPath
+        Invoke-Chapter105BootstrapStage -Report $report -Name 'dependencies' -Action {
+            Invoke-Chapter105Native -FilePath 'powershell' -Arguments @(
+                '-NoProfile', '-File', (Join-Path $PSScriptRoot 'install_runtime_dependencies.ps1'),
+                '-RepositoryRoot', $repositoryRoot
+            ) -FailureMessage 'Runtime dependency installation failed.' | Out-Null
+            @{ installer = 'completed' }
+        }
+        Invoke-Chapter105BootstrapStage -Report $report -Name 'infrastructure' -Action {
+            Invoke-Chapter105Native -FilePath 'docker' -Arguments ($context.ComposePrefix + @('up', '-d')) `
+                -FailureMessage 'Infrastructure startup failed.' | Out-Null
+            Wait-Chapter105ComposeReady -ComposePrefix $context.ComposePrefix
+        }
+        Invoke-Chapter105BootstrapStage -Report $report -Name 'initialization' -Action {
+            Invoke-Chapter105Native -FilePath 'docker' -Arguments ($context.ComposePrefix + @(
+                'exec', '-T', 'kafka-broker', 'kafka-topics', '--bootstrap-server', 'kafka-broker:29092',
+                '--create', '--if-not-exists', '--topic', 'user_behavior_events', '--partitions', '1', '--replication-factor', '1'
+            )) -FailureMessage 'Kafka topic initialization failed.' | Out-Null
+            Invoke-Chapter105Native -FilePath 'powershell' -Arguments @(
+                '-NoProfile', '-File', (Join-Path $PSScriptRoot 'init_doris_realtime_metrics.ps1'),
+                '-EnvFile', $envPath
+            ) -FailureMessage 'Doris initialization failed.' | Out-Null
+            @{ topic = 'user_behavior_events'; doris = 'initialized'; minio_buckets = 'compose-init' }
+        }
+        Invoke-Chapter105BootstrapStage -Report $report -Name 'catalog' -Action {
+            Invoke-Chapter105Native -FilePath 'powershell' -Arguments @(
+                '-NoProfile', '-File', (Join-Path $PSScriptRoot 'restore_chapter_10_5_catalog.ps1'),
+                '-EnvFile', $envPath
+            ) -FailureMessage 'Catalog recovery failed.' | Out-Null
+            @{ catalog = 'recovered' }
+        }
+        Invoke-Chapter105BootstrapStage -Report $report -Name 'jobs' -Action {
+            . (Join-Path $PSScriptRoot 'run_chapter_9_production_cutover.ps1') -FunctionsOnly
+            $overview = Invoke-Chapter105FlinkOverview -Port ([int]$context.Environment['FLINK_REST_PORT'])
+            $decision = Invoke-Chapter105EnsureJob -Overview $overview -JobName $jobName -SubmitAction {
+                $recovery = Get-Chapter105Task4RecoveryPlan -RepositoryRoot $repositoryRoot
+                $statePath = Resolve-Chapter105RepositoryPath -RepositoryRoot $repositoryRoot `
+                    -Path 'tmp/chapter-10-5/job-recovery.json' -AllowedRelativeRoot 'tmp/chapter-10-5'
+                $state = if (Test-Path -LiteralPath $statePath -PathType Leaf) {
+                    $loaded = Get-Content -LiteralPath $statePath -Raw -Encoding UTF8 | ConvertFrom-Json -ErrorAction Stop
+                    Ensure-CutoverRecoveryState -State $loaded -Path $statePath
+                } else {
+                    New-CutoverRecoveryState -CutoverId 'chapter-10-5-bootstrap' -Path $statePath
+                }
+                $checkpointUri = Get-Chapter9StateUri -Kind 'checkpoint' -Environment $context.Environment
+                $submission = Invoke-Chapter105PersistentJobMutation -State $state -StatePath $statePath -SubmitAction {
+                    $id = Invoke-Chapter105JobSubmission -RepositoryRoot $repositoryRoot -ComposePrefix $context.ComposePrefix `
+                        -CheckpointUri $checkpointUri -SavepointPath $recovery.savepoint_path -SkipBuild:$SkipBuild
+                    [pscustomobject]@{ job_id = $id }
+                }
+                [pscustomobject]@{ action = 'submitted'; job_id = [string]$submission.job_id }
+            }
+            if ($decision.action -eq 'submitted') {
+                $running = Wait-Chapter105UniqueRunningJob -FlinkPort ([int]$context.Environment['FLINK_REST_PORT']) -JobName $jobName
+                if ($running.job_id -ne $decision.job_id) { throw 'Submitted Flink job identity changed during recovery.' }
+            }
+            @{ job_id = $decision.job_id; action = $decision.action }
+        }
+        Invoke-Chapter105BootstrapStage -Report $report -Name 'acceptance' -Action {
+            Invoke-Chapter105Acceptance -ApiPort ([int]$context.Environment['API_PORT']) `
+                -FlinkPort ([int]$context.Environment['FLINK_REST_PORT']) -JobName $jobName `
+                -CheckpointMaxAgeSeconds ([int]$context.Environment['FLINK_CHECKPOINT_MAX_AGE_SECONDS']) `
+                -ComposePrefix $context.ComposePrefix
+        }
+        $report.status = 'passed'
+    } catch {
+        $bootstrapFailed = $true
+        $report.status = 'failed'
+    } finally {
+        [Environment]::SetEnvironmentVariable('MINIO_DATA_DIR', $previousMinioDataDir, 'Process')
+        $report.completed_at = [DateTimeOffset]::UtcNow.ToString('o')
+        try {
+            Write-Chapter105BootstrapReport -Report $report -Path $context.ReportPath
+        } catch {
+            $reportWriteFailed = $true
+        }
     }
-    Invoke-Chapter105BootstrapStage -Report $report -Name 'acceptance' -Action {
-        Invoke-Chapter105Acceptance -ApiPort ([int]$environment['API_PORT']) -FlinkPort ([int]$environment['FLINK_REST_PORT']) `
-            -JobName $jobName -CheckpointMaxAgeSeconds ([int]$environment['FLINK_CHECKPOINT_MAX_AGE_SECONDS']) -ComposePrefix $composePrefix
-    }
-    $report.status = 'passed'
-} catch {
-    $report.status = 'failed'
-} finally {
-    $report.completed_at = [DateTimeOffset]::UtcNow.ToString('o')
-    Write-Chapter105BootstrapReport -Report $report -Path $ReportPath
+    if ($reportWriteFailed) { throw 'Chapter 10.5 bootstrap report could not be written safely.' }
+    if ($bootstrapFailed) { throw 'Chapter 10.5 bootstrap failed. See the bootstrap report for safe stage status.' }
 }
-
-if ($report.status -ne 'passed') { throw 'Chapter 10.5 bootstrap failed. See the bootstrap report for safe stage status.' }

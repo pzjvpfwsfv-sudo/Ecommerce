@@ -12,6 +12,21 @@ UUID_TWO = "22222222-2222-4222-8222-222222222222"
 
 
 class Chapter105CatalogRecoveryTest(unittest.TestCase):
+    def test_custom_env_file_is_used_by_compose_wrapper(self):
+        payload = self._payload(
+            r'''
+. (Resolve-Path "scripts/restore_chapter_10_5_catalog.ps1") -FunctionsOnly -EnvFile "infra/custom.env"
+$script:capturedArguments = @()
+function docker {
+    $script:capturedArguments = @($args)
+    $global:LASTEXITCODE = 0
+    return "ok"
+}
+$null = Invoke-Chapter105Compose -Arguments @("ps") -FailureMessage "failed"
+[ordered]@{ env_file = $script:capturedArguments[2] } | ConvertTo-Json -Compress
+'''
+        )
+        self.assertEqual(str(ROOT / "infra" / "custom.env"), payload["env_file"])
     def _run_powershell(self, command):
         return subprocess.run(
             ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command],
