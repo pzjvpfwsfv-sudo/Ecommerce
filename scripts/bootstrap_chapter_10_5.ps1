@@ -6,8 +6,42 @@ param(
     [switch]$FunctionsOnly
 )
 
-. ([scriptblock]::Create([System.IO.File]::ReadAllText(
-            [System.IO.Path]::Combine($PSScriptRoot, 'lib', 'Chapter105.Common.psm1'))))
+$chapter105BeforeModules = @(Get-Module)
+$chapter105CommonModule = Import-Module ([System.IO.Path]::Combine($PSScriptRoot, 'lib', 'Chapter105.Common.psm1')) -PassThru
+$chapter105PublicFunctions = @(
+    'Read-Chapter105EnvFile',
+    'Get-Chapter105PrimaryRepositoryRoot',
+    'Get-Chapter105StableMinioDataPath',
+    'Resolve-Chapter105RepositoryPath',
+    'Invoke-Chapter105Native',
+    'Invoke-Chapter105Retry',
+    'ConvertTo-Chapter105RedactedValue',
+    'Write-Chapter105BootstrapReport'
+)
+$chapter105Definitions = @{}
+foreach ($chapter105Name in $chapter105PublicFunctions) {
+    if (-not $chapter105CommonModule.ExportedFunctions.ContainsKey($chapter105Name)) {
+        throw 'Chapter 10.5 Common module test interface is incomplete.'
+    }
+    $chapter105Definitions[$chapter105Name] = $chapter105CommonModule.ExportedFunctions[$chapter105Name].ScriptBlock
+}
+if ($chapter105BeforeModules -notcontains $chapter105CommonModule) {
+    Remove-Module $chapter105CommonModule -Force
+}
+foreach ($chapter105Name in $chapter105PublicFunctions) {
+    Set-Item -LiteralPath "Function:$chapter105Name" -Value $chapter105Definitions[$chapter105Name]
+}
+foreach ($chapter105LoadedModule in @(Get-Module)) {
+    if ($chapter105BeforeModules -notcontains $chapter105LoadedModule) {
+        Remove-Module $chapter105LoadedModule -Force
+    }
+}
+foreach ($chapter105Variable in @(
+        'chapter105BeforeModules', 'chapter105CommonModule', 'chapter105PublicFunctions',
+        'chapter105Definitions', 'chapter105Name', 'chapter105LoadedModule', 'chapter105Variable'
+    )) {
+    $ExecutionContext.SessionState.PSVariable.Remove($chapter105Variable)
+}
 
 function Get-Chapter105FlinkJobDecision {
     param(
@@ -33,7 +67,7 @@ function Get-Chapter105FlinkJobDecision {
         $state = $job.PSObject.Properties['state'].Value
         if ($jid -isnot [string] -or $jid -cnotmatch '^[0-9a-f]{32}$' -or
             $name -isnot [string] -or [string]::IsNullOrWhiteSpace($name) -or
-            $state -isnot [string] -or $validStates -notcontains $state -or $seenIds.ContainsKey($jid)) {
+            $state -isnot [string] -or $validStates -cnotcontains $state -or $seenIds.ContainsKey($jid)) {
             throw 'Flink job entry has an invalid structure.'
         }
         $seenIds[$jid] = $true
@@ -117,7 +151,7 @@ function Assert-Chapter105Preflight {
             throw 'Environment port configuration is invalid.'
         }
     }
-    foreach ($key in @('MINIO_ROOT_USER', 'MINIO_ROOT_PASSWORD', 'DORIS_DATABASE', 'DORIS_TABLE_REALTIME_METRICS', 'CHAPTER9_CHECKPOINT_URI', 'FLINK_CHECKPOINT_MAX_AGE_SECONDS')) {
+    foreach ($key in @('MINIO_ROOT_USER', 'MINIO_ROOT_PASSWORD', 'DORIS_DATABASE', 'DORIS_TABLE_REALTIME_METRICS', 'CHAPTER9_CHECKPOINT_URI', 'CHAPTER9_SAVEPOINT_URI', 'FLINK_CHECKPOINT_MAX_AGE_SECONDS')) {
         if (-not $Environment.ContainsKey($key) -or [string]::IsNullOrWhiteSpace([string]$Environment[$key])) {
             throw 'Environment required configuration is missing.'
         }
@@ -152,6 +186,28 @@ function Assert-Chapter105ReportPathWritable {
     }
 }
 
+function ConvertFrom-Chapter105ComposePsOutput {
+    param([Parameter(Mandatory = $true)][string[]]$Lines)
+
+    if ($Lines.Count -lt 1) { throw 'compose status has an invalid structure' }
+    foreach ($line in $Lines) {
+        if ([string]::IsNullOrWhiteSpace($line)) { throw 'compose status has an invalid structure' }
+        $parsed = $line | ConvertFrom-Json -ErrorAction Stop
+        if ($parsed -is [System.Collections.IList] -and $parsed -isnot [string]) {
+            foreach ($item in $parsed) {
+                if ($item -isnot [System.Management.Automation.PSCustomObject]) {
+                    throw 'compose status has an invalid structure'
+                }
+                Write-Output $item
+            }
+        } elseif ($parsed -is [System.Management.Automation.PSCustomObject]) {
+            Write-Output $parsed
+        } else {
+            throw 'compose status has an invalid structure'
+        }
+    }
+}
+
 function Wait-Chapter105ComposeReady {
     param(
         [Parameter(Mandatory = $true)][string[]]$ComposePrefix,
@@ -161,7 +217,7 @@ function Wait-Chapter105ComposeReady {
 
     Invoke-Chapter105Retry -Attempts $Attempts -SleepSeconds $SleepSeconds -FailureMessage 'Compose services did not become ready.' -Action {
         $raw = Invoke-Chapter105Native -FilePath 'docker' -Arguments ($ComposePrefix + @('ps', '--all', '--format', 'json')) -FailureMessage 'Compose status query failed.'
-        $services = @($raw | ForEach-Object { $_ | ConvertFrom-Json -ErrorAction Stop })
+        $services = @(ConvertFrom-Chapter105ComposePsOutput -Lines $raw)
         $byService = @{}
         foreach ($service in $services) {
             $name = [string]$service.Service
@@ -218,8 +274,14 @@ function Invoke-Chapter105JobSubmission {
 }
 
 function Get-Chapter105Task4RecoveryPlan {
-    param([Parameter(Mandatory = $true)][string]$RepositoryRoot)
+    param(
+        [Parameter(Mandatory = $true)][string]$RepositoryRoot,
+        [Parameter(Mandatory = $true)][string]$SavepointUri
+    )
 
+    $validatedSavepointUri = Get-Chapter9StateUri -Kind 'savepoint' -Environment @{
+        CHAPTER9_SAVEPOINT_URI = $SavepointUri
+    }
     $stateRoot = Join-Path $RepositoryRoot 'tmp\chapter-9'
     $finalPath = Join-Path $stateRoot 'cutover-manifest.json'
     $partialPath = Join-Path $stateRoot 'cutover-manifest.json.partial'
@@ -232,7 +294,22 @@ function Get-Chapter105Task4RecoveryPlan {
     }
     try {
         $state = Get-Content -LiteralPath $statePath -Raw -Encoding UTF8 | ConvertFrom-Json -ErrorAction Stop
+        if ($state -isnot [System.Management.Automation.PSCustomObject] -or
+            $state.PSObject.Properties['mutations'].Value -isnot [System.Management.Automation.PSCustomObject]) {
+            throw 'invalid state'
+        }
+        $mutation = $state.PSObject.Properties['mutations'].Value.PSObject.Properties['production_submit'].Value
+        if ($mutation -isnot [System.Management.Automation.PSCustomObject] -or
+            $mutation.PSObject.Properties['status'].Value -isnot [string] -or
+            [string]$mutation.PSObject.Properties['status'].Value -cne 'not_started' -or
+            $null -ne $mutation.PSObject.Properties['intent'].Value -or
+            $null -ne $mutation.PSObject.Properties['result'].Value) {
+            throw 'unsafe production mutation'
+        }
         $savepointPath = Assert-CutoverSavepointPath -Path ([string]$state.savepoint_path)
+        if (-not $savepointPath.StartsWith($validatedSavepointUri.TrimEnd('/') + '/', [System.StringComparison]::Ordinal)) {
+            throw 'savepoint base mismatch'
+        }
     } catch {
         throw 'Task 4 recovery state is invalid.'
     }
@@ -355,20 +432,26 @@ function Invoke-Chapter105Acceptance {
     return @{ job_id = $decision.job_id; ready = $true; tools = 'rule_based' }
 }
 
-if ($FunctionsOnly) { return }
+function Invoke-Chapter105Bootstrap {
+    param(
+        [string]$EnvFile = 'infra/.env',
+        [switch]$SkipBuild,
+        [string]$ReportPath = 'tmp/chapter-10-5/bootstrap-report.json'
+    )
 
-& {
     Set-StrictMode -Version Latest
     $ErrorActionPreference = 'Stop'
     $report = New-Chapter105BootstrapReport
-    $repositoryRoot = Get-Chapter105PrimaryRepositoryRoot -StartPath $PSScriptRoot
-    $defaultReportPath = Resolve-Chapter105RepositoryPath -RepositoryRoot $repositoryRoot `
-        -Path 'tmp/chapter-10-5/bootstrap-report.json' -AllowedRelativeRoot 'tmp/chapter-10-5'
+    $fallbackReportPath = [System.IO.Path]::GetFullPath([System.IO.Path]::Combine(
+            $PSScriptRoot, '..', 'tmp', 'chapter-10-5', 'bootstrap-report.fallback.json'))
     $context = [pscustomobject]@{
-        ReportPath = $defaultReportPath
+        ReportPath = $fallbackReportPath
+        RepositoryRoot = $null
         EnvPath = $null
         Environment = $null
         ComposePrefix = $null
+        CheckpointUri = $null
+        SavepointUri = $null
     }
     $jobName = 'chapter-9-datastream-quality-production'
     $bootstrapFailed = $false
@@ -376,21 +459,32 @@ if ($FunctionsOnly) { return }
     $previousMinioDataDir = [Environment]::GetEnvironmentVariable('MINIO_DATA_DIR', 'Process')
     try {
         Invoke-Chapter105BootstrapStage -Report $report -Name 'preflight' -Action {
-            $requestedReportPath = Resolve-Chapter105RepositoryPath -RepositoryRoot $repositoryRoot `
-                -Path $ReportPath -AllowedRelativeRoot 'tmp/chapter-10-5'
+            $context.RepositoryRoot = Get-Chapter105PrimaryRepositoryRoot -StartPath $PSScriptRoot
+            $defaultReportPath = Resolve-Chapter105RepositoryPath -RepositoryRoot $context.RepositoryRoot `
+                -Path 'tmp/chapter-10-5/bootstrap-report.json' -AllowedRelativeRoot 'tmp/chapter-10-5'
+            $requestedReportPath = if ($ReportPath -ceq 'tmp/chapter-10-5/bootstrap-report.json') {
+                $defaultReportPath
+            } else {
+                Resolve-Chapter105RepositoryPath -RepositoryRoot $context.RepositoryRoot `
+                    -Path $ReportPath -AllowedRelativeRoot 'tmp/chapter-10-5'
+            }
             Assert-Chapter105ReportPathWritable -Path $requestedReportPath
             $context.ReportPath = $requestedReportPath
-            $context.EnvPath = Resolve-Chapter105RepositoryPath -RepositoryRoot $repositoryRoot `
+            $context.EnvPath = Resolve-Chapter105RepositoryPath -RepositoryRoot $context.RepositoryRoot `
                 -Path $EnvFile -AllowedRelativeRoot 'infra'
             $context.Environment = Read-Chapter105EnvFile -Path $context.EnvPath
-            $context.Environment['MINIO_DATA_DIR'] = Get-Chapter105StableMinioDataPath -RepositoryRoot $repositoryRoot
+            $context.Environment['MINIO_DATA_DIR'] = Get-Chapter105StableMinioDataPath -RepositoryRoot $context.RepositoryRoot
             [Environment]::SetEnvironmentVariable('MINIO_DATA_DIR', $context.Environment['MINIO_DATA_DIR'], 'Process')
             $context.ComposePrefix = @(
-                'compose', '--env-file', $context.EnvPath, '-f', (Join-Path $repositoryRoot 'infra\docker-compose.yml'),
+                'compose', '--env-file', $context.EnvPath, '-f', (Join-Path $context.RepositoryRoot 'infra\docker-compose.yml'),
                 '--profile', 'flink', '--profile', 'serving', '--profile', 'lakehouse'
             )
-            Assert-Chapter105Preflight -RepositoryRoot $repositoryRoot -Environment $context.Environment
+            . (Join-Path $PSScriptRoot 'run_chapter_9_production_cutover.ps1') -FunctionsOnly
+            $context.CheckpointUri = Get-Chapter9StateUri -Kind 'checkpoint' -Environment $context.Environment
+            $context.SavepointUri = Get-Chapter9StateUri -Kind 'savepoint' -Environment $context.Environment
+            Assert-Chapter105Preflight -RepositoryRoot $context.RepositoryRoot -Environment $context.Environment
         }
+        $repositoryRoot = $context.RepositoryRoot
         $envPath = $context.EnvPath
         Invoke-Chapter105BootstrapStage -Report $report -Name 'dependencies' -Action {
             Invoke-Chapter105Native -FilePath 'powershell' -Arguments @(
@@ -426,7 +520,8 @@ if ($FunctionsOnly) { return }
             . (Join-Path $PSScriptRoot 'run_chapter_9_production_cutover.ps1') -FunctionsOnly
             $overview = Invoke-Chapter105FlinkOverview -Port ([int]$context.Environment['FLINK_REST_PORT'])
             $decision = Invoke-Chapter105EnsureJob -Overview $overview -JobName $jobName -SubmitAction {
-                $recovery = Get-Chapter105Task4RecoveryPlan -RepositoryRoot $repositoryRoot
+                $recovery = Get-Chapter105Task4RecoveryPlan -RepositoryRoot $repositoryRoot `
+                    -SavepointUri $context.SavepointUri
                 $statePath = Resolve-Chapter105RepositoryPath -RepositoryRoot $repositoryRoot `
                     -Path 'tmp/chapter-10-5/job-recovery.json' -AllowedRelativeRoot 'tmp/chapter-10-5'
                 $state = if (Test-Path -LiteralPath $statePath -PathType Leaf) {
@@ -435,10 +530,9 @@ if ($FunctionsOnly) { return }
                 } else {
                     New-CutoverRecoveryState -CutoverId 'chapter-10-5-bootstrap' -Path $statePath
                 }
-                $checkpointUri = Get-Chapter9StateUri -Kind 'checkpoint' -Environment $context.Environment
                 $submission = Invoke-Chapter105PersistentJobMutation -State $state -StatePath $statePath -SubmitAction {
                     $id = Invoke-Chapter105JobSubmission -RepositoryRoot $repositoryRoot -ComposePrefix $context.ComposePrefix `
-                        -CheckpointUri $checkpointUri -SavepointPath $recovery.savepoint_path -SkipBuild:$SkipBuild
+                        -CheckpointUri $context.CheckpointUri -SavepointPath $recovery.savepoint_path -SkipBuild:$SkipBuild
                     [pscustomobject]@{ job_id = $id }
                 }
                 [pscustomobject]@{ action = 'submitted'; job_id = [string]$submission.job_id }
@@ -468,6 +562,10 @@ if ($FunctionsOnly) { return }
             $reportWriteFailed = $true
         }
     }
-    if ($reportWriteFailed) { throw 'Chapter 10.5 bootstrap report could not be written safely.' }
     if ($bootstrapFailed) { throw 'Chapter 10.5 bootstrap failed. See the bootstrap report for safe stage status.' }
+    if ($reportWriteFailed) { throw 'Chapter 10.5 bootstrap report could not be written safely.' }
 }
+
+if ($FunctionsOnly) { return }
+
+Invoke-Chapter105Bootstrap -EnvFile $EnvFile -SkipBuild:$SkipBuild -ReportPath $ReportPath

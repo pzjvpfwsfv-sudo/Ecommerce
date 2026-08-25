@@ -174,6 +174,42 @@ $result = Wait-Chapter105ComposeReady -ComposePrefix @("compose-prefix") -Attemp
         )
         self.assertEqual({"all": True, "services": 13}, payload)
 
+    def test_compose_ps_parser_accepts_array_ndjson_and_single_object_on_powershell_51(self):
+        payload = self._powershell_payload(
+            r'''
+. "scripts/bootstrap_chapter_10_5.ps1" -FunctionsOnly
+$services = @(
+    [pscustomobject]@{ Service = "minio"; State = "running"; Health = "healthy" },
+    [pscustomobject]@{ Service = "minio-init"; State = "exited"; Health = ""; ExitCode = 0 }
+)
+$arrayJson = @($services | ConvertTo-Json -Compress)
+$ndjson = @($services | ForEach-Object { $_ | ConvertTo-Json -Compress })
+$single = @($services[0] | ConvertTo-Json -Compress)
+$fromArray = @(ConvertFrom-Chapter105ComposePsOutput -Lines $arrayJson)
+$fromNdjson = @(ConvertFrom-Chapter105ComposePsOutput -Lines $ndjson)
+$fromSingle = @(ConvertFrom-Chapter105ComposePsOutput -Lines $single)
+[ordered]@{
+    array_count = $fromArray.Count
+    array_second = $fromArray[1].Service
+    ndjson_count = $fromNdjson.Count
+    ndjson_second = $fromNdjson[1].Service
+    single_count = $fromSingle.Count
+    single_service = $fromSingle[0].Service
+} | ConvertTo-Json -Compress
+'''
+        )
+        self.assertEqual(
+            {
+                "array_count": 2,
+                "array_second": "minio-init",
+                "ndjson_count": 2,
+                "ndjson_second": "minio-init",
+                "single_count": 1,
+                "single_service": "minio",
+            },
+            payload,
+        )
+
     def test_job_submission_restores_only_when_validated_recovery_state_exists(self):
         with tempfile.TemporaryDirectory() as directory:
             recovery_root = Path(directory)
@@ -184,6 +220,13 @@ $result = Wait-Chapter105ComposeReady -ComposePrefix @("compose-prefix") -Attemp
                     {
                         "savepoint_path": "s3a://flink-state/savepoints/chapter-9/savepoint-fixed",
                         "production_job_id": "1" * 32,
+                        "mutations": {
+                            "production_submit": {
+                                "status": "not_started",
+                                "intent": None,
+                                "result": None,
+                            }
+                        },
                     }
                 ),
                 encoding="utf-8",
@@ -198,10 +241,10 @@ function Invoke-Chapter105Native {{
     $script:commands += ,@($Arguments)
     return @("Job has been submitted with JobID 22222222222222222222222222222222")
 }}
-$recovery = Get-Chapter105Task4RecoveryPlan -RepositoryRoot "{recovery_root}"
+$recovery = Get-Chapter105Task4RecoveryPlan -RepositoryRoot "{recovery_root}" -SavepointUri "s3a://flink-state/savepoints/chapter-9"
 $restoredId = Invoke-Chapter105JobSubmission -RepositoryRoot "{recovery_root}" -ComposePrefix @("compose") -CheckpointUri "s3a://flink-state/checkpoints/chapter-9" -SavepointPath $recovery.savepoint_path -SkipBuild
 Remove-Item -LiteralPath "{recovery_root / 'tmp' / 'chapter-9' / 'cutover-manifest.json'}" -Force
-$fresh = Get-Chapter105Task4RecoveryPlan -RepositoryRoot "{recovery_root}"
+$fresh = Get-Chapter105Task4RecoveryPlan -RepositoryRoot "{recovery_root}" -SavepointUri "s3a://flink-state/savepoints/chapter-9"
 $freshId = Invoke-Chapter105JobSubmission -RepositoryRoot "{recovery_root}" -ComposePrefix @("compose") -CheckpointUri "s3a://flink-state/checkpoints/chapter-9" -SkipBuild
 [ordered]@{{
     recovery_action = $recovery.action
@@ -262,6 +305,24 @@ try {{ Resolve-Chapter105RepositoryPath -RepositoryRoot "{repo}" -Path "tmp/chap
             self.assertTrue(payload["escape"])
             self.assertTrue(payload["reparse"])
 
+    def test_repository_path_rejects_a_reparse_repository_root(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "target"
+            root_link = Path(directory) / "repo-link"
+            (target / "infra").mkdir(parents=True)
+            payload = self._powershell_payload(
+                rf'''
+. "scripts/bootstrap_chapter_10_5.ps1" -FunctionsOnly
+New-Item -ItemType Junction -Path "{root_link}" -Target "{target}" | Out-Null
+$rejected = $false
+try {{
+    Resolve-Chapter105RepositoryPath -RepositoryRoot "{root_link}" -Path "infra/custom.env" -AllowedRelativeRoot "infra" | Out-Null
+}} catch {{ $rejected = $true }}
+[ordered]@{{ rejected = $rejected }} | ConvertTo-Json -Compress
+'''
+            )
+        self.assertEqual({"rejected": True}, payload)
+
     def test_malformed_flink_job_collections_fail_before_mutation(self):
         payload = self._powershell_payload(
             r'''
@@ -289,6 +350,117 @@ foreach ($json in $payloads) {
         )
         self.assertEqual(
             {"function_available": True, "rejected": 7, "mutations": 0}, payload
+        )
+
+    def test_mixed_case_flink_states_fail_closed_before_mutation(self):
+        payload = self._powershell_payload(
+            r'''
+. "scripts/bootstrap_chapter_10_5.ps1" -FunctionsOnly
+$target = "chapter-9-datastream-quality-production"
+$script:mutations = 0
+$payloads = @(
+    '{"jobs":[{"jid":"11111111111111111111111111111111","name":"other","state":"running"}]}',
+    '{"jobs":[{"jid":"11111111111111111111111111111111","name":"other","state":"RunNing"}]}',
+    ('{"jobs":[{"jid":"11111111111111111111111111111111","name":"' + $target + '","state":"running"}]}')
+)
+$rejected = 0
+foreach ($json in $payloads) {
+    try {
+        Invoke-Chapter105EnsureJob -Overview ($json | ConvertFrom-Json) -JobName $target -SubmitAction {
+            $script:mutations++
+        } | Out-Null
+    } catch { $rejected++ }
+}
+[ordered]@{ rejected = $rejected; mutations = $script:mutations } | ConvertTo-Json -Compress
+'''
+        )
+        self.assertEqual({"rejected": 3, "mutations": 0}, payload)
+
+    def test_task4_and_chapter105_production_submit_state_matrix_fails_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state_dir = root / "tmp" / "chapter-9"
+            state_dir.mkdir(parents=True)
+            manifest = state_dir / "cutover-manifest.json"
+            payload = self._powershell_payload(
+                rf'''
+. "scripts/bootstrap_chapter_10_5.ps1" -FunctionsOnly
+. "scripts/run_chapter_9_production_cutover.ps1" -FunctionsOnly
+$task4Statuses = @("not_started", "intent", "failed", "result")
+$bootstrapStatuses = @("not_started", "intent", "failed", "result")
+$script:mutations = 0
+$accepted = 0
+$rejected = 0
+function Invoke-CutoverMutation {{
+    param($State, $Path, $Stage, $Operation, $Details, [scriptblock]$Action)
+    $script:mutations++
+    & $Action
+}}
+foreach ($task4Status in $task4Statuses) {{
+    foreach ($bootstrapStatus in $bootstrapStatuses) {{
+        $task4State = [ordered]@{{
+            savepoint_path = "s3a://flink-state/savepoints/chapter-9/custom/savepoint-fixed"
+            mutations = [ordered]@{{
+                production_submit = [ordered]@{{ status = $task4Status; intent = $null; result = $null }}
+            }}
+        }}
+        $task4State | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath "{manifest}" -Encoding UTF8
+        $bootstrapState = [pscustomobject]@{{
+            mutations = [pscustomobject]@{{
+                production_submit = [pscustomobject]@{{ status = $bootstrapStatus; intent = $null; result = $null }}
+            }}
+        }}
+        try {{
+            $plan = Get-Chapter105Task4RecoveryPlan -RepositoryRoot "{root}" -SavepointUri "s3a://flink-state/savepoints/chapter-9/custom"
+            Invoke-Chapter105PersistentJobMutation -State $bootstrapState -StatePath "{root / 'tmp' / 'chapter-10-5-state.json'}" -SubmitAction {{
+                [pscustomobject]@{{ job_id = "33333333333333333333333333333333"; savepoint = $plan.savepoint_path }}
+            }} | Out-Null
+            $accepted++
+        }} catch {{ $rejected++ }}
+    }}
+}}
+[ordered]@{{ accepted = $accepted; rejected = $rejected; mutations = $script:mutations }} | ConvertTo-Json -Compress
+'''
+            )
+        self.assertEqual({"accepted": 1, "rejected": 15, "mutations": 1}, payload)
+
+    def test_custom_savepoint_uri_is_validated_and_constrains_recovery(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state_dir = root / "tmp" / "chapter-9"
+            state_dir.mkdir(parents=True)
+            manifest = state_dir / "cutover-manifest.json"
+            payload = self._powershell_payload(
+                rf'''
+. "scripts/bootstrap_chapter_10_5.ps1" -FunctionsOnly
+. "scripts/run_chapter_9_production_cutover.ps1" -FunctionsOnly
+$environment = [ordered]@{{
+    CHAPTER9_CHECKPOINT_URI = "s3a://flink-state/checkpoints/chapter-9/custom"
+    CHAPTER9_SAVEPOINT_URI = "s3a://flink-state/savepoints/chapter-9/custom"
+}}
+$checkpoint = Get-Chapter9StateUri -Kind checkpoint -Environment $environment
+$savepoint = Get-Chapter9StateUri -Kind savepoint -Environment $environment
+$state = [ordered]@{{
+    savepoint_path = "$savepoint/savepoint-fixed"
+    mutations = [ordered]@{{ production_submit = [ordered]@{{ status = "not_started"; intent = $null; result = $null }} }}
+}}
+$state | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath "{manifest}" -Encoding UTF8
+$plan = Get-Chapter105Task4RecoveryPlan -RepositoryRoot "{root}" -SavepointUri $savepoint
+$state.savepoint_path = "s3a://flink-state/savepoints/chapter-9/other/savepoint-fixed"
+$state | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath "{manifest}" -Encoding UTF8
+$wrongBaseRejected = $false
+try {{ Get-Chapter105Task4RecoveryPlan -RepositoryRoot "{root}" -SavepointUri $savepoint | Out-Null }} catch {{ $wrongBaseRejected = $true }}
+[ordered]@{{ checkpoint = $checkpoint; savepoint = $savepoint; recovered = $plan.savepoint_path; wrong_base_rejected = $wrongBaseRejected }} | ConvertTo-Json -Compress
+'''
+            )
+        self.assertEqual(
+            {
+                "checkpoint": "s3a://flink-state/checkpoints/chapter-9/custom",
+                "savepoint": "s3a://flink-state/savepoints/chapter-9/custom",
+                "recovered": "s3a://flink-state/savepoints/chapter-9/custom/savepoint-fixed",
+                "wrong_base_rejected": True,
+            },
+            payload,
         )
 
     def test_task4_uri_reads_the_controlled_env_map_and_mutation_state_is_persisted(self):
@@ -390,24 +562,122 @@ $checkpoint = Wait-Chapter105CompletedCheckpoint -FlinkPort 8081 -JobId "1111111
         self.assertIsNotNone(preflight["completed_at"])
         self.assertEqual("failed", report["status"])
 
-    def test_functions_only_preserves_caller_strict_mode_and_module_state(self):
+    def test_early_root_and_default_report_failures_use_the_fixed_fallback_envelope(self):
+        fallback = ROOT / "tmp" / "chapter-10-5" / "bootstrap-report.fallback.json"
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "target"
+            root_link = Path(directory) / "repo-link"
+            (target / "tmp" / "chapter-10-5").mkdir(parents=True)
+            if fallback.exists():
+                fallback.unlink()
+            payload = self._powershell_payload(
+                rf'''
+. "scripts/bootstrap_chapter_10_5.ps1" -FunctionsOnly
+$script:rootMode = "lookup"
+function Get-Chapter105PrimaryRepositoryRoot {{
+    if ($script:rootMode -eq "lookup") {{ throw "root lookup leaked detail" }}
+    return "{root_link}"
+}}
+$lookupError = ""
+try {{ Invoke-Chapter105Bootstrap -EnvFile "infra/.env" -ReportPath "tmp/chapter-10-5/report.json" }} catch {{ $lookupError = $_.Exception.Message }}
+$lookupReport = Get-Content -LiteralPath "{fallback}" -Raw | ConvertFrom-Json
+Remove-Item -LiteralPath "{fallback}" -Force
+New-Item -ItemType Junction -Path "{root_link}" -Target "{target}" | Out-Null
+$script:rootMode = "junction"
+$junctionError = ""
+try {{ Invoke-Chapter105Bootstrap -EnvFile "infra/.env" -ReportPath "tmp/chapter-10-5/report.json" }} catch {{ $junctionError = $_.Exception.Message }}
+$junctionReport = Get-Content -LiteralPath "{fallback}" -Raw | ConvertFrom-Json
+[ordered]@{{
+    lookup_error = $lookupError
+    lookup_status = $lookupReport.status
+    lookup_preflight = $lookupReport.stages.preflight.status
+    junction_error = $junctionError
+    junction_status = $junctionReport.status
+    junction_preflight = $junctionReport.stages.preflight.status
+}} | ConvertTo-Json -Compress
+'''
+            )
+        if fallback.exists():
+            fallback.unlink()
+        expected_error = "Chapter 10.5 bootstrap failed. See the bootstrap report for safe stage status."
+        self.assertEqual(expected_error, payload["lookup_error"])
+        self.assertEqual("failed", payload["lookup_status"])
+        self.assertEqual("failed", payload["lookup_preflight"])
+        self.assertEqual(expected_error, payload["junction_error"])
+        self.assertEqual("failed", payload["junction_status"])
+        self.assertEqual("failed", payload["junction_preflight"])
+
+    def test_original_bootstrap_error_wins_when_fallback_report_write_also_fails(self):
+        payload = self._powershell_payload(
+            r'''
+. "scripts/bootstrap_chapter_10_5.ps1" -FunctionsOnly
+function Get-Chapter105PrimaryRepositoryRoot { throw "root lookup leaked detail" }
+function Write-Chapter105BootstrapReport { throw "report medium leaked detail" }
+$errorMessage = ""
+try { Invoke-Chapter105Bootstrap } catch { $errorMessage = $_.Exception.Message }
+function Invoke-Chapter105BootstrapStage {
+    param($Report, $Name, [scriptblock]$Action)
+}
+$reportOnlyError = ""
+try { Invoke-Chapter105Bootstrap } catch { $reportOnlyError = $_.Exception.Message }
+[ordered]@{ error = $errorMessage; report_only_error = $reportOnlyError } | ConvertTo-Json -Compress
+'''
+        )
+        self.assertEqual(
+            {
+                "error": "Chapter 10.5 bootstrap failed. See the bootstrap report for safe stage status.",
+                "report_only_error": "Chapter 10.5 bootstrap report could not be written safely.",
+            },
+            payload,
+        )
+
+    def test_functions_only_preserves_caller_state_and_exposes_only_explicit_interfaces(self):
         payload = self._powershell_payload(
             r'''
 Set-StrictMode -Off
 $beforeModules = @((Get-Module).Name)
 $beforeUndefinedThrows = $false
 try { $null = $undefinedBefore } catch { $beforeUndefinedThrows = $true }
+function Test-DependencyHash { return "caller-private-helper" }
+$beforePrivate = (Get-Command Test-DependencyHash).ScriptBlock.ToString()
+$beforeAbsent = $null -eq (Get-Command Get-RuntimeDependencyArtifacts -ErrorAction SilentlyContinue)
 . "scripts/bootstrap_chapter_10_5.ps1" -FunctionsOnly
 $afterModules = @((Get-Module).Name)
 $afterUndefinedThrows = $false
 try { $null = $undefinedAfter } catch { $afterUndefinedThrows = $true }
+$afterPrivate = (Get-Command Test-DependencyHash).ScriptBlock.ToString()
+$explicit = @(
+    "Read-Chapter105EnvFile",
+    "Resolve-Chapter105RepositoryPath",
+    "Invoke-Chapter105Native",
+    "Get-Chapter105FlinkJobDecision",
+    "ConvertFrom-Chapter105ComposePsOutput",
+    "Invoke-Chapter105Bootstrap"
+)
+$explicitAvailable = @($explicit | Where-Object { $null -ne (Get-Command $_ -ErrorAction SilentlyContinue) }).Count
 [ordered]@{
     modules_equal = (($beforeModules -join "|") -eq ($afterModules -join "|"))
     strict_equal = $beforeUndefinedThrows -eq $afterUndefinedThrows
+    private_equal = $beforePrivate -ceq $afterPrivate
+    private_result = Test-DependencyHash
+    absent_private_equal = $beforeAbsent -and ($null -eq (Get-Command Get-RuntimeDependencyArtifacts -ErrorAction SilentlyContinue))
+    installer_hidden = $null -eq (Get-Command Install-RuntimeDependencies -ErrorAction SilentlyContinue)
+    explicit_available = $explicitAvailable
 } | ConvertTo-Json -Compress
 '''
         )
-        self.assertEqual({"modules_equal": True, "strict_equal": True}, payload)
+        self.assertEqual(
+            {
+                "modules_equal": True,
+                "strict_equal": True,
+                "private_equal": True,
+                "private_result": "caller-private-helper",
+                "absent_private_equal": True,
+                "installer_hidden": True,
+                "explicit_available": 6,
+            },
+            payload,
+        )
 
     def test_functions_only_import_never_runs_native_commands(self):
         payload = self._powershell_payload(

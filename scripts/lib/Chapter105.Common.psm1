@@ -224,6 +224,10 @@ function Resolve-Chapter105RepositoryPath {
     )
 
     $root = [System.IO.Path]::GetFullPath($RepositoryRoot).TrimEnd('\', '/')
+    if (-not (Test-Path -LiteralPath $root -PathType Container) -or
+        ((Get-Item -LiteralPath $root -Force).Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw 'Repository root is missing or is a reparse point.'
+    }
     $allowedRoot = [System.IO.Path]::GetFullPath((Join-Path $root $AllowedRelativeRoot)).TrimEnd('\', '/')
     $segments = @($Path.Split(@('\', '/'), [System.StringSplitOptions]::RemoveEmptyEntries))
     if ($segments -contains '..') { throw 'Repository path traversal is not allowed.' }

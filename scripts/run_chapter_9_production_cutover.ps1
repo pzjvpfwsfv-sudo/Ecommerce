@@ -238,7 +238,7 @@ function Get-SavepointPath([string[]]$Lines) {
 function Assert-CutoverSavepointPath([string]$Path) {
     if ([string]::IsNullOrWhiteSpace($Path) -or $Path -match "\.\." -or
         $Path -match '(?:^|/)\.(?:/|$)' -or
-        $Path -cnotmatch "^s3a://flink-state/savepoints/chapter-9/[A-Za-z0-9._-]+$") {
+        $Path -cnotmatch "^s3a://flink-state/savepoints/chapter-9(?:/[A-Za-z0-9._-]+)+$") {
         throw "Invalid cutover Savepoint evidence: $Path"
     }
     return $Path
