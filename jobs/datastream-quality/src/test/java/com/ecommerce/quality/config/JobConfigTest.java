@@ -41,6 +41,16 @@ class JobConfigTest {
         assertThrows(IllegalArgumentException.class,
                 () -> JobConfig.fromArgs(concat(requiredArgs(), "--checkpoint-uri", "s3a://other-state/checkpoints/chapter-9")));
         assertThrows(IllegalArgumentException.class,
+                () -> JobConfig.fromArgs(concat(requiredArgs(), "--checkpoint-uri", "s3a://flink-state/checkpoints/chapter-9/.")));
+        assertThrows(IllegalArgumentException.class,
+                () -> JobConfig.fromArgs(concat(requiredArgs(), "--checkpoint-uri", "s3a://flink-state/checkpoints/chapter-9/./next")));
+        assertThrows(IllegalArgumentException.class,
+                () -> JobConfig.fromArgs(concat(requiredArgs(), "--checkpoint-uri", "s3a://flink-state/checkpoints/chapter-9/..")));
+        assertThrows(IllegalArgumentException.class,
+                () -> JobConfig.fromArgs(concat(requiredArgs(), "--checkpoint-uri", "s3a://flink-state/checkpoints/chapter-9/%2e%2e")));
+        assertThrows(IllegalArgumentException.class,
+                () -> JobConfig.fromArgs(concat(requiredArgs(), "--checkpoint-uri", "s3a://flink-state/checkpoints/chapter-9/%ZZ")));
+        assertThrows(IllegalArgumentException.class,
                 () -> JobConfig.fromArgs(concat(requiredArgs(), "--dlq-topic", "user_behavior_clean_shadow")));
         assertThrows(IllegalArgumentException.class,
                 () -> JobConfig.fromArgs(concat(requiredArgs(), "--input-topic", "")));

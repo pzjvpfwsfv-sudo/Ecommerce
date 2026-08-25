@@ -27,6 +27,7 @@ function Invoke-FlinkRest([string]$Resource) {
 function Assert-Chapter9StateUri([string]$Path, [ValidateSet("checkpoint", "savepoint")][string]$Kind) {
     $base = "s3a://flink-state/$($Kind)s/chapter-9"
     if ([string]::IsNullOrWhiteSpace($Path) -or $Path -match "\.\." -or
+        $Path -match '(?:^|/)\.(?:/|$)' -or
         $Path -cnotmatch "^$([regex]::Escape($base))(?:/[A-Za-z0-9._-]+)*$") {
         throw "Invalid Chapter 9 $Kind URI: $Path"
     }
@@ -42,14 +43,15 @@ function Get-Chapter9StateUri([ValidateSet("checkpoint", "savepoint")][string]$K
 }
 
 function Get-SavepointPath([string[]]$Lines) {
-    $paths = @($Lines | ForEach-Object {
-        $match = [regex]::Match([string]$_, "(?i)Savepoint completed\.\s*Path:\s*(\S+)")
-        if ($match.Success) { Assert-Chapter9StateUri -Path $match.Groups[1].Value -Kind "savepoint" }
-    } | Sort-Object -Unique)
-    if ($paths.Count -ne 1 -or $paths[0] -cnotmatch "^s3a://flink-state/savepoints/chapter-9/[A-Za-z0-9._-]+$") {
+    if ($Lines.Count -ne 1) {
         throw "Expected exactly one validated remote Savepoint path."
     }
-    return [string]$paths[0]
+    $match = [regex]::Match([string]$Lines[0], '^Savepoint completed\. Path: (\S+)$')
+    if (-not $match.Success -or
+        $match.Groups[1].Value -cnotmatch "^s3a://flink-state/savepoints/chapter-9/[A-Za-z0-9._-]+$") {
+        throw "Expected exactly one validated remote Savepoint path."
+    }
+    return Assert-Chapter9StateUri -Path $match.Groups[1].Value -Kind "savepoint"
 }
 
 function Get-ShadowJob {

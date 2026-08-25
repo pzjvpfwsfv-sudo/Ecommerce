@@ -30,7 +30,7 @@ public record JobConfig(
         if (bootstrap.isEmpty()) {
             throw new IllegalArgumentException("--bootstrap-servers must not be blank");
         }
-        if (!checkpoint.matches("^s3a://flink-state/checkpoints/chapter-9(?:/[A-Za-z0-9._-]+)*$")) {
+        if (!checkpoint.matches("^s3a://flink-state/checkpoints/chapter-9(?:/(?!\\.{1,2}(?:/|$))[A-Za-z0-9._-]+)*$")) {
             throw new IllegalArgumentException("--checkpoint-uri must be an unambiguous s3a://flink-state/checkpoints/chapter-9 path");
         }
         if (!Set.of("shadow", "production").contains(mode)) {

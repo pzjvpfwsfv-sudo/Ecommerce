@@ -484,21 +484,38 @@ try {
         [pscustomobject]@{ jid = "22222222222222222222222222222222"; name = "chapter-9-datastream-quality-shadow"; state = "CANCELED" }
     ) }
     $initial = Get-CutoverShadowStopResumePlan -State $state -Jobs $running
+    $state.mutations.shadow_stop.status = "failed"
+    $orphanedNoIntentError = $null
+    try {
+        Get-CutoverShadowStopResumePlan -State $state -Jobs $running | Out-Null
+    } catch { $orphanedNoIntentError = $_.Exception.Message }
+    $state.mutations.shadow_stop.status = "not_started"
     Set-CutoverMutationIntent -State $state -Path $path -Stage "shadow_stop" `
         -Operation "stop_shadow_with_savepoint" -Details @{
             job_id = $shadowId
             name = "chapter-9-datastream-quality-shadow"
             savepoint_destination = "s3a://flink-state/savepoints/chapter-9"
         }
-    $retry = Get-CutoverShadowStopResumePlan -State $state -Jobs $running
+    $unknownError = $null
+    try {
+        Get-CutoverShadowStopResumePlan -State $state -Jobs $running | Out-Null
+    } catch { $unknownError = $_.Exception.Message }
+    $state.mutations.shadow_stop.status = "failed"
+    $state.mutations.shadow_stop.result = [pscustomobject]@{
+        status = "failed"
+        details = [pscustomobject]@{ error = "interrupted native command" }
+    }
+    $failedError = $null
+    try {
+        Get-CutoverShadowStopResumePlan -State $state -Jobs $running | Out-Null
+    } catch { $failedError = $_.Exception.Message }
     $finished = [pscustomobject]@{ jobs = @(
         [pscustomobject]@{ jid = $shadowId; name = "chapter-9-datastream-quality-shadow"; state = "FINISHED" },
         [pscustomobject]@{ jid = "22222222222222222222222222222222"; name = "chapter-9-datastream-quality-shadow"; state = "CANCELED" }
     ) }
-    $finishedRejected = $false
-    try {
-        Get-CutoverShadowStopResumePlan -State $state -Jobs $finished | Out-Null
-    } catch { $finishedRejected = $true }
+    $state | Add-Member -NotePropertyName savepoint_path `
+        -NotePropertyValue "s3a://flink-state/savepoints/chapter-9/savepoint-validated" -Force
+    $completed = Get-CutoverShadowStopResumePlan -State $state -Jobs $finished
     $terminalRejected = $false
     try {
         Get-CutoverShadowStopResumePlan -State $state -Jobs ([pscustomobject]@{ jobs = @(
@@ -507,8 +524,11 @@ try {
     } catch { $terminalRejected = $true }
     [ordered]@{
         initial = $initial.Action
-        retry = $retry.Action
-        finished_rejected = $finishedRejected
+        orphaned_no_intent_error = $orphanedNoIntentError
+        unknown_error = $unknownError
+        failed_error = $failedError
+        completed = $completed.Action
+        completed_path = $completed.SavepointPath
         terminal_rejected = $terminalRejected
     } | ConvertTo-Json -Compress
 } finally { Remove-Item -LiteralPath $root -Recurse -Force }
@@ -517,8 +537,15 @@ try {
         self.assertEqual(0, result.returncode, result.stderr or result.stdout)
         payload = json.loads(result.stdout.strip().splitlines()[-1])
         self.assertEqual("stop", payload["initial"])
-        self.assertEqual("retry_stop", payload["retry"])
-        self.assertTrue(payload["finished_rejected"])
+        fail_closed = "Shadow stop outcome is unknown without a validated persisted Savepoint URI."
+        self.assertEqual(fail_closed, payload["orphaned_no_intent_error"])
+        self.assertEqual(fail_closed, payload["unknown_error"])
+        self.assertEqual(fail_closed, payload["failed_error"])
+        self.assertEqual("complete", payload["completed"])
+        self.assertEqual(
+            "s3a://flink-state/savepoints/chapter-9/savepoint-validated",
+            payload["completed_path"],
+        )
         self.assertTrue(payload["terminal_rejected"])
 
     def test_cutover_finalization_keeps_partial_resumable_and_writes_independent_final(self):
@@ -688,6 +715,37 @@ $localSavepointRejected = $false
 try { Assert-CutoverSavepointPath -Path "file:///workspace/tmp/savepoints/chapter-9/savepoint-1" | Out-Null } catch { $localSavepointRejected = $true }
 $ambiguousSavepointRejected = $false
 try { Assert-CutoverSavepointPath -Path "s3a://flink-state/savepoints/chapter-9/../savepoint-1" | Out-Null } catch { $ambiguousSavepointRejected = $true }
+$dotSavepointRejected = $false
+try { Assert-CutoverSavepointPath -Path "s3a://flink-state/savepoints/chapter-9/." | Out-Null } catch { $dotSavepointRejected = $true }
+$duplicateSavepointRejected = $false
+try {
+    Get-SavepointPath @(
+        "Savepoint completed. Path: s3a://flink-state/savepoints/chapter-9/savepoint-1",
+        "Savepoint completed. Path: s3a://flink-state/savepoints/chapter-9/savepoint-1"
+    ) | Out-Null
+} catch { $duplicateSavepointRejected = $true }
+$prefixedSavepointRejected = $false
+try {
+    Get-SavepointPath @(
+        "INFO Savepoint completed. Path: s3a://flink-state/savepoints/chapter-9/savepoint-1"
+    ) | Out-Null
+} catch { $prefixedSavepointRejected = $true }
+$suffixedSavepointRejected = $false
+try {
+    Get-SavepointPath @(
+        "Savepoint completed. Path: s3a://flink-state/savepoints/chapter-9/savepoint-1 done"
+    ) | Out-Null
+} catch { $suffixedSavepointRejected = $true }
+$caseVariantSavepointRejected = $false
+try {
+    Get-SavepointPath @(
+        "savepoint completed. Path: s3a://flink-state/savepoints/chapter-9/savepoint-1"
+    ) | Out-Null
+} catch { $caseVariantSavepointRejected = $true }
+$encodedTraversalRejected = $false
+try { Assert-CutoverSavepointPath -Path "s3a://flink-state/savepoints/chapter-9/%2e%2e" | Out-Null } catch { $encodedTraversalRejected = $true }
+$malformedEncodingRejected = $false
+try { Assert-CutoverSavepointPath -Path "s3a://flink-state/savepoints/chapter-9/%ZZ" | Out-Null } catch { $malformedEncodingRejected = $true }
 $ambiguousRejected = $false
 try {
     Get-SubmittedJobId @(
@@ -706,6 +764,13 @@ try {
     ambiguous_rejected = $ambiguousRejected
     local_savepoint_rejected = $localSavepointRejected
     ambiguous_savepoint_rejected = $ambiguousSavepointRejected
+    dot_savepoint_rejected = $dotSavepointRejected
+    duplicate_savepoint_rejected = $duplicateSavepointRejected
+    prefixed_savepoint_rejected = $prefixedSavepointRejected
+    suffixed_savepoint_rejected = $suffixedSavepointRejected
+    case_variant_savepoint_rejected = $caseVariantSavepointRejected
+    encoded_traversal_rejected = $encodedTraversalRejected
+    malformed_encoding_rejected = $malformedEncodingRejected
 } | ConvertTo-Json -Compress
 '''
         result = self._run_powershell(command)
@@ -719,6 +784,87 @@ try {
         self.assertTrue(payload["ambiguous_rejected"])
         self.assertTrue(payload["local_savepoint_rejected"])
         self.assertTrue(payload["ambiguous_savepoint_rejected"])
+        self.assertTrue(payload["dot_savepoint_rejected"])
+        self.assertTrue(payload["duplicate_savepoint_rejected"])
+        self.assertTrue(payload["prefixed_savepoint_rejected"])
+        self.assertTrue(payload["suffixed_savepoint_rejected"])
+        self.assertTrue(payload["case_variant_savepoint_rejected"])
+        self.assertTrue(payload["encoded_traversal_rejected"])
+        self.assertTrue(payload["malformed_encoding_rejected"])
+
+    def test_recovery_functions_require_exact_remote_savepoint_evidence(self):
+        command = r'''
+$ErrorActionPreference = "Stop"
+. (Resolve-Path "scripts/verify_chapter_9_recovery.ps1") -FunctionsOnly
+$uri = "s3a://flink-state/savepoints/chapter-9/savepoint-1"
+$savepoint = Get-SavepointPath -Lines @("Savepoint completed. Path: $uri")
+$cases = [ordered]@{
+    duplicate = @("Savepoint completed. Path: $uri", "Savepoint completed. Path: $uri")
+    prefixed = @("INFO Savepoint completed. Path: $uri")
+    suffixed = @("Savepoint completed. Path: $uri done")
+    case_variant = @("savepoint completed. Path: $uri")
+}
+$rejected = [ordered]@{}
+foreach ($case in $cases.GetEnumerator()) {
+    try { Get-SavepointPath -Lines $case.Value | Out-Null; $rejected[$case.Key] = $false }
+    catch { $rejected[$case.Key] = $true }
+}
+$invalidUris = [ordered]@{
+    checkpoint_dot = @("s3a://flink-state/checkpoints/chapter-9/.", "checkpoint")
+    savepoint_dot = @("s3a://flink-state/savepoints/chapter-9/.", "savepoint")
+    encoded_traversal = @("s3a://flink-state/savepoints/chapter-9/%2e%2e", "savepoint")
+    malformed_encoding = @("s3a://flink-state/savepoints/chapter-9/%ZZ", "savepoint")
+}
+foreach ($case in $invalidUris.GetEnumerator()) {
+    try {
+        Assert-Chapter9StateUri -Path $case.Value[0] -Kind $case.Value[1] | Out-Null
+        $rejected[$case.Key] = $false
+    } catch { $rejected[$case.Key] = $true }
+}
+[ordered]@{ savepoint = $savepoint; rejected = $rejected } | ConvertTo-Json -Depth 4 -Compress
+'''
+        result = self._run_powershell(command)
+        self.assertEqual(0, result.returncode, result.stderr or result.stdout)
+        payload = json.loads(result.stdout.strip().splitlines()[-1])
+        self.assertEqual(
+            "s3a://flink-state/savepoints/chapter-9/savepoint-1", payload["savepoint"]
+        )
+        self.assertTrue(all(payload["rejected"].values()), payload)
+
+    def test_flink_jobmanager_wrappers_preserve_native_argument_boundaries(self):
+        for script in (
+            "scripts/run_chapter_9_production_cutover.ps1",
+            "scripts/verify_chapter_9_recovery.ps1",
+        ):
+            command = rf'''
+$ErrorActionPreference = "Stop"
+. (Resolve-Path "{script}") -FunctionsOnly
+$script:dockerArguments = @()
+function docker {{
+    param([Parameter(ValueFromRemainingArguments = $true)][object[]]$Arguments)
+    $script:dockerArguments = @($Arguments | ForEach-Object {{ [string]$_ }})
+    $global:LASTEXITCODE = 0
+}}
+$command = @("/opt/flink/bin/flink", "stop", "--savepointPath", "argument with spaces", "11111111111111111111111111111111")
+Invoke-FlinkJobManagerCommand -Command $command -FailureMessage "unexpected" | Out-Null
+$root = (Resolve-Path ".").Path
+$expected = @(
+    "compose", "--env-file", (Join-Path $root "infra/.env.example"),
+    "-f", (Join-Path $root "infra/docker-compose.yml"),
+    "exec", "-T", "flink-jobmanager"
+) + $command
+[ordered]@{{
+    count = $script:dockerArguments.Count
+    exact = (($script:dockerArguments -join "|") -ceq ($expected -join "|"))
+    spaced_argument = $script:dockerArguments[11]
+}} | ConvertTo-Json -Compress
+'''
+            result = self._run_powershell(command)
+            self.assertEqual(0, result.returncode, result.stderr or result.stdout)
+            payload = json.loads(result.stdout.strip().splitlines()[-1])
+            self.assertEqual(13, payload["count"])
+            self.assertTrue(payload["exact"], (script, payload))
+            self.assertEqual("argument with spaces", payload["spaced_argument"])
 
     def test_cutover_and_recovery_keep_state_in_minio_and_use_compose_jobmanager(self):
         cutover = (ROOT / "scripts/run_chapter_9_production_cutover.ps1").read_text(encoding="ascii")
@@ -762,12 +908,26 @@ try {
         $env:CHAPTER9_CHECKPOINT_URI = "S3A://flink-state/checkpoints/chapter-9"
         Get-Chapter9StateUri -Kind "checkpoint" | Out-Null
     } catch { $caseVariantRejected = $true }
+    $invalidUris = [ordered]@{
+        checkpoint_dot = @("s3a://flink-state/checkpoints/chapter-9/.", "checkpoint")
+        savepoint_dot = @("s3a://flink-state/savepoints/chapter-9/.", "savepoint")
+        encoded_traversal = @("s3a://flink-state/checkpoints/chapter-9/%2e%2e", "checkpoint")
+        malformed_encoding = @("s3a://flink-state/savepoints/chapter-9/%ZZ", "savepoint")
+    }
+    $uriRejected = [ordered]@{}
+    foreach ($case in $invalidUris.GetEnumerator()) {
+        try {
+            Assert-Chapter9StateUri -Path $case.Value[0] -Kind $case.Value[1] | Out-Null
+            $uriRejected[$case.Key] = $false
+        } catch { $uriRejected[$case.Key] = $true }
+    }
     [ordered]@{
         checkpoint = $checkpoint
         savepoint = $savepoint
         local_rejected = $localRejected
         ambiguous_rejected = $ambiguousRejected
         case_variant_rejected = $caseVariantRejected
+        uri_rejected = $uriRejected
     } | ConvertTo-Json -Compress
 } finally {
     if ($null -eq $originalCheckpoint) { Remove-Item Env:CHAPTER9_CHECKPOINT_URI -ErrorAction SilentlyContinue } else { $env:CHAPTER9_CHECKPOINT_URI = $originalCheckpoint }
@@ -782,6 +942,7 @@ try {
         self.assertTrue(payload["local_rejected"])
         self.assertTrue(payload["ambiguous_rejected"])
         self.assertTrue(payload["case_variant_rejected"])
+        self.assertTrue(all(payload["uri_rejected"].values()), payload)
 
     def test_cutover_kafka_parsers_accept_exact_single_and_multi_partition_inputs(self):
         command = r'''

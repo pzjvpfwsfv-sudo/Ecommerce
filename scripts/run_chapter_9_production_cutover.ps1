@@ -46,6 +46,7 @@ function Assert-Chapter9StateUri {
 
     $base = "s3a://flink-state/$($Kind)s/chapter-9"
     if ([string]::IsNullOrWhiteSpace($Path) -or $Path -match "\.\." -or
+        $Path -match '(?:^|/)\.(?:/|$)' -or
         $Path -cnotmatch "^$([regex]::Escape($base))(?:/[A-Za-z0-9._-]+)*$") {
         throw "Invalid Chapter 9 $Kind URI: $Path"
     }
@@ -221,20 +222,17 @@ function Get-SubmittedJobId([string[]]$Lines) {
 }
 
 function Get-SavepointPath([string[]]$Lines) {
-    $paths = @()
-    foreach ($line in $Lines) {
-        $match = [regex]::Match([string]$line, "(?i)Savepoint completed\.\s*Path:\s*(\S+)")
-        if ($match.Success) { $paths += $match.Groups[1].Value }
+    if ($Lines.Count -ne 1) {
+        throw "Expected exactly one completed Savepoint response line, found $($Lines.Count)."
     }
-    $uniquePaths = @($paths | Sort-Object -Unique)
-    if ($uniquePaths.Count -ne 1) {
-        throw "Expected exactly one completed Savepoint path, found $($uniquePaths.Count)."
-    }
-    return Assert-CutoverSavepointPath -Path ([string]$uniquePaths[0])
+    $match = [regex]::Match([string]$Lines[0], '^Savepoint completed\. Path: (\S+)$')
+    if (-not $match.Success) { throw "Expected exactly one completed Savepoint response line." }
+    return Assert-CutoverSavepointPath -Path $match.Groups[1].Value
 }
 
 function Assert-CutoverSavepointPath([string]$Path) {
     if ([string]::IsNullOrWhiteSpace($Path) -or $Path -match "\.\." -or
+        $Path -match '(?:^|/)\.(?:/|$)' -or
         $Path -cnotmatch "^s3a://flink-state/savepoints/chapter-9/[A-Za-z0-9._-]+$") {
         throw "Invalid cutover Savepoint evidence: $Path"
     }
@@ -267,12 +265,13 @@ function Get-CutoverShadowStopResumePlan {
         return [pscustomobject]@{ Action = "complete"; SavepointPath = $resultPath }
     }
     if ($null -eq $mutation.intent) {
+        if ($mutation.status -ne "not_started") {
+            throw "Shadow stop outcome is unknown without a validated persisted Savepoint URI."
+        }
         if ($jobState -eq "RUNNING") { return [pscustomobject]@{ Action = "stop" } }
         throw "Shadow stop has no intent and the exact shadow job is $jobState."
     }
-    if ($jobState -eq "RUNNING") { return [pscustomobject]@{ Action = "retry_stop" } }
-    if ($jobState -eq "FINISHED") { throw "Shadow stop has no validated Savepoint response or manifest URI." }
-    throw "Shadow stop recovery is fail-closed for exact job state $jobState."
+    throw "Shadow stop outcome is unknown without a validated persisted Savepoint URI."
 }
 
 function Set-CutoverShadowStopResult {
