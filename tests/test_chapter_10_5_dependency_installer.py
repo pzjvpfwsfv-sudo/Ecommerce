@@ -1,6 +1,7 @@
 import hashlib
 import http.server
 import json
+import os
 from pathlib import Path
 import shutil
 import socketserver
@@ -21,6 +22,12 @@ class _Handler(http.server.BaseHTTPRequestHandler):
 
     def do_GET(self):
         type(self).requests += 1
+        if self.path == "/redirect.jar":
+            self.send_response(302)
+            self.send_header("Location", "/fixture.jar")
+            self.end_headers()
+            self.wfile.write(b"redirect response body must stay private")
+            return
         self.send_response(200)
         self.send_header("Content-Length", str(len(self.payload)))
         self.end_headers()
@@ -54,13 +61,13 @@ class Chapter105DependencyInstallerTest(unittest.TestCase):
     def tearDown(self):
         self.tempdir.cleanup()
 
-    def _lock(self, destination, sha256=None):
+    def _lock(self, destination, sha256=None, url=None):
         digest = sha256 or hashlib.sha256(_Handler.payload).hexdigest()
         lock = {
             "version": 1,
             "artifacts": [{
                 "name": "fixture.jar",
-                "url": f"http://127.0.0.1:{self.server.server_address[1]}/fixture.jar",
+                "url": url or f"http://127.0.0.1:{self.server.server_address[1]}/fixture.jar",
                 "destination": destination,
                 "sha256": digest,
             }],
@@ -69,9 +76,8 @@ class Chapter105DependencyInstallerTest(unittest.TestCase):
         path.write_text(json.dumps(lock), encoding="utf-8")
         return path
 
-    def _run(self, lock, *extra):
-        return subprocess.run(
-            [
+    def _run(self, lock, *extra, allow_insecure=True):
+        command = [
                 "powershell",
                 "-NoProfile",
                 "-ExecutionPolicy",
@@ -82,13 +88,26 @@ class Chapter105DependencyInstallerTest(unittest.TestCase):
                 str(lock),
                 "-RepositoryRoot",
                 str(self.repo),
-                "-AllowInsecureHttpForTest",
-                *extra,
-            ],
+        ]
+        if allow_insecure:
+            command.append("-AllowInsecureHttpForTest")
+        command.extend(extra)
+        return subprocess.run(
+            command,
             capture_output=True,
             text=True,
             check=False,
         )
+
+    def test_production_invocation_rejects_loopback_http_before_download(self):
+        destination = "infra/compose/flink/lib/fixture.jar"
+
+        result = self._run(self._lock(destination), allow_insecure=False)
+
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("Runtime dependency URL must use HTTPS.", result.stderr)
+        self.assertEqual(0, _Handler.requests)
+        self.assertFalse((self.repo / destination).exists())
 
     def test_correct_file_is_cached_without_network_request(self):
         destination = "infra/compose/flink/lib/fixture.jar"
@@ -113,6 +132,22 @@ class Chapter105DependencyInstallerTest(unittest.TestCase):
         self.assertEqual(old_contents, target.read_bytes())
         self.assertEqual([], list(target.parent.glob("fixture.jar.partial.*")))
 
+    def test_redirect_is_rejected_without_replacing_destination_or_leaking_response(self):
+        destination = "infra/compose/flink/lib/fixture.jar"
+        target = self.repo / destination
+        old_contents = b"existing artifact stays intact"
+        target.write_bytes(old_contents)
+        url = f"http://127.0.0.1:{self.server.server_address[1]}/redirect.jar"
+
+        result = self._run(self._lock(destination, url=url))
+
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("Runtime dependency download failed for fixture.jar.", result.stderr)
+        self.assertNotIn("redirect response body", result.stderr + result.stdout)
+        self.assertEqual(old_contents, target.read_bytes())
+        self.assertEqual([], list(target.parent.glob("fixture.jar.partial.*")))
+        self.assertEqual(1, _Handler.requests)
+
     def test_successful_download_installs_from_a_temporary_file(self):
         destination = "infra/compose/flink/lib/fixture.jar"
         target = self.repo / destination
@@ -130,6 +165,44 @@ class Chapter105DependencyInstallerTest(unittest.TestCase):
         self.assertNotEqual(0, result.returncode)
         self.assertFalse((self.repo / "infra" / "compose" / "flink" / "escape.jar").exists())
         self.assertEqual(0, _Handler.requests)
+
+    def test_reparse_point_at_allowed_lib_is_rejected_before_outside_write(self):
+        destination = "infra/compose/flink/lib/fixture.jar"
+        lib = self.repo / "infra" / "compose" / "flink" / "lib"
+        outside_tempdir = tempfile.TemporaryDirectory()
+        outside = Path(outside_tempdir.name)
+        lib.rmdir()
+        creation_errors = []
+        try:
+            try:
+                os.symlink(outside, lib, target_is_directory=True)
+            except OSError as error:
+                creation_errors.append(f"symlink: {error}")
+                if os.name == "nt":
+                    junction = subprocess.run(
+                        ["cmd", "/c", "mklink", "/J", str(lib), str(outside)],
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                    )
+                    if junction.returncode != 0:
+                        creation_errors.append(f"junction: {junction.stderr or junction.stdout}")
+                if not lib.exists():
+                    lib.mkdir()
+                    self.skipTest("cannot create symlink or junction: " + "; ".join(creation_errors))
+
+            result = self._run(self._lock(destination))
+
+            self.assertNotEqual(0, result.returncode)
+            self.assertIn("Runtime dependency path contains a reparse point.", result.stderr)
+            self.assertEqual(0, _Handler.requests)
+            self.assertFalse((outside / "fixture.jar").exists())
+            self.assertEqual([], list(outside.glob("fixture.jar.partial.*")))
+        finally:
+            if lib.is_symlink() or (os.name == "nt" and os.path.isjunction(lib)):
+                lib.rmdir()
+                lib.mkdir()
+            outside_tempdir.cleanup()
 
 
 if __name__ == "__main__":

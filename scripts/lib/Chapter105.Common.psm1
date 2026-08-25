@@ -32,6 +32,32 @@ function Test-AllowedDependencyPath {
     return $false
 }
 
+function Assert-DependencyPathSafe {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$RepositoryRoot
+    )
+
+    $root = [System.IO.Path]::GetFullPath($RepositoryRoot).TrimEnd('\', '/')
+    $candidate = [System.IO.Path]::GetFullPath($Path)
+    if (-not $candidate.StartsWith($root + [System.IO.Path]::DirectorySeparatorChar,
+            [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw 'Runtime dependency destination is outside the repository.'
+    }
+
+    $current = $root
+    $relative = $candidate.Substring($root.Length).TrimStart('\', '/')
+    $segments = @($relative.Split(@('\', '/'), [System.StringSplitOptions]::RemoveEmptyEntries))
+    foreach ($segment in (@('') + $segments)) {
+        if ($segment) { $current = Join-Path $current $segment }
+        if (-not (Test-Path -LiteralPath $current)) { break }
+        $item = Get-Item -LiteralPath $current -Force
+        if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw 'Runtime dependency path contains a reparse point.'
+        }
+    }
+}
+
 function Get-RuntimeDependencyArtifacts {
     param(
         [Parameter(Mandatory = $true)][string]$LockFile,
@@ -94,22 +120,33 @@ function Install-RuntimeDependencies {
     $artifacts = Get-RuntimeDependencyArtifacts -LockFile $LockFile -RepositoryRoot $RepositoryRoot `
         -AllowInsecureHttpForTest:$AllowInsecureHttpForTest
     foreach ($artifact in $artifacts) {
+        Assert-DependencyPathSafe -Path $artifact.Destination -RepositoryRoot $RepositoryRoot
         if (Test-DependencyHash -Path $artifact.Destination -ExpectedHash $artifact.Sha256) {
             Write-Output "$($artifact.Name) cached"
             continue
         }
 
         $directory = Split-Path -Parent $artifact.Destination
+        Assert-DependencyPathSafe -Path $directory -RepositoryRoot $RepositoryRoot
         New-Item -ItemType Directory -Path $directory -Force | Out-Null
+        Assert-DependencyPathSafe -Path $directory -RepositoryRoot $RepositoryRoot
         $partial = "$($artifact.Destination).partial.$([guid]::NewGuid().ToString('N'))"
         try {
-            Invoke-WebRequest -UseBasicParsing -Uri $artifact.Url -OutFile $partial -MaximumRedirection 0 -ErrorAction Stop
+            Assert-DependencyPathSafe -Path $partial -RepositoryRoot $RepositoryRoot
+            try {
+                Invoke-WebRequest -UseBasicParsing -Uri $artifact.Url -OutFile $partial -MaximumRedirection 0 -ErrorAction Stop
+            } catch {
+                throw "Runtime dependency download failed for $($artifact.Name)."
+            }
             if (-not (Test-DependencyHash -Path $partial -ExpectedHash $artifact.Sha256)) {
                 throw "Downloaded dependency hash validation failed for $($artifact.Name)."
             }
+            Assert-DependencyPathSafe -Path $partial -RepositoryRoot $RepositoryRoot
+            Assert-DependencyPathSafe -Path $artifact.Destination -RepositoryRoot $RepositoryRoot
             Move-Item -LiteralPath $partial -Destination $artifact.Destination -Force
             Write-Output "$($artifact.Name) installed"
         } finally {
+            Assert-DependencyPathSafe -Path $partial -RepositoryRoot $RepositoryRoot
             if ((Test-Path -LiteralPath $partial -PathType Leaf) -and
                 (Test-AllowedDependencyPath -Path $partial -AllowedRoots @($directory))) {
                 Remove-Item -LiteralPath $partial -Force
