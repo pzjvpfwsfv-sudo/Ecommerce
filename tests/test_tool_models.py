@@ -122,12 +122,14 @@ class ToolModelsTest(unittest.TestCase):
         self.assertEqual("http://flink-jobmanager:8081", settings.flink_rest_url)
         self.assertEqual("chapter-9-datastream-quality-production", settings.chapter9_production_job_name)
         self.assertEqual(3, settings.ai_tool_max_calls)
+        self.assertEqual(3, settings.ai_tool_executor_max_workers)
         configured = load_settings(
             {
                 "FLINK_REST_URL": "http://flink.local:8081",
                 "CHAPTER9_PRODUCTION_JOB_NAME": "production-job",
                 "AI_TOOL_PLANNER_MODE": "openai_compatible",
                 "AI_TOOL_MAX_CALLS": "2",
+                "AI_TOOL_EXECUTOR_MAX_WORKERS": "2",
                 "AI_TOOL_TOTAL_TIMEOUT_SECONDS": "30.5",
                 "AI_TOOL_MAX_EVENT_TYPES": "99",
             }
@@ -136,11 +138,13 @@ class ToolModelsTest(unittest.TestCase):
         self.assertEqual("production-job", configured.chapter9_production_job_name)
         self.assertEqual("openai_compatible", configured.ai_tool_planner_mode)
         self.assertEqual(2, configured.ai_tool_max_calls)
+        self.assertEqual(2, configured.ai_tool_executor_max_workers)
         self.assertEqual(30.5, configured.ai_tool_total_timeout_seconds)
         self.assertEqual(99, configured.ai_tool_max_event_types)
         for field, value, message in (
             ("ai_tool_planner_mode", "unknown", "AI_TOOL_PLANNER_MODE"),
             ("ai_tool_max_calls", 4, "AI_TOOL_MAX_CALLS"),
+            ("ai_tool_executor_max_workers", 4, "AI_TOOL_EXECUTOR_MAX_WORKERS"),
             ("ai_tool_total_timeout_seconds", 0, "AI_TOOL_TOTAL_TIMEOUT_SECONDS"),
             ("ai_tool_max_event_types", 101, "AI_TOOL_MAX_EVENT_TYPES"),
             ("flink_rest_url", "", "FLINK_REST_URL"),

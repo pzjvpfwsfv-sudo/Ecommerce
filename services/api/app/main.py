@@ -1,6 +1,9 @@
 ﻿from __future__ import annotations
 
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 import logging
+from threading import Lock
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, status
@@ -34,12 +37,26 @@ def create_app(
         repository = RealtimeMetricsRepository.from_settings(settings)
     if analysis_service is None:
         analysis_service = build_analysis_service(settings, repository)
-    if tool_analysis_service is None:
+    owns_tool_analysis_service = tool_analysis_service is None
+    if owns_tool_analysis_service:
         tool_analysis_service = build_tool_analysis_service(settings, repository)
     if readiness_service is None:
         readiness_service = build_readiness_service(settings)
+    tool_analysis_service_closed = False
+    tool_analysis_service_close_lock = Lock()
 
-    app = FastAPI(title="Realtime Metrics API", version="0.2.0")
+    @asynccontextmanager
+    async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+        nonlocal tool_analysis_service_closed
+        try:
+            yield
+        finally:
+            with tool_analysis_service_close_lock:
+                if owns_tool_analysis_service and not tool_analysis_service_closed:
+                    tool_analysis_service_closed = True
+                    tool_analysis_service.close()
+
+    app = FastAPI(title="Realtime Metrics API", version="0.2.0", lifespan=lifespan)
 
     @app.post("/analysis/realtime", response_model=AnalysisResponse)
     def analyze_realtime(request: AnalysisRequest) -> AnalysisResponse:

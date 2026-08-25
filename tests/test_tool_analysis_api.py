@@ -2,7 +2,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 import sys
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 from uuid import UUID
 
 from fastapi import HTTPException
@@ -42,6 +42,49 @@ def valid_tool_response() -> ToolAnalysisResponse:
 
 
 class ToolAnalysisApiTest(unittest.TestCase):
+    def test_shutdown_closes_the_owned_tool_service_once(self):
+        owned_service = Mock()
+        with patch("app.main.build_tool_analysis_service", return_value=owned_service):
+            with TestClient(
+                create_app(
+                    repository=Mock(),
+                    analysis_service=Mock(),
+                    readiness_service=Mock(),
+                )
+            ):
+                pass
+
+        owned_service.close.assert_called_once_with()
+
+    def test_repeated_lifecycles_close_the_owned_tool_service_only_once(self):
+        owned_service = Mock()
+        with patch("app.main.build_tool_analysis_service", return_value=owned_service):
+            app = create_app(
+                repository=Mock(),
+                analysis_service=Mock(),
+                readiness_service=Mock(),
+            )
+            with TestClient(app):
+                pass
+            with TestClient(app):
+                pass
+
+        owned_service.close.assert_called_once_with()
+
+    def test_shutdown_does_not_close_an_injected_tool_service(self):
+        injected_service = Mock()
+        with TestClient(
+            create_app(
+                repository=Mock(),
+                analysis_service=Mock(),
+                tool_analysis_service=injected_service,
+                readiness_service=Mock(),
+            )
+        ):
+            pass
+
+        injected_service.close.assert_not_called()
+
     def setUp(self):
         self.service = Mock()
         self.client = TestClient(

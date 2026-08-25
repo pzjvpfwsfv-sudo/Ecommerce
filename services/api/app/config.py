@@ -28,6 +28,7 @@ class ApiSettings:
     flink_checkpoint_max_age_seconds: int = 120
     ai_tool_planner_mode: str = "rule_based"
     ai_tool_max_calls: int = 3
+    ai_tool_executor_max_workers: int = 3
     ai_tool_total_timeout_seconds: float = 20
     ai_tool_max_event_types: int = 20
 
@@ -36,6 +37,8 @@ class ApiSettings:
             raise ValueError(f"unsupported AI_TOOL_PLANNER_MODE: {self.ai_tool_planner_mode}")
         if not 1 <= self.ai_tool_max_calls <= 3:
             raise ValueError("AI_TOOL_MAX_CALLS must be between 1 and 3")
+        if not 1 <= self.ai_tool_executor_max_workers <= 3:
+            raise ValueError("AI_TOOL_EXECUTOR_MAX_WORKERS must be between 1 and 3")
         if not 0 < self.ai_tool_total_timeout_seconds <= 60:
             raise ValueError("AI_TOOL_TOTAL_TIMEOUT_SECONDS must be between 0 and 60")
         if not 1 <= self.ai_tool_max_event_types <= 100:
@@ -74,6 +77,7 @@ def load_settings(environ: Mapping[str, str] | None = None) -> ApiSettings:
         flink_checkpoint_max_age_seconds=int(values.get("FLINK_CHECKPOINT_MAX_AGE_SECONDS", "120")),
         ai_tool_planner_mode=values.get("AI_TOOL_PLANNER_MODE", "rule_based"),
         ai_tool_max_calls=int(values.get("AI_TOOL_MAX_CALLS", "3")),
+        ai_tool_executor_max_workers=int(values.get("AI_TOOL_EXECUTOR_MAX_WORKERS", "3")),
         ai_tool_total_timeout_seconds=float(values.get("AI_TOOL_TOTAL_TIMEOUT_SECONDS", "20")),
         ai_tool_max_event_types=int(values.get("AI_TOOL_MAX_EVENT_TYPES", "20")),
     )

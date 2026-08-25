@@ -150,6 +150,13 @@ def service_with(
 
 
 class ToolAnalysisServiceTest(unittest.TestCase):
+    def test_close_delegates_to_the_tool_executor(self):
+        service, executor = service_with()
+
+        service.close()
+
+        executor.close.assert_called_once_with()
+
     def test_audit_events_are_stable_for_normal_and_planner_degraded_requests(self):
         normal_service, _ = service_with(executor=real_executor())
         normal_records = capture_app_logs(lambda: normal_service.analyze("password=secret"))

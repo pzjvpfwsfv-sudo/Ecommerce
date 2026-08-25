@@ -3,9 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 import logging
 import math
-from queue import Empty, Queue
 import re
-from threading import Thread
 from time import perf_counter
 
 from pydantic import ValidationError
@@ -24,6 +22,7 @@ from app.tool_models import (
 )
 from app.trino_repository import TrinoAnalyticsRepository
 from app.tool_deadline import use_tool_deadline
+from app.tool_runner import BoundedToolRunner, ToolRunnerUnavailableError
 
 
 LOGGER = logging.getLogger(__name__)
@@ -53,6 +52,7 @@ class ToolExecutor:
         total_timeout_seconds: float,
         max_event_types: int,
         timer: Callable[[], float] = perf_counter,
+        runner: BoundedToolRunner | None = None,
     ) -> None:
         if type(max_calls) is not int or not 1 <= max_calls <= len(ToolId):
             raise ValueError("tool max calls must be between 1 and 3")
@@ -73,6 +73,7 @@ class ToolExecutor:
         self._realtime_repository = realtime_repository
         self._historical_repository = historical_repository
         self._quality_repository = quality_repository
+        self._runner = runner or BoundedToolRunner(max_workers=3)
         # This registry is intentionally fixed to private, read-only adapters.
         self._registry: dict[ToolId, Callable[[], EvidencePartition]] = {
             ToolId.REALTIME: self._fetch_realtime,
@@ -95,11 +96,11 @@ class ToolExecutor:
 
             try:
                 remaining = self._remaining(started_at, call_started_at)
-                partition = self._run_with_timeout(
-                    self._registry[call.tool_id],
+                partition = self._runner.run(
+                    lambda: self._run_with_deadline(self._registry[call.tool_id], remaining),
                     remaining,
                 )
-            except ToolExecutionUnavailableError:
+            except (ToolExecutionUnavailableError, ToolRunnerUnavailableError):
                 completed_at = self._now()
                 duration_ms = self._duration_ms(call_started_at, completed_at)
                 self._log_call(
@@ -154,6 +155,9 @@ class ToolExecutor:
             ) else [],
             degraded=any(summary.status == "failed" for summary in summaries),
         )
+
+    def close(self) -> None:
+        self._runner.close()
 
     def _validate_plan(self, plan: ToolPlan) -> list[ToolCall]:
         try:
@@ -237,31 +241,12 @@ class ToolExecutor:
         return self._total_timeout_seconds - self._elapsed(started_at, current_at)
 
     @staticmethod
-    def _run_with_timeout(
+    def _run_with_deadline(
         operation: Callable[[], EvidencePartition],
         timeout_seconds: float,
     ) -> EvidencePartition:
-        outcomes: Queue[tuple[bool, object]] = Queue(maxsize=1)
-
-        def run() -> None:
-            try:
-                with use_tool_deadline(timeout_seconds):
-                    outcomes.put((True, operation()))
-            except Exception as error:
-                outcomes.put((False, error))
-
-        worker = Thread(target=run, name="tool-execution", daemon=True)
-        worker.start()
-        worker.join(timeout_seconds)
-        if worker.is_alive():
-            raise ToolExecutionUnavailableError("tool execution unavailable") from None
-        try:
-            succeeded, value = outcomes.get_nowait()
-        except Empty:
-            raise ToolExecutionUnavailableError("tool execution unavailable") from None
-        if not succeeded:
-            raise value  # type: ignore[misc]
-        return value  # type: ignore[return-value]
+        with use_tool_deadline(timeout_seconds):
+            return operation()
 
     @staticmethod
     def _elapsed(started_at: float, current_at: float) -> float:

@@ -10,6 +10,7 @@ from app.tool_analysis_service import ToolAnalysisService
 from app.tool_executor import ToolExecutor
 from app.tool_narratives import OpenAICompatibleToolNarrativeAnalyzer, RuleBasedToolNarrativeAnalyzer
 from app.tool_planners import OpenAICompatibleToolPlanner, RuleBasedToolPlanner
+from app.tool_runner import BoundedToolRunner
 from app.trino_repository import TrinoAnalyticsRepository
 
 
@@ -84,6 +85,7 @@ def build_tool_analysis_service(
         max_calls=settings.ai_tool_max_calls,
         total_timeout_seconds=settings.ai_tool_total_timeout_seconds,
         max_event_types=settings.ai_tool_max_event_types,
+        runner=BoundedToolRunner(max_workers=settings.ai_tool_executor_max_workers),
     )
     return ToolAnalysisService(
         primary_planner=primary_planner,

@@ -189,6 +189,9 @@ class ToolAnalysisService:
         )
         return response
 
+    def close(self) -> None:
+        self._executor.close()
+
     @staticmethod
     def _validated_plan(plan: ToolPlan) -> ToolPlan:
         if not isinstance(plan, ToolPlan):

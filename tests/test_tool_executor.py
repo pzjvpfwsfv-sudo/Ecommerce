@@ -18,6 +18,7 @@ from app.analysis_models import HistoricalEvidence
 from app.flink_quality_repository import FlinkQualityRepository
 from app.tool_executor import ToolExecutionPlanError, ToolExecutionUnavailableError, ToolExecutor
 from app.tool_models import DataQualityEvidence, ToolCall, ToolId, ToolPlan
+from app.tool_runner import ToolRunnerUnavailableError
 
 
 COUNTERS = {
@@ -114,6 +115,22 @@ class CapturingHandler(logging.Handler):
 
 
 class ToolExecutorTest(unittest.TestCase):
+    def test_executor_maps_runner_unavailability_to_the_existing_safe_error(self):
+        class UnavailableRunner:
+            def run(self, operation, timeout_seconds):
+                raise ToolRunnerUnavailableError("password=secret")
+
+            def close(self):
+                pass
+
+        executor = ToolExecutor(Mock(), Mock(), Mock(), 3, 1, 20, runner=UnavailableRunner())
+
+        with self.assertRaisesRegex(ToolExecutionUnavailableError, "^tool execution unavailable$") as error:
+            executor.execute(realtime_plan(), "audit-runner-unavailable")
+
+        self.assertIsNone(error.exception.__cause__)
+        self.assertNotIn("secret", "".join(traceback.format_exception(error.exception)))
+
     def test_executor_runs_fixed_registry_in_plan_order_and_builds_evidence(self):
         executor, realtime, historical, quality = make_executor()
         call_order: list[ToolId] = []
