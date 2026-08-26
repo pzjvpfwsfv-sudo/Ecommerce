@@ -1227,7 +1227,11 @@ function Invoke-CutoverResumePartialStateBoundary {
                 ))) {
             throw $safeError
         }
-        return $manifest
+        $recoveryState = Ensure-CutoverRecoveryState -State $manifest -Path $legacyPath
+        if ($null -ne $recoveryState.mutations.PSObject.Properties["production_submit"]) {
+            throw $safeError
+        }
+        return $recoveryState
     } catch {
         throw $safeError
     } finally {
@@ -1252,11 +1256,8 @@ function Invoke-CutoverResumePartialControlFlow {
     if ($PSBoundParameters.ContainsKey("StateRoot")) {
         $boundaryArguments["StateRoot"] = $StateRoot
     }
-    $savedManifest = Invoke-CutoverResumePartialStateBoundary @boundaryArguments
-    $recoveryState = Ensure-CutoverRecoveryState -State $savedManifest -Path $PartialPath
-    if ($null -ne $recoveryState.mutations.PSObject.Properties["production_submit"]) {
-        throw "Production submission recovery state is unsafe."
-    }
+    $recoveryState = Invoke-CutoverResumePartialStateBoundary @boundaryArguments
+    $savedManifest = $recoveryState
     return & $Action $savedManifest $recoveryState
 }
 

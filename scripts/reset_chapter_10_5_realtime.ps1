@@ -3,6 +3,11 @@ param(
     [switch]$FunctionsOnly
 )
 
+$chapter105ResetFunctionsOnly = [bool]$FunctionsOnly
+if (-not $chapter105ResetFunctionsOnly -and -not $ConfirmReset) {
+    throw 'Realtime reset requires -ConfirmReset.'
+}
+
 $chapter105BeforeModules = @(Get-Module)
 $chapter105CommonModule = Import-Module ([System.IO.Path]::Combine(
         $PSScriptRoot, 'lib', 'Chapter105.Common.psm1')) -PassThru
@@ -37,14 +42,24 @@ $script:Chapter105DiagnosticCommand =
 $script:Chapter105LastResetReport = $null
 
 function Get-Chapter105ControlledComposePrefix {
-    param([Parameter(Mandatory = $true)][string]$RepositoryRoot)
+    param(
+        [Parameter(Mandatory = $true)][string]$RepositoryRoot,
+        [string]$ProjectName
+    )
 
     $root = [System.IO.Path]::GetFullPath($RepositoryRoot).TrimEnd('\', '/')
-    return @(
-        'compose', '--env-file', (Join-Path $root 'infra\.env'),
+    $prefix = @('compose')
+    if ($PSBoundParameters.ContainsKey('ProjectName')) {
+        if ($ProjectName -cnotmatch '^[a-z0-9][a-z0-9_-]*$') {
+            throw 'Compose project identity is unsafe.'
+        }
+        $prefix += @('--project-name', $ProjectName)
+    }
+    return @($prefix + @(
+        '--env-file', (Join-Path $root 'infra\.env'),
         '-f', (Join-Path $root 'infra\docker-compose.yml'),
         '--profile', 'flink', '--profile', 'serving', '--profile', 'lakehouse'
-    )
+    ))
 }
 
 function Get-Chapter105RealtimeLogicalVolumes {
@@ -99,6 +114,147 @@ function Get-Chapter105ComposeProjectName {
     }
 }
 
+function New-Chapter105ControlledComposeContext {
+    param([Parameter(Mandatory = $true)][string]$RepositoryRoot)
+
+    $inspectionPrefix = Get-Chapter105ControlledComposePrefix -RepositoryRoot $RepositoryRoot
+    $projectName = Get-Chapter105ComposeProjectName -ComposePrefix $inspectionPrefix
+    return [pscustomobject][ordered]@{
+        project_name = $projectName
+        prefix = @(Get-Chapter105ControlledComposePrefix -RepositoryRoot $RepositoryRoot `
+                -ProjectName $projectName)
+    }
+}
+
+function Assert-Chapter105ControlledComposeContext {
+    param(
+        [Parameter(Mandatory = $true)][object]$Context,
+        [Parameter(Mandatory = $true)][string]$RepositoryRoot
+    )
+
+    if ($Context -isnot [System.Management.Automation.PSCustomObject] -or
+        $Context.project_name -isnot [string] -or
+        [string]$Context.project_name -cnotmatch '^[a-z0-9][a-z0-9_-]*$') {
+        throw 'Compose project identity is unsafe.'
+    }
+    $expected = @(Get-Chapter105ControlledComposePrefix -RepositoryRoot $RepositoryRoot `
+            -ProjectName ([string]$Context.project_name))
+    $actual = @($Context.prefix)
+    if ($actual.Count -ne $expected.Count) { throw 'Compose project identity is unsafe.' }
+    for ($index = 0; $index -lt $expected.Count; $index++) {
+        if ([string]$actual[$index] -cne [string]$expected[$index]) {
+            throw 'Compose project identity is unsafe.'
+        }
+    }
+}
+
+function ConvertFrom-Chapter105StrictVolumeLabels {
+    param(
+        [Parameter(Mandatory = $true)][string]$Json,
+        [Parameter(Mandatory = $true)][string]$ProjectName,
+        [Parameter(Mandatory = $true)][string]$LogicalVolume
+    )
+
+    try {
+        $trimmed = $Json.Trim()
+        if ($trimmed.Length -lt 2 -or $trimmed[0] -cne '{' -or
+            $trimmed[$trimmed.Length - 1] -cne '}') {
+            throw 'unsafe'
+        }
+        $body = $trimmed.Substring(1, $trimmed.Length - 2)
+        $labels = [System.Collections.Generic.Dictionary[string, string]]::new(
+            [System.StringComparer]::Ordinal)
+        $index = 0
+        $first = $true
+        while ($true) {
+            while ($index -lt $body.Length -and [char]::IsWhiteSpace($body[$index])) { $index++ }
+            if ($index -ge $body.Length) { break }
+            if (-not $first) {
+                if ($body[$index] -cne ',') { throw 'unsafe' }
+                $index++
+            }
+            $remaining = $body.Substring($index)
+            $match = [regex]::Match(
+                $remaining,
+                '^\s*"(?<key>(?:\\.|[^"\\])*)"\s*:\s*(?<value>"(?:\\.|[^"\\])*")\s*'
+            )
+            if (-not $match.Success) { throw 'unsafe' }
+            $key = ('"' + $match.Groups['key'].Value + '"') |
+                ConvertFrom-Json -ErrorAction Stop
+            $value = $match.Groups['value'].Value | ConvertFrom-Json -ErrorAction Stop
+            if ($key -isnot [string] -or $value -isnot [string] -or
+                $key -cne $key.ToLowerInvariant() -or $labels.ContainsKey($key)) {
+                throw 'unsafe'
+            }
+            $labels.Add($key, $value)
+            $index += $match.Length
+            $first = $false
+        }
+        if ($labels.Count -eq 0 -or
+            -not $labels.ContainsKey('com.docker.compose.project') -or
+            -not $labels.ContainsKey('com.docker.compose.volume') -or
+            $labels['com.docker.compose.project'] -cne $ProjectName -or
+            $labels['com.docker.compose.volume'] -cne $LogicalVolume) {
+            throw 'unsafe'
+        }
+        return $labels
+    } catch {
+        throw 'Realtime volume ownership is unsafe.'
+    }
+}
+
+function Get-Chapter105RealtimeVolumeInspection {
+    param(
+        [Parameter(Mandatory = $true)][string]$VolumeName,
+        [Parameter(Mandatory = $true)][string]$LogicalVolume,
+        [Parameter(Mandatory = $true)][string]$ProjectName
+    )
+
+    $format = '{"name":{{json .Name}},"created_at":{{json .CreatedAt}},' +
+        '"mountpoint":{{json .Mountpoint}},"driver":{{json .Driver}},' +
+        '"scope":{{json .Scope}},"labels":{{json .Labels}}}'
+    $output = @(Invoke-Chapter105Native -FilePath 'docker' -Arguments @(
+            'volume', 'inspect', $VolumeName, '--format', $format
+        ) -FailureMessage 'Realtime volume label inspection failed.')
+    try {
+        if ($output.Count -ne 1) { throw 'unsafe' }
+        $raw = [string]$output[0]
+        $stringToken = '"(?:\\.|[^"\\])*"'
+        $pattern = '^\s*\{\s*"name"\s*:\s*(?<name>' + $stringToken + ')' +
+            '\s*,\s*"created_at"\s*:\s*(?<created>' + $stringToken + ')' +
+            '\s*,\s*"mountpoint"\s*:\s*(?<mount>' + $stringToken + ')' +
+            '\s*,\s*"driver"\s*:\s*(?<driver>' + $stringToken + ')' +
+            '\s*,\s*"scope"\s*:\s*(?<scope>' + $stringToken + ')' +
+            '\s*,\s*"labels"\s*:\s*(?<labels>\{.*\})\s*\}\s*$'
+        $match = [regex]::Match($raw, $pattern, [System.Text.RegularExpressions.RegexOptions]::Singleline)
+        if (-not $match.Success) { throw 'unsafe' }
+        $name = $match.Groups['name'].Value | ConvertFrom-Json -ErrorAction Stop
+        $createdAt = $match.Groups['created'].Value | ConvertFrom-Json -ErrorAction Stop
+        $mountpoint = $match.Groups['mount'].Value | ConvertFrom-Json -ErrorAction Stop
+        $driver = $match.Groups['driver'].Value | ConvertFrom-Json -ErrorAction Stop
+        $scope = $match.Groups['scope'].Value | ConvertFrom-Json -ErrorAction Stop
+        if ($name -isnot [string] -or $name -cne $VolumeName -or
+            $createdAt -isnot [string] -or [string]::IsNullOrWhiteSpace($createdAt) -or
+            $mountpoint -isnot [string] -or [string]::IsNullOrWhiteSpace($mountpoint) -or
+            $driver -isnot [string] -or [string]::IsNullOrWhiteSpace($driver) -or
+            $scope -isnot [string] -or [string]::IsNullOrWhiteSpace($scope)) {
+            throw 'unsafe'
+        }
+        $labels = ConvertFrom-Chapter105StrictVolumeLabels -Json $match.Groups['labels'].Value `
+            -ProjectName $ProjectName -LogicalVolume $LogicalVolume
+        $labelFingerprint = @($labels.Keys | Sort-Object -CaseSensitive | ForEach-Object {
+                "$_=$($labels[$_])"
+            }) -join "`n"
+        return [pscustomobject][ordered]@{
+            volume_name = $name
+            logical_volume = $LogicalVolume
+            fingerprint = @($name, $createdAt, $mountpoint, $driver, $scope, $labelFingerprint) -join "`0"
+        }
+    } catch {
+        throw 'Realtime volume ownership is unsafe.'
+    }
+}
+
 function Assert-Chapter105RealtimeVolumeLabels {
     param(
         [Parameter(Mandatory = $true)][object]$Plan,
@@ -106,22 +262,30 @@ function Assert-Chapter105RealtimeVolumeLabels {
     )
 
     $logicalVolumes = @(Get-Chapter105RealtimeLogicalVolumes)
+    $inspections = @()
     for ($index = 0; $index -lt $logicalVolumes.Count; $index++) {
-        $volume = [string]$Plan.volumes[$index]
-        $output = @(Invoke-Chapter105Native -FilePath 'docker' -Arguments @(
-                'volume', 'inspect', $volume, '--format', '{{json .Labels}}'
-            ) -FailureMessage 'Realtime volume label inspection failed.')
-        try {
-            $labels = ($output -join "`n") | ConvertFrom-Json -ErrorAction Stop
-            if ($labels -isnot [System.Management.Automation.PSCustomObject] -or
-                [string]$labels.'com.docker.compose.project' -cne $ProjectName -or
-                [string]$labels.'com.docker.compose.volume' -cne [string]$logicalVolumes[$index]) {
-                throw 'unsafe'
-            }
-        } catch {
-            throw 'Realtime volume ownership is unsafe.'
-        }
+        $inspections += Get-Chapter105RealtimeVolumeInspection `
+            -VolumeName ([string]$Plan.volumes[$index]) `
+            -LogicalVolume ([string]$logicalVolumes[$index]) -ProjectName $ProjectName
     }
+    return @($inspections)
+}
+
+function Remove-Chapter105ValidatedRealtimeVolume {
+    param(
+        [Parameter(Mandatory = $true)][object]$ExpectedInspection,
+        [Parameter(Mandatory = $true)][string]$ProjectName
+    )
+
+    $current = Get-Chapter105RealtimeVolumeInspection `
+        -VolumeName ([string]$ExpectedInspection.volume_name) `
+        -LogicalVolume ([string]$ExpectedInspection.logical_volume) -ProjectName $ProjectName
+    if ([string]$current.fingerprint -cne [string]$ExpectedInspection.fingerprint) {
+        throw 'Realtime volume ownership is unsafe.'
+    }
+    Invoke-Chapter105Native -FilePath 'docker' -Arguments @(
+        'volume', 'rm', [string]$ExpectedInspection.volume_name
+    ) -FailureMessage 'Realtime volume reset failed.' | Out-Null
 }
 
 function Get-Chapter105LakeEvidence {
@@ -200,10 +364,22 @@ function Write-Chapter105ResetPlan {
     Write-Host ("[protected] warehouse bucket; " + [string]$Plan.protected.minio_host_path)
 }
 
+function Get-Chapter105RealtimeVolumeOwnerServices {
+    return @(
+        'kafka-controller',
+        'kafka-broker',
+        'doris-fe',
+        'doris-be',
+        'metastore-postgres'
+    )
+}
+
 function Invoke-Chapter105RealtimeReset {
     param(
         [switch]$ConfirmReset,
-        [string]$RepositoryRoot
+        [string]$RepositoryRoot,
+        [AllowNull()][object]$ComposeContext,
+        [AllowNull()][object]$BeforeEvidence
     )
 
     if (-not $ConfirmReset) { throw 'Realtime reset requires -ConfirmReset.' }
@@ -223,31 +399,40 @@ function Invoke-Chapter105RealtimeReset {
     }
     $script:Chapter105LastResetReport = $report
     try {
-        $composePrefix = Get-Chapter105ControlledComposePrefix -RepositoryRoot $RepositoryRoot
-        $projectName = Get-Chapter105ComposeProjectName -ComposePrefix $composePrefix
+        if ($null -eq $ComposeContext) {
+            $ComposeContext = New-Chapter105ControlledComposeContext -RepositoryRoot $RepositoryRoot
+        }
+        Assert-Chapter105ControlledComposeContext -Context $ComposeContext `
+            -RepositoryRoot $RepositoryRoot
+        $composePrefix = @($ComposeContext.prefix)
+        $projectName = [string]$ComposeContext.project_name
         $plan = Get-Chapter105RealtimeResetPlan -ProjectName $projectName
         $report.project_name = $projectName
         $report.plan = $plan
         Write-Chapter105ResetPlan -Plan $plan
 
-        Assert-Chapter105RealtimeVolumeLabels -Plan $plan -ProjectName $projectName
-        $report.evidence.before = Get-Chapter105LakeEvidence -ComposePrefix $composePrefix
+        $volumeInspections = @(Assert-Chapter105RealtimeVolumeLabels -Plan $plan `
+                -ProjectName $projectName)
+        $report.evidence.before = if ($null -ne $BeforeEvidence) {
+            $BeforeEvidence
+        } else {
+            Get-Chapter105LakeEvidence -ComposePrefix $composePrefix
+        }
 
         Invoke-Chapter105Native -FilePath 'docker' -Arguments ($composePrefix + @(
-                'stop', 'api', 'trino', 'hive-metastore', 'metastore-postgres',
-                'flink-sql-client', 'flink-taskmanager', 'flink-jobmanager',
-                'doris-be', 'doris-fe', 'kafka-broker', 'kafka-controller'
-            )) -FailureMessage 'Realtime service stop failed.' | Out-Null
+                'rm', '--stop', '--force'
+            ) + @(Get-Chapter105RealtimeVolumeOwnerServices)) `
+            -FailureMessage 'Realtime owner container removal failed.' | Out-Null
 
-        foreach ($prefix in @($plan.object_prefixes)) {
-            $target = "local/$prefix/"
-            Invoke-Chapter105Native -FilePath 'docker' -Arguments ($composePrefix + @(
-                    'exec', '-T', 'minio', 'mc', 'rm', '--recursive', '--force', $target
-                )) -FailureMessage 'Flink state prefix reset failed.' | Out-Null
+        foreach ($inspection in @($volumeInspections)) {
+            Remove-Chapter105ValidatedRealtimeVolume -ExpectedInspection $inspection `
+                -ProjectName $projectName
         }
-        foreach ($volume in @($plan.volumes)) {
-            Invoke-Chapter105Native -FilePath 'docker' -Arguments @('volume', 'rm', [string]$volume) `
-                -FailureMessage 'Realtime volume reset failed.' | Out-Null
+        foreach ($prefix in @($plan.object_prefixes)) {
+            Invoke-Chapter105Native -FilePath 'docker' -Arguments ($composePrefix + @(
+                    'exec', '-T', 'minio', 'mc', 'rm', '--recursive', '--force',
+                    "local/$prefix/"
+                )) -FailureMessage 'Flink state prefix reset failed.' | Out-Null
         }
 
         Invoke-Chapter105Native -FilePath 'docker' -Arguments ($composePrefix + @(
@@ -257,7 +442,8 @@ function Invoke-Chapter105RealtimeReset {
             )) -FailureMessage 'Realtime service rebuild failed.' | Out-Null
         Invoke-Chapter105Native -FilePath 'powershell' -Arguments @(
             '-NoProfile', '-File', (Join-Path $RepositoryRoot 'scripts\restore_chapter_10_5_catalog.ps1'),
-            '-EnvFile', (Join-Path $RepositoryRoot 'infra\.env')
+            '-EnvFile', (Join-Path $RepositoryRoot 'infra\.env'),
+            '-ComposeProjectName', $projectName
         ) -FailureMessage 'Fixed catalog recovery failed.' | Out-Null
 
         $report.evidence.after = Get-Chapter105LakeEvidence -ComposePrefix $composePrefix
@@ -274,7 +460,7 @@ function Invoke-Chapter105RealtimeReset {
     }
 }
 
-if ($FunctionsOnly) { return }
+if ($chapter105ResetFunctionsOnly) { return }
 
 $chapter105Root = Get-Chapter105PrimaryRepositoryRoot -StartPath $PSScriptRoot
 $chapter105ReportPath = Join-Path $chapter105Root 'tmp/chapter-10-5/realtime-reset-report.json'

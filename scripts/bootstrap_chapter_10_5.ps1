@@ -3,6 +3,7 @@ param(
     [string]$EnvFile = 'infra/.env',
     [switch]$SkipBuild,
     [string]$ReportPath = 'tmp/chapter-10-5/bootstrap-report.json',
+    [string]$ComposeProjectName,
     [switch]$FunctionsOnly
 )
 
@@ -489,8 +490,16 @@ function Invoke-Chapter105Bootstrap {
             $context.Environment = Read-Chapter105EnvFile -Path $context.EnvPath
             $context.Environment['MINIO_DATA_DIR'] = Get-Chapter105StableMinioDataPath -RepositoryRoot $context.RepositoryRoot
             [Environment]::SetEnvironmentVariable('MINIO_DATA_DIR', $context.Environment['MINIO_DATA_DIR'], 'Process')
-            $context.ComposePrefix = @(
-                'compose', '--env-file', $context.EnvPath, '-f', (Join-Path $context.RepositoryRoot 'infra\docker-compose.yml'),
+            if (-not [string]::IsNullOrWhiteSpace($ComposeProjectName) -and
+                $ComposeProjectName -cnotmatch '^[a-z0-9][a-z0-9_-]*$') {
+                throw 'Compose project identity is unsafe.'
+            }
+            $context.ComposePrefix = @('compose')
+            if (-not [string]::IsNullOrWhiteSpace($ComposeProjectName)) {
+                $context.ComposePrefix += @('--project-name', $ComposeProjectName)
+            }
+            $context.ComposePrefix += @(
+                '--env-file', $context.EnvPath, '-f', (Join-Path $context.RepositoryRoot 'infra\docker-compose.yml'),
                 '--profile', 'flink', '--profile', 'serving', '--profile', 'lakehouse'
             )
             . (Join-Path $PSScriptRoot 'run_chapter_9_production_cutover.ps1') -FunctionsOnly

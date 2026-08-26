@@ -4,6 +4,12 @@ param(
     [switch]$FunctionsOnly
 )
 
+$chapter105MigrationFunctionsOnly = [bool]$FunctionsOnly
+if (-not $chapter105MigrationFunctionsOnly -and
+    (-not $TrafficPaused -or -not $ConfirmRealtimeReset)) {
+    throw 'Migration requires -TrafficPaused and -ConfirmRealtimeReset.'
+}
+
 . (Join-Path $PSScriptRoot 'reset_chapter_10_5_realtime.ps1') -FunctionsOnly
 
 $script:Chapter105LastMigrationReport = $null
@@ -48,15 +54,20 @@ function Invoke-Chapter105Migration {
     Write-Host '[protected] warehouse bucket; infra/compose/minio/data'
 
     try {
-        $composePrefix = Get-Chapter105ControlledComposePrefix -RepositoryRoot $RepositoryRoot
+        $composeContext = New-Chapter105ControlledComposeContext -RepositoryRoot $RepositoryRoot
+        Assert-Chapter105ControlledComposeContext -Context $composeContext `
+            -RepositoryRoot $RepositoryRoot
+        $composePrefix = @($composeContext.prefix)
         $report.evidence.before = Get-Chapter105LakeEvidence -ComposePrefix $composePrefix
         $report.reset = Invoke-Chapter105RealtimeReset -ConfirmReset `
-            -RepositoryRoot $RepositoryRoot
+            -RepositoryRoot $RepositoryRoot -ComposeContext $composeContext `
+            -BeforeEvidence $report.evidence.before
 
         Invoke-Chapter105Native -FilePath 'powershell' -Arguments @(
             '-NoProfile', '-File', (Join-Path $RepositoryRoot 'scripts\bootstrap_chapter_10_5.ps1'),
             '-EnvFile', (Join-Path $RepositoryRoot 'infra\.env'),
-            '-ReportPath', 'tmp/chapter-10-5/migration-bootstrap-report.json'
+            '-ReportPath', 'tmp/chapter-10-5/migration-bootstrap-report.json',
+            '-ComposeProjectName', ([string]$composeContext.project_name)
         ) -FailureMessage 'Chapter 10.5 strict bootstrap acceptance failed.' | Out-Null
 
         $report.evidence.after = Get-Chapter105LakeEvidence -ComposePrefix $composePrefix
@@ -73,7 +84,7 @@ function Invoke-Chapter105Migration {
     }
 }
 
-if ($FunctionsOnly) { return }
+if ($chapter105MigrationFunctionsOnly) { return }
 
 $chapter105Root = Get-Chapter105PrimaryRepositoryRoot -StartPath $PSScriptRoot
 $chapter105ReportPath = Join-Path $chapter105Root 'tmp/chapter-10-5/migration-report.json'

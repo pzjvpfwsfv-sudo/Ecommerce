@@ -1,6 +1,7 @@
 param(
     [switch]$FunctionsOnly,
-    [string]$EnvFile = "infra/.env.example"
+    [string]$EnvFile = "infra/.env.example",
+    [string]$ComposeProjectName
 )
 
 $script:Chapter105CatalogRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
@@ -9,6 +10,11 @@ $script:Chapter105CatalogEnvFile = if ([System.IO.Path]::IsPathRooted($EnvFile))
 } else {
     [System.IO.Path]::GetFullPath((Join-Path $script:Chapter105CatalogRoot $EnvFile))
 }
+$script:Chapter105CatalogProjectName = $ComposeProjectName
+if (-not [string]::IsNullOrWhiteSpace($script:Chapter105CatalogProjectName) -and
+    $script:Chapter105CatalogProjectName -cnotmatch '^[a-z0-9][a-z0-9_-]*$') {
+    throw 'Compose project identity is unsafe.'
+}
 
 function Invoke-Chapter105Compose {
     param(
@@ -16,8 +22,11 @@ function Invoke-Chapter105Compose {
         [Parameter(Mandatory = $true)][string]$FailureMessage
     )
 
-    $composeArguments = @(
-        "compose",
+    $composeArguments = @("compose")
+    if (-not [string]::IsNullOrWhiteSpace($script:Chapter105CatalogProjectName)) {
+        $composeArguments += @('--project-name', $script:Chapter105CatalogProjectName)
+    }
+    $composeArguments += @(
         "--env-file", $script:Chapter105CatalogEnvFile,
         "-f", (Join-Path $script:Chapter105CatalogRoot "infra/docker-compose.yml"),
         "--profile", "lakehouse"

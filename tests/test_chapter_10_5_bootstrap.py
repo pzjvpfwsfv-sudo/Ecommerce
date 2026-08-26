@@ -668,6 +668,433 @@ $after = Get-Content -LiteralPath $partialPath -Raw -Encoding UTF8
         self.assertTrue(payload["legacy_preserved"])
         self.assertTrue(payload["canonical_absent"])
 
+    def test_resume_partial_outer_flow_normalizes_legacy_evidence_only_while_lock_is_held(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repository = root / "repository"
+            state_root = root / "state"
+            repository.mkdir()
+            state_root.mkdir()
+            partial = repository / "tmp" / "chapter-9" / "cutover-manifest.json.partial"
+            payload = self._powershell_payload(
+                rf'''
+. "scripts/run_chapter_9_production_cutover.ps1" -FunctionsOnly
+$name = "chapter-9-datastream-quality-production"
+$jobId = "99999999999999999999999999999999"
+$savepoint = "s3a://flink-state/savepoints/chapter-9/savepoint-fixed"
+$partialPath = "{partial}"
+$statePath = Get-CutoverProductionSubmitStatePath -RepositoryRoot "{repository}" -StateRoot "{state_root}"
+$legacy = [ordered]@{{
+    schema_version = 2
+    cutover_id = "resume-lock-owned"
+    phase = "production_submit"
+    created_at = "2026-08-25T00:00:00.0000000+00:00"
+    raw_offsets = @("partition:0,offset:42")
+    shadow_job_id = "11111111111111111111111111111111"
+    savepoint_path = $savepoint
+    production_job_id = $jobId
+    doris_job_id = $null
+    iceberg_job_id = $null
+    mutations = [ordered]@{{
+        shadow_stop = [ordered]@{{ status = "result"; intent = @{{}}; result = @{{}} }}
+        production_submit = [ordered]@{{
+            status = "result"
+            intent = [ordered]@{{
+                operation = "submit_production_from_savepoint"
+                details = [ordered]@{{ name = $name; savepoint_path = $savepoint }}
+                created_at_utc = "2026-08-25T00:01:00.0000000+00:00"
+            }}
+            result = [ordered]@{{
+                status = "result"
+                details = [ordered]@{{ job_id = $jobId }}
+                completed_at_utc = "2026-08-25T00:02:00.0000000+00:00"
+                job_id = $jobId
+            }}
+        }}
+        doris_submit = [ordered]@{{ status = "not_started"; intent = $null; result = $null }}
+        iceberg_submit = [ordered]@{{ status = "not_started"; intent = $null; result = $null }}
+        finalization = [ordered]@{{ status = "not_started"; intent = $null; result = $null }}
+    }}
+}}
+Write-CutoverStateAtomic -State $legacy -Path $partialPath
+$script:originalEnsure = ${{function:Ensure-CutoverRecoveryState}}
+$script:ensureUnderLock = $false
+$script:actions = 0
+function Ensure-CutoverRecoveryState {{
+    param($State, $Path)
+    $probe = $null
+    try {{
+        $probe = [System.IO.File]::Open(
+            "$statePath.lock",
+            [System.IO.FileMode]::OpenOrCreate,
+            [System.IO.FileAccess]::ReadWrite,
+            [System.IO.FileShare]::None
+        )
+        $script:ensureUnderLock = $false
+    }} catch [System.IO.IOException] {{
+        $script:ensureUnderLock = $true
+    }} finally {{
+        if ($null -ne $probe) {{ $probe.Dispose() }}
+    }}
+    return & $script:originalEnsure -State $State -Path $Path
+}}
+$result = Invoke-CutoverResumePartialControlFlow -RepositoryRoot "{repository}" -StateRoot "{state_root}" `
+    -PartialPath $partialPath -ExpectedName $name -Action {{
+        param($savedManifest, $recoveryState)
+        $script:actions++
+        return ($null -eq $recoveryState.mutations.PSObject.Properties["production_submit"])
+    }}
+[ordered]@{{
+    ensure_under_lock = $script:ensureUnderLock
+    actions = $script:actions
+    production_removed = [bool]$result
+}} | ConvertTo-Json -Compress
+'''
+            )
+
+        self.assertTrue(payload["ensure_under_lock"])
+        self.assertEqual(1, payload["actions"])
+        self.assertTrue(payload["production_removed"])
+
+    def test_real_reset_public_entry_rejects_before_native_or_file_side_effects(self):
+        with tempfile.TemporaryDirectory() as directory:
+            primary = Path(directory) / "primary"
+            (primary / ".git").mkdir(parents=True)
+            (primary / "infra").mkdir()
+            payload = self._powershell_payload(
+                rf'''
+$script:nativeCalls = 0
+function git {{
+    param([Parameter(ValueFromRemainingArguments = $true)]$Arguments)
+    $script:nativeCalls++
+    $global:LASTEXITCODE = 0
+    if ($Arguments -contains "--git-common-dir") {{ return "{primary / '.git'}" }}
+    if ($Arguments -contains "--is-inside-work-tree") {{ return "true" }}
+    return "{primary}"
+}}
+function docker {{ $script:nativeCalls++; throw "docker must not run" }}
+function powershell {{ $script:nativeCalls++; throw "powershell must not run" }}
+$errorMessage = $null
+try {{ & "{RESET}" }} catch {{ $errorMessage = $_.Exception.Message }}
+$reportPath = Join-Path "{primary}" "tmp/chapter-10-5/realtime-reset-report.json"
+[ordered]@{{
+    error = $errorMessage
+    native_calls = $script:nativeCalls
+    report_exists = Test-Path -LiteralPath $reportPath
+}} | ConvertTo-Json -Compress
+'''
+            )
+
+        self.assertEqual("Realtime reset requires -ConfirmReset.", payload["error"])
+        self.assertEqual(0, payload["native_calls"])
+        self.assertFalse(payload["report_exists"])
+
+    def test_real_migrate_public_entry_denies_without_gates_and_runs_when_confirmed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            primary = Path(directory) / "primary"
+            (primary / ".git").mkdir(parents=True)
+            (primary / "infra").mkdir()
+            payload = self._powershell_payload(
+                rf'''
+$global:chapter105PublicCalls = @()
+function git {{
+    param([Parameter(ValueFromRemainingArguments = $true)]$Arguments)
+    $global:chapter105PublicCalls += "git"
+    $global:LASTEXITCODE = 0
+    if ($Arguments -contains "--git-common-dir") {{ return "{primary / '.git'}" }}
+    if ($Arguments -contains "--is-inside-work-tree") {{ return "true" }}
+    return "{primary}"
+}}
+function docker {{
+    param([Parameter(ValueFromRemainingArguments = $true)][string[]]$Arguments)
+    $global:chapter105PublicCalls += ,([pscustomobject]@{{ file = "docker"; arguments = @($Arguments) }})
+    $global:LASTEXITCODE = 0
+    if ($Arguments -contains "config") {{
+        [System.IO.File]::WriteAllText("{primary / 'infra' / '.env'}", "COMPOSE_PROJECT_NAME=attacker`n")
+        return '{{"name":"safeproject"}}'
+    }}
+    if ($Arguments.Count -ge 3 -and $Arguments[0] -ceq "volume" -and $Arguments[1] -ceq "inspect") {{
+        $logical = [string]$Arguments[2] -replace '^safeproject_', ''
+        return ([ordered]@{{
+            name = [string]$Arguments[2]
+            created_at = "2026-08-25T00:00:00Z"
+            mountpoint = "mock/$logical"
+            driver = "local"
+            scope = "local"
+            labels = [ordered]@{{
+                "com.docker.compose.project" = "safeproject"
+                "com.docker.compose.volume" = $logical
+            }}
+        }} | ConvertTo-Json -Depth 5 -Compress)
+    }}
+    if ($Arguments -contains "find") {{ return '{{"key":"warehouse/a.parquet","size":7}}' }}
+    if ($Arguments -contains "--execute") {{ return "123456789" }}
+    return @()
+}}
+function powershell {{
+    param([Parameter(ValueFromRemainingArguments = $true)][string[]]$Arguments)
+    $global:chapter105PublicCalls += ,([pscustomobject]@{{ file = "powershell"; arguments = @($Arguments) }})
+    $global:LASTEXITCODE = 0
+    return @()
+}}
+$deniedError = $null
+try {{ & "{MIGRATE}" }} catch {{ $deniedError = $_.Exception.Message }}
+$callsAfterDenied = $global:chapter105PublicCalls.Count
+$confirmedError = $null
+try {{ & "{MIGRATE}" -TrafficPaused -ConfirmRealtimeReset }} catch {{ $confirmedError = $_.Exception.Message }}
+$reportPath = Join-Path "{primary}" "tmp/chapter-10-5/migration-report.json"
+$report = if (Test-Path -LiteralPath $reportPath -PathType Leaf) {{
+    Get-Content -LiteralPath $reportPath -Raw -Encoding UTF8 | ConvertFrom-Json
+}} else {{ $null }}
+$composeCalls = @($global:chapter105PublicCalls | Where-Object {{
+    $_.file -ceq "docker" -and $_.arguments.Count -gt 0 -and $_.arguments[0] -ceq "compose"
+}})
+$postInspection = @($composeCalls | Select-Object -Skip 1)
+$allComposeFrozen = @($postInspection | Where-Object {{
+    $index = [Array]::IndexOf([object[]]$_.arguments, "--project-name")
+    $index -lt 0 -or $index + 1 -ge $_.arguments.Count -or $_.arguments[$index + 1] -cne "safeproject"
+}}).Count -eq 0
+$childCalls = @($global:chapter105PublicCalls | Where-Object {{ $_.file -ceq "powershell" }})
+$allChildrenFrozen = @($childCalls | Where-Object {{
+    $index = [Array]::IndexOf([object[]]$_.arguments, "-ComposeProjectName")
+    $index -lt 0 -or $index + 1 -ge $_.arguments.Count -or $_.arguments[$index + 1] -cne "safeproject"
+}}).Count -eq 0
+[ordered]@{{
+    denied_error = $deniedError
+    calls_after_denied = $callsAfterDenied
+    confirmed_error = $confirmedError
+    confirmed_calls = $global:chapter105PublicCalls.Count
+    report_status = if ($null -eq $report) {{ $null }} else {{ [string]$report.status }}
+    project_inspections = @($composeCalls | Where-Object {{ $_.arguments -contains "config" }}).Count
+    all_compose_frozen = $allComposeFrozen
+    frozen_child_calls = $childCalls.Count
+    all_children_frozen = $allChildrenFrozen
+}} | ConvertTo-Json -Compress
+'''
+            )
+
+        self.assertEqual(
+            "Migration requires -TrafficPaused and -ConfirmRealtimeReset.",
+            payload["denied_error"],
+        )
+        self.assertEqual(0, payload["calls_after_denied"])
+        self.assertIsNone(payload["confirmed_error"])
+        self.assertGreater(payload["confirmed_calls"], 0)
+        self.assertEqual("passed", payload["report_status"])
+        self.assertEqual(1, payload["project_inspections"])
+        self.assertTrue(payload["all_compose_frozen"])
+        self.assertEqual(2, payload["frozen_child_calls"])
+        self.assertTrue(payload["all_children_frozen"])
+
+    def test_compose_project_is_frozen_in_every_post_inspection_argv(self):
+        with tempfile.TemporaryDirectory() as directory:
+            env_file = Path(directory) / "infra" / ".env"
+            env_file.parent.mkdir()
+            env_file.write_text("COMPOSE_PROJECT_NAME=safeproject\n", encoding="utf-8")
+            payload = self._powershell_payload(
+                rf'''
+. "{RESET}" -FunctionsOnly
+$script:calls = @()
+$script:inspectRound = @{{}}
+function Invoke-Chapter105Native {{
+    param([string]$FilePath, [string[]]$Arguments, [string]$FailureMessage)
+    $script:calls += ,([pscustomobject]@{{ file = $FilePath; arguments = @($Arguments) }})
+    if ($Arguments -contains "config") {{
+        [System.IO.File]::WriteAllText("{env_file}", "COMPOSE_PROJECT_NAME=attacker`n")
+        return @('{{"name":"safeproject"}}')
+    }}
+    if ($Arguments.Count -ge 3 -and $Arguments[0] -ceq "volume" -and $Arguments[1] -ceq "inspect") {{
+        $logical = [string]$Arguments[2] -replace '^safeproject_', ''
+        return @(([ordered]@{{
+            name = [string]$Arguments[2]; created_at = "2026-08-25T00:00:00Z"
+            mountpoint = "mock/$logical"; driver = "local"; scope = "local"
+            labels = [ordered]@{{
+                "com.docker.compose.project" = "safeproject"
+                "com.docker.compose.volume" = $logical
+            }}
+        }} | ConvertTo-Json -Depth 5 -Compress))
+    }}
+    if ($Arguments -contains "find") {{ return @('{{"key":"warehouse/a.parquet","size":7}}') }}
+    if ($Arguments -contains "--execute") {{ return @("123456789") }}
+    return @()
+}}
+$report = Invoke-Chapter105RealtimeReset -ConfirmReset -RepositoryRoot "{Path(directory)}"
+$composeCalls = @($script:calls | Where-Object {{
+    $_.file -ceq "docker" -and $_.arguments.Count -gt 0 -and $_.arguments[0] -ceq "compose"
+}})
+$postInspection = @($composeCalls | Select-Object -Skip 1)
+$allFrozen = @($postInspection | Where-Object {{
+    $index = [Array]::IndexOf([object[]]$_.arguments, "--project-name")
+    $index -lt 0 -or $index + 1 -ge $_.arguments.Count -or $_.arguments[$index + 1] -cne "safeproject"
+}}).Count -eq 0
+$joined = @($postInspection | ForEach-Object {{ $_.arguments -join " " }}) -join "`n"
+$restoreCalls = @($script:calls | Where-Object {{ $_.file -ceq "powershell" }})
+$restoreFrozen = @($restoreCalls | Where-Object {{
+    $index = [Array]::IndexOf([object[]]$_.arguments, "-ComposeProjectName")
+    $index -lt 0 -or $index + 1 -ge $_.arguments.Count -or $_.arguments[$index + 1] -cne "safeproject"
+}}).Count -eq 0
+[ordered]@{{
+    status = [string]$report.status
+    compose_calls = $composeCalls.Count
+    all_frozen = $allFrozen
+    attacker_seen = $joined -match "attacker"
+    restore_calls = $restoreCalls.Count
+    restore_frozen = $restoreFrozen
+}} | ConvertTo-Json -Compress
+'''
+            )
+
+        self.assertEqual("passed", payload["status"])
+        self.assertGreater(payload["compose_calls"], 1)
+        self.assertTrue(payload["all_frozen"])
+        self.assertFalse(payload["attacker_seen"])
+        self.assertEqual(1, payload["restore_calls"])
+        self.assertTrue(payload["restore_frozen"])
+
+    def test_strict_volume_label_json_rejects_case_duplicates_and_non_strings(self):
+        payload = self._powershell_payload(
+            rf'''
+. "{RESET}" -FunctionsOnly
+$cases = [ordered]@{{
+    valid = '{{"com.docker.compose.project":"safeproject","com.docker.compose.volume":"kafka-controller-data"}}'
+    uppercase = '{{"com.docker.compose.Project":"safeproject","com.docker.compose.volume":"kafka-controller-data"}}'
+    duplicate = '{{"com.docker.compose.project":"safeproject","com.docker.compose.project":"safeproject","com.docker.compose.volume":"kafka-controller-data"}}'
+    non_string = '{{"com.docker.compose.project":7,"com.docker.compose.volume":"kafka-controller-data"}}'
+}}
+$results = [ordered]@{{}}
+foreach ($entry in $cases.GetEnumerator()) {{
+    try {{
+        ConvertFrom-Chapter105StrictVolumeLabels -Json $entry.Value `
+            -ProjectName "safeproject" -LogicalVolume "kafka-controller-data" | Out-Null
+        $results[$entry.Key] = "accepted"
+    }} catch {{ $results[$entry.Key] = $_.Exception.Message }}
+}}
+$results | ConvertTo-Json -Compress
+'''
+        )
+
+        self.assertEqual("accepted", payload["valid"])
+        for case_name in ("uppercase", "duplicate", "non_string"):
+            self.assertEqual("Realtime volume ownership is unsafe.", payload[case_name])
+
+    def test_reset_removes_fixed_owner_containers_then_reinspects_each_volume_before_rm(self):
+        payload = self._powershell_payload(
+            rf'''
+. "{RESET}" -FunctionsOnly
+$script:events = @()
+function Invoke-Chapter105Native {{
+    param([string]$FilePath, [string[]]$Arguments, [string]$FailureMessage)
+    if ($Arguments -contains "config") {{ return @('{{"name":"safeproject"}}') }}
+    if ($Arguments.Count -ge 3 -and $Arguments[0] -ceq "volume" -and $Arguments[1] -ceq "inspect") {{
+        $logical = [string]$Arguments[2] -replace '^safeproject_', ''
+        $script:events += "inspect:$($Arguments[2])"
+        return @(([ordered]@{{
+            name = [string]$Arguments[2]; created_at = "2026-08-25T00:00:00Z"
+            mountpoint = "mock/$logical"; driver = "local"; scope = "local"
+            labels = [ordered]@{{
+                "com.docker.compose.project" = "safeproject"
+                "com.docker.compose.volume" = $logical
+            }}
+        }} | ConvertTo-Json -Depth 5 -Compress))
+    }}
+    if ($Arguments -contains "find") {{ return @('{{"key":"warehouse/a.parquet","size":7}}') }}
+    if ($Arguments -contains "--execute") {{ return @("123456789") }}
+    if ($Arguments -contains "rm" -and $Arguments -contains "--stop" -and
+        $Arguments[0] -ceq "compose") {{
+        $serviceIndex = [Array]::IndexOf([object[]]$Arguments, "rm") + 3
+        $script:events += "compose-rm:$(@($Arguments[$serviceIndex..($Arguments.Count - 1)]) -join ',')"
+    }} elseif ($Arguments.Count -eq 3 -and $Arguments[0] -ceq "volume" -and $Arguments[1] -ceq "rm") {{
+        $script:events += "volume-rm:$($Arguments[2])"
+    }} elseif ($Arguments -contains "mc" -and $Arguments -contains "rm") {{
+        $script:events += "prefix-rm:$($Arguments[-1])"
+    }}
+    return @()
+}}
+$report = Invoke-Chapter105RealtimeReset -ConfirmReset -RepositoryRoot (Get-Location)
+$firstVolumeRm = [Array]::FindIndex([string[]]$script:events, [Predicate[string]]{{ param($x) $x.StartsWith("volume-rm:") }})
+$firstPrefixRm = [Array]::FindIndex([string[]]$script:events, [Predicate[string]]{{ param($x) $x.StartsWith("prefix-rm:") }})
+$adjacent = $true
+for ($index = 0; $index -lt $script:events.Count; $index++) {{
+    if ($script:events[$index].StartsWith("volume-rm:") -and
+        ($index -eq 0 -or $script:events[$index - 1] -cne $script:events[$index].Replace("volume-rm:", "inspect:"))) {{
+        $adjacent = $false
+    }}
+}}
+[ordered]@{{
+    status = [string]$report.status
+    events = @($script:events)
+    adjacent = $adjacent
+    volumes_before_prefixes = $firstVolumeRm -ge 0 -and $firstPrefixRm -gt $firstVolumeRm
+}} | ConvertTo-Json -Depth 5 -Compress
+'''
+        )
+
+        self.assertEqual("passed", payload["status"])
+        self.assertIn(
+            "compose-rm:kafka-controller,kafka-broker,doris-fe,doris-be,metastore-postgres",
+            payload["events"],
+        )
+        self.assertTrue(payload["adjacent"])
+        self.assertTrue(payload["volumes_before_prefixes"])
+
+    def test_reset_rejects_replaced_volume_on_immediate_second_inspection(self):
+        payload = self._powershell_payload(
+            rf'''
+. "{RESET}" -FunctionsOnly
+$script:inspectCounts = @{{}}
+$script:events = @()
+function Invoke-Chapter105Native {{
+    param([string]$FilePath, [string[]]$Arguments, [string]$FailureMessage)
+    if ($Arguments -contains "config") {{ return @('{{"name":"safeproject"}}') }}
+    if ($Arguments.Count -ge 3 -and $Arguments[0] -ceq "volume" -and $Arguments[1] -ceq "inspect") {{
+        $volume = [string]$Arguments[2]
+        $script:inspectCounts[$volume] = 1 + [int]$script:inspectCounts[$volume]
+        $logical = $volume -replace '^safeproject_', ''
+        $created = if ($logical -ceq "kafka-controller-data" -and $script:inspectCounts[$volume] -eq 2) {{
+            "2026-08-26T00:00:00Z"
+        }} else {{ "2026-08-25T00:00:00Z" }}
+        $script:events += "inspect:${{volume}}:$created"
+        return @(([ordered]@{{
+            name = $volume; created_at = $created; mountpoint = "mock/$logical"
+            driver = "local"; scope = "local"
+            labels = [ordered]@{{
+                "com.docker.compose.project" = "safeproject"
+                "com.docker.compose.volume" = $logical
+            }}
+        }} | ConvertTo-Json -Depth 5 -Compress))
+    }}
+    if ($Arguments -contains "find") {{ return @('{{"key":"warehouse/a.parquet","size":7}}') }}
+    if ($Arguments -contains "--execute") {{ return @("123456789") }}
+    if ($Arguments -contains "rm" -and $Arguments[0] -ceq "compose") {{ $script:events += "compose-rm" }}
+    if ($Arguments.Count -eq 3 -and $Arguments[0] -ceq "volume" -and $Arguments[1] -ceq "rm") {{
+        $script:events += "volume-rm:$($Arguments[2])"
+    }}
+    if ($Arguments -contains "mc" -and $Arguments -contains "rm") {{ $script:events += "prefix-rm" }}
+    return @()
+}}
+$errorMessage = $null
+try {{ Invoke-Chapter105RealtimeReset -ConfirmReset -RepositoryRoot (Get-Location) | Out-Null }} catch {{
+    $errorMessage = $_.Exception.Message
+}}
+[ordered]@{{
+    error = $errorMessage
+    events = @($script:events)
+    inspect_count = @($script:events | Where-Object {{ $_.StartsWith("inspect:") }}).Count
+    volume_rm_count = @($script:events | Where-Object {{ $_.StartsWith("volume-rm:") }}).Count
+    prefix_rm_count = @($script:events | Where-Object {{ $_ -ceq "prefix-rm" }}).Count
+}} | ConvertTo-Json -Depth 5 -Compress
+'''
+        )
+
+        self.assertEqual(
+            "Chapter 10.5 realtime reset failed. State was preserved; run the fixed diagnostic command.",
+            payload["error"],
+        )
+        self.assertIn("compose-rm", payload["events"])
+        self.assertEqual(6, payload["inspect_count"])
+        self.assertEqual(0, payload["volume_rm_count"])
+        self.assertEqual(0, payload["prefix_rm_count"])
+
     def test_realtime_reset_requires_confirmation_before_native_calls_and_has_exact_plan(self):
         payload = self._powershell_payload(
             rf'''
@@ -746,9 +1173,13 @@ function Invoke-Chapter105Native {{
         $Arguments[0] -ceq "volume" -and $Arguments[1] -ceq "inspect") {{
         $logical = [string]$Arguments[2] -replace '^safeproject_', ''
         return @(([ordered]@{{
-            "com.docker.compose.project" = "safeproject"
-            "com.docker.compose.volume" = $logical
-        }} | ConvertTo-Json -Compress))
+            name = [string]$Arguments[2]; created_at = "2026-08-25T00:00:00Z"
+            mountpoint = "mock/$logical"; driver = "local"; scope = "local"
+            labels = [ordered]@{{
+                "com.docker.compose.project" = "safeproject"
+                "com.docker.compose.volume" = $logical
+            }}
+        }} | ConvertTo-Json -Depth 5 -Compress))
     }}
     if ($FilePath -ceq "docker" -and $Arguments -contains "find") {{
         return @(
@@ -793,7 +1224,7 @@ $allArguments = @($script:calls | ForEach-Object {{ $_.arguments -join " " }}) -
             "safeproject_metastore-postgres-data",
         ]
         self.assertTrue(payload["present"])
-        self.assertEqual(expected_volumes, payload["volume_inspects"])
+        self.assertEqual(expected_volumes + expected_volumes, payload["volume_inspects"])
         self.assertEqual(expected_volumes, payload["volume_deletes"])
         self.assertEqual(
             [
@@ -838,9 +1269,13 @@ function Invoke-Chapter105Native {{
         $logical = [string]$Arguments[2] -replace '^safeproject_', ''
         $project = if ($logical -ceq "metastore-postgres-data") {{ "foreignproject" }} else {{ "safeproject" }}
         return @(([ordered]@{{
-            "com.docker.compose.project" = $project
-            "com.docker.compose.volume" = $logical
-        }} | ConvertTo-Json -Compress))
+            name = [string]$Arguments[2]; created_at = "2026-08-25T00:00:00Z"
+            mountpoint = "mock/$logical"; driver = "local"; scope = "local"
+            labels = [ordered]@{{
+                "com.docker.compose.project" = $project
+                "com.docker.compose.volume" = $logical
+            }}
+        }} | ConvertTo-Json -Depth 5 -Compress))
     }}
     return @()
 }}
@@ -851,7 +1286,8 @@ try {{
 $mutations = @($script:calls | Where-Object {{
     ($_.file -ceq "powershell") -or
     ($_.arguments.Count -ge 2 -and $_.arguments[0] -ceq "volume" -and $_.arguments[1] -ceq "rm") -or
-    ($_.arguments -contains "stop") -or ($_.arguments -contains "up") -or
+    ($_.arguments -contains "stop") -or ($_.arguments -contains "--stop") -or
+    ($_.arguments -contains "up") -or
     ($_.arguments -contains "mc" -and $_.arguments -contains "rm")
 }})
 [ordered]@{{
@@ -918,6 +1354,13 @@ if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {{
 . $path -FunctionsOnly
 $script:events = @()
 $script:evidenceCalls = 0
+function New-Chapter105ControlledComposeContext {{
+    return [pscustomobject]@{{
+        project_name = "safeproject"
+        prefix = @("compose", "--project-name", "safeproject", "--env-file", "fixed.env")
+    }}
+}}
+function Assert-Chapter105ControlledComposeContext {{}}
 function Get-Chapter105LakeEvidence {{
     param($ComposePrefix)
     $script:evidenceCalls++
@@ -931,7 +1374,7 @@ function Get-Chapter105LakeEvidence {{
     }}
 }}
 function Invoke-Chapter105RealtimeReset {{
-    param([switch]$ConfirmReset, $RepositoryRoot)
+    param([switch]$ConfirmReset, $RepositoryRoot, $ComposeContext, $BeforeEvidence)
     $script:events += "reset"
     return [pscustomobject]@{{ status = "passed" }}
 }}
@@ -946,7 +1389,7 @@ $successEvents = @($script:events)
 $script:events = @()
 $script:evidenceCalls = 0
 function Invoke-Chapter105RealtimeReset {{
-    param([switch]$ConfirmReset, $RepositoryRoot)
+    param([switch]$ConfirmReset, $RepositoryRoot, $ComposeContext, $BeforeEvidence)
     $script:events += "reset"
     throw "PASSWORD=unsafe-reset-detail"
 }}
