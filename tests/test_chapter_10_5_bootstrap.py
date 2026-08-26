@@ -8,6 +8,8 @@ import unittest
 
 ROOT = Path(__file__).resolve().parent.parent
 BOOTSTRAP = ROOT / "scripts" / "bootstrap_chapter_10_5.ps1"
+MIGRATE = ROOT / "scripts" / "migrate_chapter_10_5.ps1"
+RESET = ROOT / "scripts" / "reset_chapter_10_5_realtime.ps1"
 
 
 class Chapter105BootstrapTest(unittest.TestCase):
@@ -462,6 +464,522 @@ $actionCount = if (Test-Path -LiteralPath "{action_log}") {{
         self.assertEqual("b" * 32, payload["canonical_job_id"])
         self.assertTrue(payload["legacy_preserved"])
         self.assertLessEqual(payload["mutations"], 1)
+
+    def test_resume_partial_control_flow_rejects_legacy_envelope_before_normalization(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            payload = self._powershell_payload(
+                rf'''
+. "scripts/run_chapter_9_production_cutover.ps1" -FunctionsOnly
+$name = "chapter-9-datastream-quality-production"
+$safeError = "Production submission recovery state is unsafe."
+$savepoint = "s3a://flink-state/savepoints/chapter-9/savepoint-fixed"
+$script:continuations = 0
+$records = @()
+
+function New-ResumeLegacyManifest {{
+    return ([ordered]@{{
+        schema_version = 2
+        cutover_id = "resume-envelope"
+        phase = "production_submit"
+        created_at = "2026-08-25T00:00:00.0000000+00:00"
+        raw_offsets = @("partition:0,offset:42")
+        shadow_job_id = "11111111111111111111111111111111"
+        savepoint_path = $savepoint
+        production_job_id = "99999999999999999999999999999999"
+        doris_job_id = $null
+        iceberg_job_id = $null
+        mutations = [ordered]@{{
+            shadow_stop = [ordered]@{{ status = "result"; intent = @{{}}; result = @{{}} }}
+            production_submit = [ordered]@{{
+                status = "result"
+                intent = [ordered]@{{
+                    operation = "submit_production_from_savepoint"
+                    details = [ordered]@{{ name = $name; savepoint_path = $savepoint }}
+                    created_at_utc = "2026-08-25T00:01:00.0000000+00:00"
+                }}
+                result = [ordered]@{{
+                    status = "result"
+                    details = [ordered]@{{ job_id = "99999999999999999999999999999999" }}
+                    completed_at_utc = "2026-08-25T00:02:00.0000000+00:00"
+                    job_id = "99999999999999999999999999999999"
+                }}
+            }}
+            doris_submit = [ordered]@{{ status = "not_started"; intent = $null; result = $null }}
+            iceberg_submit = [ordered]@{{ status = "not_started"; intent = $null; result = $null }}
+            finalization = [ordered]@{{ status = "not_started"; intent = $null; result = $null }}
+        }}
+    }} | ConvertTo-Json -Depth 12 | ConvertFrom-Json)
+}}
+
+foreach ($caseName in @("missing_schema", "missing_phase", "phase_case", "arbitrary_phase")) {{
+    $repositoryRoot = Join-Path "{root}" "$caseName-repository"
+    $stateRoot = Join-Path "{root}" "$caseName-state"
+    New-Item -ItemType Directory -Force -Path $repositoryRoot, $stateRoot | Out-Null
+    $partialPath = Join-Path $repositoryRoot "tmp/chapter-9/cutover-manifest.json.partial"
+    $manifest = New-ResumeLegacyManifest
+    switch -CaseSensitive ($caseName) {{
+        "missing_schema" {{ $manifest.PSObject.Properties.Remove("schema_version") }}
+        "missing_phase" {{ $manifest.PSObject.Properties.Remove("phase") }}
+        "phase_case" {{ $manifest.phase = "Production_Submit" }}
+        "arbitrary_phase" {{ $manifest.phase = "operator_repaired" }}
+    }}
+    Write-CutoverStateAtomic -State $manifest -Path $partialPath
+    $before = Get-Content -LiteralPath $partialPath -Raw -Encoding UTF8
+    $errorMessage = $null
+    try {{
+        Invoke-CutoverResumePartialControlFlow -RepositoryRoot $repositoryRoot -StateRoot $stateRoot `
+            -PartialPath $partialPath -ExpectedName $name -Action {{
+                param($savedManifest, $recoveryState)
+                $script:continuations++
+            }} | Out-Null
+    }} catch {{ $errorMessage = $_.Exception.Message }}
+    $after = Get-Content -LiteralPath $partialPath -Raw -Encoding UTF8
+    $statePath = Join-Path $stateRoot "tmp/chapter-9/production-submit-state.json"
+    $records += [pscustomobject]@{{
+        case_name = $caseName
+        error = $errorMessage
+        unchanged = $before -ceq $after
+        canonical_absent = -not (Test-Path -LiteralPath $statePath)
+    }}
+}}
+[ordered]@{{
+    safe_error = $safeError
+    continuations = $script:continuations
+    records = $records
+}} | ConvertTo-Json -Depth 6 -Compress
+'''
+            )
+
+        self.assertEqual(0, payload["continuations"])
+        self.assertEqual(4, len(payload["records"]))
+        for record in payload["records"]:
+            self.assertEqual(payload["safe_error"], record["error"], record)
+            self.assertTrue(record["unchanged"], record)
+            self.assertTrue(record["canonical_absent"], record)
+
+    def test_resume_partial_control_flow_fails_closed_on_canonical_lock_before_touching_legacy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repository = root / "repository"
+            state_root = root / "state"
+            repository.mkdir()
+            state_root.mkdir()
+            partial = repository / "tmp" / "chapter-9" / "cutover-manifest.json.partial"
+            started = root / "resume-started.txt"
+            continued = root / "resume-continued.txt"
+            payload = self._powershell_payload(
+                rf'''
+. "scripts/run_chapter_9_production_cutover.ps1" -FunctionsOnly
+$task4Script = (Resolve-Path "scripts/run_chapter_9_production_cutover.ps1").Path
+$name = "chapter-9-datastream-quality-production"
+$jobId = "99999999999999999999999999999999"
+$savepoint = "s3a://flink-state/savepoints/chapter-9/savepoint-fixed"
+$partialPath = "{partial}"
+$statePath = Get-CutoverProductionSubmitStatePath -RepositoryRoot "{repository}" -StateRoot "{state_root}"
+$legacy = [ordered]@{{
+    schema_version = 2
+    cutover_id = "resume-lock"
+    phase = "production_submit"
+    created_at = "2026-08-25T00:00:00.0000000+00:00"
+    raw_offsets = @("partition:0,offset:42")
+    shadow_job_id = "11111111111111111111111111111111"
+    savepoint_path = $savepoint
+    production_job_id = $jobId
+    doris_job_id = $null
+    iceberg_job_id = $null
+    mutations = [ordered]@{{
+        shadow_stop = [ordered]@{{ status = "result"; intent = @{{}}; result = @{{}} }}
+        production_submit = [ordered]@{{
+            status = "result"
+            intent = [ordered]@{{
+                operation = "submit_production_from_savepoint"
+                details = [ordered]@{{ name = $name; savepoint_path = $savepoint }}
+                created_at_utc = "2026-08-25T00:01:00.0000000+00:00"
+            }}
+            result = [ordered]@{{
+                status = "result"
+                details = [ordered]@{{ job_id = $jobId }}
+                completed_at_utc = "2026-08-25T00:02:00.0000000+00:00"
+                job_id = $jobId
+            }}
+        }}
+        doris_submit = [ordered]@{{ status = "not_started"; intent = $null; result = $null }}
+        iceberg_submit = [ordered]@{{ status = "not_started"; intent = $null; result = $null }}
+        finalization = [ordered]@{{ status = "not_started"; intent = $null; result = $null }}
+    }}
+}}
+Write-CutoverStateAtomic -State $legacy -Path $partialPath
+$before = Get-Content -LiteralPath $partialPath -Raw -Encoding UTF8
+New-Item -ItemType Directory -Force -Path (Split-Path -Parent $statePath) | Out-Null
+$lock = [System.IO.File]::Open(
+    "$statePath.lock",
+    [System.IO.FileMode]::OpenOrCreate,
+    [System.IO.FileAccess]::ReadWrite,
+    [System.IO.FileShare]::None
+)
+$job = Start-Job -ScriptBlock {{
+    param($scriptPath, $repositoryRoot, $stateRoot, $manifestPath, $startedPath, $continuedPath, $jobName)
+    . $scriptPath -FunctionsOnly
+    [System.IO.File]::WriteAllText($startedPath, "started")
+    try {{
+        Invoke-CutoverResumePartialControlFlow -RepositoryRoot $repositoryRoot -StateRoot $stateRoot `
+            -PartialPath $manifestPath -ExpectedName $jobName -Action {{
+                param($savedManifest, $recoveryState)
+                [System.IO.File]::WriteAllText($continuedPath, "continued")
+            }} | Out-Null
+        "NO_ERROR"
+    }} catch {{ $_.Exception.Message }}
+}} -ArgumentList $task4Script, "{repository}", "{state_root}", $partialPath, "{started}", "{continued}", $name
+try {{
+    for ($attempt = 0; $attempt -lt 100 -and -not (Test-Path -LiteralPath "{started}"); $attempt++) {{
+        Start-Sleep -Milliseconds 25
+    }}
+    Start-Sleep -Milliseconds 150
+    $whileLocked = Get-Content -LiteralPath $partialPath -Raw -Encoding UTF8
+    $unchangedWhileLocked = $before -ceq $whileLocked
+    $canonicalAbsentWhileLocked = -not (Test-Path -LiteralPath $statePath)
+    $continuationAbsentWhileLocked = -not (Test-Path -LiteralPath "{continued}")
+}} finally {{ $lock.Dispose() }}
+$null = Wait-Job -Job $job -Timeout 10
+$childOutcome = [string](@((Receive-Job -Job $job))[-1])
+Remove-Job -Job $job -Force
+$legacyAfter = Get-Content -LiteralPath $partialPath -Raw -Encoding UTF8 | ConvertFrom-Json
+$after = Get-Content -LiteralPath $partialPath -Raw -Encoding UTF8
+[ordered]@{{
+    unchanged_while_locked = $unchangedWhileLocked
+    canonical_absent_while_locked = $canonicalAbsentWhileLocked
+    continuation_absent_while_locked = $continuationAbsentWhileLocked
+    child_outcome = $childOutcome
+    continuation_ran = Test-Path -LiteralPath "{continued}"
+    unchanged_after_failure = $before -ceq $after
+    legacy_preserved = $null -ne $legacyAfter.mutations.PSObject.Properties["production_submit"]
+    canonical_absent = -not (Test-Path -LiteralPath $statePath)
+}} | ConvertTo-Json -Compress
+'''
+            )
+
+        self.assertTrue(payload["unchanged_while_locked"])
+        self.assertTrue(payload["canonical_absent_while_locked"])
+        self.assertTrue(payload["continuation_absent_while_locked"])
+        self.assertEqual("Production submission recovery state is unsafe.", payload["child_outcome"])
+        self.assertFalse(payload["continuation_ran"])
+        self.assertTrue(payload["unchanged_after_failure"])
+        self.assertTrue(payload["legacy_preserved"])
+        self.assertTrue(payload["canonical_absent"])
+
+    def test_realtime_reset_requires_confirmation_before_native_calls_and_has_exact_plan(self):
+        payload = self._powershell_payload(
+            rf'''
+$path = "{RESET}"
+if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {{
+    [ordered]@{{ present = $false; native_calls = -1; errors = @(); volumes = @(); prefixes = @() }} |
+        ConvertTo-Json -Compress
+    return
+}}
+. $path -FunctionsOnly
+$script:nativeCalls = 0
+function Invoke-Chapter105Native {{
+    param($FilePath, $Arguments, $FailureMessage)
+    $script:nativeCalls++
+    throw "native call was not allowed"
+}}
+$errors = @()
+try {{ Invoke-Chapter105RealtimeReset | Out-Null }} catch {{ $errors += $_.Exception.Message }}
+try {{ Invoke-Chapter105RealtimeReset -ConfirmReset:$false | Out-Null }} catch {{ $errors += $_.Exception.Message }}
+$plan = Get-Chapter105RealtimeResetPlan -ProjectName "safeproject"
+[ordered]@{{
+    present = $true
+    native_calls = $script:nativeCalls
+    errors = $errors
+    volumes = @($plan.volumes)
+    prefixes = @($plan.object_prefixes)
+    protected_bucket = [string]$plan.protected.warehouse_bucket
+    protected_host_path = [string]$plan.protected.minio_host_path
+}} | ConvertTo-Json -Depth 6 -Compress
+'''
+        )
+
+        self.assertTrue(payload["present"])
+        self.assertEqual(0, payload["native_calls"])
+        self.assertEqual(
+            ["Realtime reset requires -ConfirmReset."] * 2,
+            payload["errors"],
+        )
+        self.assertEqual(
+            [
+                "safeproject_kafka-controller-data",
+                "safeproject_kafka-broker-data",
+                "safeproject_doris-fe-meta",
+                "safeproject_doris-be-storage",
+                "safeproject_metastore-postgres-data",
+            ],
+            payload["volumes"],
+        )
+        self.assertEqual(
+            [
+                "flink-state/checkpoints/chapter-9",
+                "flink-state/savepoints/chapter-9",
+            ],
+            payload["prefixes"],
+        )
+        self.assertEqual("warehouse", payload["protected_bucket"])
+        self.assertEqual("infra/compose/minio/data", payload["protected_host_path"])
+
+    def test_realtime_reset_deletes_only_labeled_allowlist_and_records_fixed_lake_evidence(self):
+        payload = self._powershell_payload(
+            rf'''
+$path = "{RESET}"
+if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {{
+    [ordered]@{{ present = $false }} | ConvertTo-Json -Compress
+    return
+}}
+. $path -FunctionsOnly
+$script:calls = @()
+function Invoke-Chapter105Native {{
+    param([string]$FilePath, [string[]]$Arguments, [string]$FailureMessage)
+    $script:calls += [pscustomobject]@{{ file = $FilePath; arguments = @($Arguments) }}
+    if ($FilePath -ceq "docker" -and $Arguments -contains "config") {{
+        return @('{{"name":"safeproject"}}')
+    }}
+    if ($FilePath -ceq "docker" -and $Arguments.Count -ge 3 -and
+        $Arguments[0] -ceq "volume" -and $Arguments[1] -ceq "inspect") {{
+        $logical = [string]$Arguments[2] -replace '^safeproject_', ''
+        return @(([ordered]@{{
+            "com.docker.compose.project" = "safeproject"
+            "com.docker.compose.volume" = $logical
+        }} | ConvertTo-Json -Compress))
+    }}
+    if ($FilePath -ceq "docker" -and $Arguments -contains "find") {{
+        return @(
+            '{{"key":"warehouse/analytics/a.parquet","size":7,"note":"PASSWORD=native-secret"}}',
+            '{{"key":"warehouse/analytics/b.parquet","size":11}}'
+        )
+    }}
+    if ($FilePath -ceq "docker" -and $Arguments -contains "--execute") {{
+        return @("123456789")
+    }}
+    return @()
+}}
+$report = Invoke-Chapter105RealtimeReset -ConfirmReset -RepositoryRoot (Get-Location)
+$volumeInspects = @($script:calls | Where-Object {{
+    $_.file -ceq "docker" -and $_.arguments.Count -ge 3 -and
+    $_.arguments[0] -ceq "volume" -and $_.arguments[1] -ceq "inspect"
+}} | ForEach-Object {{ [string]$_.arguments[2] }})
+$volumeDeletes = @($script:calls | Where-Object {{
+    $_.file -ceq "docker" -and $_.arguments.Count -eq 3 -and
+    $_.arguments[0] -ceq "volume" -and $_.arguments[1] -ceq "rm"
+}} | ForEach-Object {{ [string]$_.arguments[2] }})
+$prefixDeletes = @($script:calls | Where-Object {{
+    $_.file -ceq "docker" -and $_.arguments -contains "mc" -and $_.arguments -contains "rm"
+}} | ForEach-Object {{ [string]$_.arguments[-1] }})
+$allArguments = @($script:calls | ForEach-Object {{ $_.arguments -join " " }}) -join "`n"
+[ordered]@{{
+    present = $true
+    report = $report
+    volume_inspects = $volumeInspects
+    volume_deletes = $volumeDeletes
+    prefix_deletes = $prefixDeletes
+    all_arguments = $allArguments
+}} | ConvertTo-Json -Depth 12 -Compress
+'''
+        )
+
+        expected_volumes = [
+            "safeproject_kafka-controller-data",
+            "safeproject_kafka-broker-data",
+            "safeproject_doris-fe-meta",
+            "safeproject_doris-be-storage",
+            "safeproject_metastore-postgres-data",
+        ]
+        self.assertTrue(payload["present"])
+        self.assertEqual(expected_volumes, payload["volume_inspects"])
+        self.assertEqual(expected_volumes, payload["volume_deletes"])
+        self.assertEqual(
+            [
+                "local/flink-state/checkpoints/chapter-9/",
+                "local/flink-state/savepoints/chapter-9/",
+            ],
+            payload["prefix_deletes"],
+        )
+        self.assertNotIn("local/warehouse", payload["prefix_deletes"])
+        self.assertNotIn("unknown", payload["all_arguments"].lower())
+        self.assertNotIn("infra/compose/minio/data", payload["all_arguments"])
+        self.assertNotIn("native-secret", json.dumps(payload["report"]))
+        self.assertEqual("passed", payload["report"]["status"])
+        self.assertEqual(
+            {"object_count": 2, "total_size_bytes": 18},
+            payload["report"]["evidence"]["before"]["warehouse"],
+        )
+        self.assertEqual(
+            payload["report"]["evidence"]["before"],
+            payload["report"]["evidence"]["after"],
+        )
+        self.assertEqual(
+            "123456789",
+            payload["report"]["evidence"]["after"]["table"]["snapshot_id"],
+        )
+
+    def test_realtime_reset_rejects_foreign_volume_label_before_every_mutation(self):
+        payload = self._powershell_payload(
+            rf'''
+$path = "{RESET}"
+if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {{
+    [ordered]@{{ present = $false }} | ConvertTo-Json -Compress
+    return
+}}
+. $path -FunctionsOnly
+$script:calls = @()
+function Invoke-Chapter105Native {{
+    param([string]$FilePath, [string[]]$Arguments, [string]$FailureMessage)
+    $script:calls += [pscustomobject]@{{ file = $FilePath; arguments = @($Arguments) }}
+    if ($Arguments -contains "config") {{ return @('{{"name":"safeproject"}}') }}
+    if ($Arguments.Count -ge 3 -and $Arguments[0] -ceq "volume" -and $Arguments[1] -ceq "inspect") {{
+        $logical = [string]$Arguments[2] -replace '^safeproject_', ''
+        $project = if ($logical -ceq "metastore-postgres-data") {{ "foreignproject" }} else {{ "safeproject" }}
+        return @(([ordered]@{{
+            "com.docker.compose.project" = $project
+            "com.docker.compose.volume" = $logical
+        }} | ConvertTo-Json -Compress))
+    }}
+    return @()
+}}
+$errorMessage = $null
+try {{
+    Invoke-Chapter105RealtimeReset -ConfirmReset -RepositoryRoot (Get-Location) | Out-Null
+}} catch {{ $errorMessage = $_.Exception.Message }}
+$mutations = @($script:calls | Where-Object {{
+    ($_.file -ceq "powershell") -or
+    ($_.arguments.Count -ge 2 -and $_.arguments[0] -ceq "volume" -and $_.arguments[1] -ceq "rm") -or
+    ($_.arguments -contains "stop") -or ($_.arguments -contains "up") -or
+    ($_.arguments -contains "mc" -and $_.arguments -contains "rm")
+}})
+[ordered]@{{
+    present = $true
+    error = $errorMessage
+    mutation_count = $mutations.Count
+    inspect_count = @($script:calls | Where-Object {{ $_.arguments -contains "inspect" }}).Count
+}} | ConvertTo-Json -Compress
+'''
+        )
+
+        self.assertTrue(payload["present"])
+        self.assertEqual(
+            "Chapter 10.5 realtime reset failed. State was preserved; run the fixed diagnostic command.",
+            payload["error"],
+        )
+        self.assertEqual(5, payload["inspect_count"])
+        self.assertEqual(0, payload["mutation_count"])
+
+    def test_migration_requires_traffic_pause_and_confirmation_before_every_call(self):
+        payload = self._powershell_payload(
+            rf'''
+$path = "{MIGRATE}"
+if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {{
+    [ordered]@{{ present = $false; call_count = -1; errors = @() }} | ConvertTo-Json -Compress
+    return
+}}
+. $path -FunctionsOnly
+$script:calls = 0
+function Get-Chapter105LakeEvidence {{ $script:calls++; throw "evidence call was not allowed" }}
+function Invoke-Chapter105RealtimeReset {{ $script:calls++; throw "reset call was not allowed" }}
+function Invoke-Chapter105Native {{ $script:calls++; throw "native call was not allowed" }}
+$errors = @()
+foreach ($switches in @(
+    @{{ traffic = $false; confirm = $false }},
+    @{{ traffic = $true; confirm = $false }},
+    @{{ traffic = $false; confirm = $true }}
+)) {{
+    try {{
+        Invoke-Chapter105Migration -TrafficPaused:$switches.traffic `
+            -ConfirmRealtimeReset:$switches.confirm -RepositoryRoot (Get-Location) | Out-Null
+    }} catch {{ $errors += $_.Exception.Message }}
+}}
+[ordered]@{{ present = $true; call_count = $script:calls; errors = $errors }} |
+    ConvertTo-Json -Compress
+'''
+        )
+
+        self.assertTrue(payload["present"])
+        self.assertEqual(0, payload["call_count"])
+        self.assertEqual(
+            ["Migration requires -TrafficPaused and -ConfirmRealtimeReset."] * 3,
+            payload["errors"],
+        )
+
+    def test_migration_orders_reset_bootstrap_and_evidence_and_stops_on_failure(self):
+        payload = self._powershell_payload(
+            rf'''
+$path = "{MIGRATE}"
+if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {{
+    [ordered]@{{ present = $false }} | ConvertTo-Json -Compress
+    return
+}}
+. $path -FunctionsOnly
+$script:events = @()
+$script:evidenceCalls = 0
+function Get-Chapter105LakeEvidence {{
+    param($ComposePrefix)
+    $script:evidenceCalls++
+    $label = if ($script:evidenceCalls -eq 1) {{ "evidence-before" }} else {{ "evidence-after" }}
+    $script:events += $label
+    return [pscustomobject]@{{
+        warehouse = [pscustomobject]@{{ object_count = 2; total_size_bytes = 18 }}
+        table = [pscustomobject]@{{
+            catalog = "lakehouse"; schema = "analytics"; table = "user_behavior_detail"; snapshot_id = "123456789"
+        }}
+    }}
+}}
+function Invoke-Chapter105RealtimeReset {{
+    param([switch]$ConfirmReset, $RepositoryRoot)
+    $script:events += "reset"
+    return [pscustomobject]@{{ status = "passed" }}
+}}
+function Invoke-Chapter105Native {{
+    param($FilePath, $Arguments, $FailureMessage)
+    $script:events += "bootstrap"
+    return @()
+}}
+$success = Invoke-Chapter105Migration -TrafficPaused -ConfirmRealtimeReset -RepositoryRoot (Get-Location)
+$successEvents = @($script:events)
+
+$script:events = @()
+$script:evidenceCalls = 0
+function Invoke-Chapter105RealtimeReset {{
+    param([switch]$ConfirmReset, $RepositoryRoot)
+    $script:events += "reset"
+    throw "PASSWORD=unsafe-reset-detail"
+}}
+$failureError = $null
+try {{
+    Invoke-Chapter105Migration -TrafficPaused -ConfirmRealtimeReset -RepositoryRoot (Get-Location) | Out-Null
+}} catch {{ $failureError = $_.Exception.Message }}
+[ordered]@{{
+    present = $true
+    success_events = $successEvents
+    success_report = $success
+    failure_events = @($script:events)
+    failure_error = $failureError
+}} | ConvertTo-Json -Depth 10 -Compress
+'''
+        )
+
+        self.assertTrue(payload["present"])
+        self.assertEqual(
+            ["evidence-before", "reset", "bootstrap", "evidence-after"],
+            payload["success_events"],
+        )
+        self.assertEqual("passed", payload["success_report"]["status"])
+        self.assertEqual(
+            payload["success_report"]["evidence"]["before"],
+            payload["success_report"]["evidence"]["after"],
+        )
+        self.assertEqual(["evidence-before", "reset"], payload["failure_events"])
+        self.assertEqual(
+            "Chapter 10.5 migration failed. State was preserved; run the fixed diagnostic command.",
+            payload["failure_error"],
+        )
+        self.assertNotIn("unsafe-reset-detail", payload["failure_error"])
 
     def test_both_entries_migrate_only_an_exact_complete_legacy_result(self):
         with tempfile.TemporaryDirectory() as directory:

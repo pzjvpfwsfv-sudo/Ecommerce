@@ -10,9 +10,75 @@ COMPOSE_FILE = ROOT / "infra" / "docker-compose.yml"
 ENV_FILE = ROOT / "infra" / ".env.example"
 CATALOG_RECOVERY = ROOT / "scripts" / "restore_chapter_10_5_catalog.ps1"
 BOOTSTRAP = ROOT / "scripts" / "bootstrap_chapter_10_5.ps1"
+MIGRATE = ROOT / "scripts" / "migrate_chapter_10_5.ps1"
+RESET = ROOT / "scripts" / "reset_chapter_10_5_realtime.ps1"
 
 
 class Chapter105ArtifactsTest(unittest.TestCase):
+    def test_controlled_migration_and_reset_have_narrow_non_generic_surfaces(self):
+        self.assertTrue(MIGRATE.is_file(), MIGRATE)
+        self.assertTrue(RESET.is_file(), RESET)
+        if not MIGRATE.is_file() or not RESET.is_file():
+            return
+
+        migrate_text = MIGRATE.read_text(encoding="utf-8")
+        reset_text = RESET.read_text(encoding="utf-8")
+        migrate_parameters = migrate_text.split(")", 1)[0]
+        reset_parameters = reset_text.split(")", 1)[0]
+
+        self.assertIn("[switch]$TrafficPaused", migrate_parameters)
+        self.assertIn("[switch]$ConfirmRealtimeReset", migrate_parameters)
+        self.assertIn("[switch]$ConfirmReset", reset_parameters)
+        for parameters in (migrate_parameters, reset_parameters):
+            self.assertNotIn("Volume", parameters)
+            self.assertNotIn("Prefix", parameters)
+        self.assertIn("tmp/chapter-10-5/migration-report.json", migrate_text)
+        self.assertIn("tmp/chapter-10-5/realtime-reset-report.json", reset_text)
+
+        combined = f"{migrate_text}\n{reset_text}"
+        for forbidden in (
+            "volume prune",
+            "down -v",
+            "docker rm",
+            "Remove-Item -Recurse",
+            "local/warehouse/",
+        ):
+            self.assertNotIn(forbidden.lower(), combined.lower())
+
+    def test_controlled_migration_and_reset_functions_only_never_call_native_tools(self):
+        self.assertTrue(MIGRATE.is_file(), MIGRATE)
+        self.assertTrue(RESET.is_file(), RESET)
+        if not MIGRATE.is_file() or not RESET.is_file():
+            return
+
+        command = r'''
+$ErrorActionPreference = "Stop"
+$script:nativeCalls = 0
+function docker { $script:nativeCalls++; throw "docker must not run" }
+function powershell { $script:nativeCalls++; throw "powershell must not run" }
+. (Resolve-Path "scripts/reset_chapter_10_5_realtime.ps1") -FunctionsOnly
+. (Resolve-Path "scripts/migrate_chapter_10_5.ps1") -FunctionsOnly
+[ordered]@{
+    native_calls = $script:nativeCalls
+    reset_function = $null -ne (Get-Command Invoke-Chapter105RealtimeReset -ErrorAction SilentlyContinue)
+    migrate_function = $null -ne (Get-Command Invoke-Chapter105Migration -ErrorAction SilentlyContinue)
+} | ConvertTo-Json -Compress
+'''
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", command],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+        self.assertEqual(0, result.returncode, result.stderr or result.stdout)
+        payload = json.loads(result.stdout.strip().splitlines()[-1])
+        self.assertEqual(0, payload["native_calls"])
+        self.assertTrue(payload["reset_function"])
+        self.assertTrue(payload["migrate_function"])
+
     def test_bootstrap_surface_has_fixed_stages_and_no_destructive_commands(self):
         text = BOOTSTRAP.read_text(encoding="utf-8")
 

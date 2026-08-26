@@ -1077,6 +1077,9 @@ function Assert-CutoverProductionSubmitManifestEnvelope {
     param([Parameter(Mandatory = $true)][object]$Manifest)
 
     $safeError = "Production submission recovery state is unsafe."
+    $validPhases = @(
+        "prepared", "shadow_stop", "production_submit", "doris_submit", "iceberg_submit", "finalization"
+    )
     try {
         if (-not (Test-CutoverExactProperties -Record $Manifest -Names @(
                     "schema_version", "cutover_id", "phase", "created_at", "raw_offsets",
@@ -1085,7 +1088,7 @@ function Assert-CutoverProductionSubmitManifestEnvelope {
                 )) -or
             $Manifest.schema_version -isnot [int] -or [int]$Manifest.schema_version -ne 2 -or
             $Manifest.cutover_id -isnot [string] -or [string]::IsNullOrWhiteSpace([string]$Manifest.cutover_id) -or
-            $Manifest.phase -isnot [string] -or [string]::IsNullOrWhiteSpace([string]$Manifest.phase) -or
+            $Manifest.phase -isnot [string] -or $validPhases -cnotcontains [string]$Manifest.phase -or
             -not (Test-CutoverRoundTripTimestamp -Value $Manifest.created_at) -or
             $Manifest.raw_offsets -isnot [System.Collections.IList] -or $Manifest.raw_offsets -is [string] -or
             @($Manifest.raw_offsets).Count -lt 1 -or
@@ -1144,6 +1147,10 @@ function Move-CutoverLegacyProductionSubmitState {
         if (-not (Test-CutoverExactProperties -Record $manifest.mutations -Names $legacyNames)) {
             throw $safeError
         }
+        if (@("production_submit", "doris_submit", "iceberg_submit", "finalization") `
+                -cnotcontains [string]$manifest.phase) {
+            throw $safeError
+        }
 
         $mapped = ConvertFrom-CutoverLegacyProductionSubmitState `
             -Mutation $manifest.mutations.production_submit -Manifest $manifest -ExpectedName $ExpectedName
@@ -1166,6 +1173,91 @@ function Move-CutoverLegacyProductionSubmitState {
     } catch {
         throw $safeError
     }
+}
+
+function Invoke-CutoverResumePartialStateBoundary {
+    param(
+        [Parameter(Mandatory = $true)][string]$RepositoryRoot,
+        [string]$StateRoot,
+        [Parameter(Mandatory = $true)][string]$PartialPath,
+        [Parameter(Mandatory = $true)][string]$ExpectedName
+    )
+
+    $safeError = "Production submission recovery state is unsafe."
+    $lock = $null
+    try {
+        $statePathArguments = @{ RepositoryRoot = $RepositoryRoot }
+        if ($PSBoundParameters.ContainsKey("StateRoot")) {
+            $statePathArguments["StateRoot"] = $StateRoot
+        }
+        $statePath = Get-CutoverProductionSubmitStatePath @statePathArguments
+        $legacyPath = Get-CutoverLegacyProductionSubmitStatePath `
+            -RepositoryRoot $RepositoryRoot -Path $PartialPath
+        New-Item -ItemType Directory -Force -Path (Split-Path -Parent $statePath) | Out-Null
+        $lock = [System.IO.File]::Open(
+            "$statePath.lock",
+            [System.IO.FileMode]::OpenOrCreate,
+            [System.IO.FileAccess]::ReadWrite,
+            [System.IO.FileShare]::None
+        )
+
+        $state = if (Test-Path -LiteralPath $statePath -PathType Leaf) {
+            Get-Content -LiteralPath $statePath -Raw -Encoding UTF8 | ConvertFrom-Json -ErrorAction Stop
+        } elseif (Test-Path -LiteralPath $statePath) {
+            throw $safeError
+        } else {
+            $null
+        }
+        if ($null -ne $state) {
+            Assert-CutoverProductionSubmitState -State $state -ExpectedName $ExpectedName
+        }
+        $state = Move-CutoverLegacyProductionSubmitState -ManifestPath $legacyPath `
+            -ProductionStatePath $statePath -CanonicalState $state `
+            -LegacyStateProjection $null -ExpectedName $ExpectedName
+        if ($null -ne $state -and [string]$state.status -cin @("intent", "failed")) {
+            throw $safeError
+        }
+
+        if (-not (Test-Path -LiteralPath $legacyPath -PathType Leaf)) { throw $safeError }
+        $manifest = Get-Content -LiteralPath $legacyPath -Raw -Encoding UTF8 |
+            ConvertFrom-Json -ErrorAction Stop
+        Assert-CutoverProductionSubmitManifestEnvelope -Manifest $manifest
+        if (-not (Test-CutoverExactProperties -Record $manifest.mutations -Names @(
+                    "shadow_stop", "doris_submit", "iceberg_submit", "finalization"
+                ))) {
+            throw $safeError
+        }
+        return $manifest
+    } catch {
+        throw $safeError
+    } finally {
+        if ($null -ne $lock) { $lock.Dispose() }
+    }
+}
+
+function Invoke-CutoverResumePartialControlFlow {
+    param(
+        [Parameter(Mandatory = $true)][string]$RepositoryRoot,
+        [string]$StateRoot,
+        [Parameter(Mandatory = $true)][string]$PartialPath,
+        [Parameter(Mandatory = $true)][string]$ExpectedName,
+        [Parameter(Mandatory = $true)][scriptblock]$Action
+    )
+
+    $boundaryArguments = @{
+        RepositoryRoot = $RepositoryRoot
+        PartialPath = $PartialPath
+        ExpectedName = $ExpectedName
+    }
+    if ($PSBoundParameters.ContainsKey("StateRoot")) {
+        $boundaryArguments["StateRoot"] = $StateRoot
+    }
+    $savedManifest = Invoke-CutoverResumePartialStateBoundary @boundaryArguments
+    $recoveryState = Ensure-CutoverRecoveryState -State $savedManifest -Path $PartialPath
+    if ($null -ne $recoveryState.mutations.PSObject.Properties["production_submit"]) {
+        throw "Production submission recovery state is unsafe."
+    }
+    return & $Action $savedManifest $recoveryState
 }
 
 function Invoke-CutoverProductionSubmitBoundary {
@@ -1768,9 +1860,10 @@ Write-SqlFile -Path (Join-Path $tmpRoot "iceberg-clean.sql") -Parts @(
 )
 
 if ($ResumePartial) {
-    $savedManifest = Get-Content -Raw -Encoding UTF8 $manifestPartialPath | ConvertFrom-Json
-    $recoveryState = Ensure-CutoverRecoveryState -State $savedManifest -Path $manifestPartialPath
-    $resumeJobs = Get-FlinkJobs
+    Invoke-CutoverResumePartialControlFlow -RepositoryRoot $root -PartialPath $manifestPartialPath `
+        -ExpectedName $productionJobName -Action {
+        param($savedManifest, $recoveryState)
+        $resumeJobs = Get-FlinkJobs
     $stopResult = Invoke-CutoverShadowStopStage -State $recoveryState -Path $manifestPartialPath `
         -Jobs $resumeJobs -StopAction {
             $output = Invoke-FlinkJobManagerCommand -Command @(
@@ -1852,6 +1945,8 @@ if ($ResumePartial) {
         -IcebergCheckpoints $icebergCheckpoints
     Set-CutoverMutationResult -State $recoveryState -Path $manifestPartialPath -Stage "finalization" -Status "result" `
         -Details @{ final_path = $manifestPath }
+        return
+    } | Out-Null
     return
 }
 # ResumePartial ends before normal cutover.
