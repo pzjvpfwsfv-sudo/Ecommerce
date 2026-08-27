@@ -451,7 +451,8 @@ function Invoke-Chapter105Bootstrap {
     param(
         [string]$EnvFile = 'infra/.env',
         [switch]$SkipBuild,
-        [string]$ReportPath = 'tmp/chapter-10-5/bootstrap-report.json'
+        [string]$ReportPath = 'tmp/chapter-10-5/bootstrap-report.json',
+        [string]$ComposeProjectName
     )
 
     Set-StrictMode -Version Latest
@@ -465,6 +466,7 @@ function Invoke-Chapter105Bootstrap {
         EnvPath = $null
         Environment = $null
         ComposePrefix = $null
+        ComposeProjectName = $null
         CheckpointUri = $null
         SavepointUri = $null
     }
@@ -494,9 +496,10 @@ function Invoke-Chapter105Bootstrap {
                 $ComposeProjectName -cnotmatch '^[a-z0-9][a-z0-9_-]*$') {
                 throw 'Compose project identity is unsafe.'
             }
+            $context.ComposeProjectName = $ComposeProjectName
             $context.ComposePrefix = @('compose')
-            if (-not [string]::IsNullOrWhiteSpace($ComposeProjectName)) {
-                $context.ComposePrefix += @('--project-name', $ComposeProjectName)
+            if (-not [string]::IsNullOrWhiteSpace($context.ComposeProjectName)) {
+                $context.ComposePrefix += @('--project-name', $context.ComposeProjectName)
             }
             $context.ComposePrefix += @(
                 '--env-file', $context.EnvPath, '-f', (Join-Path $context.RepositoryRoot 'infra\docker-compose.yml'),
@@ -527,17 +530,27 @@ function Invoke-Chapter105Bootstrap {
                 'exec', '-T', 'kafka-broker', 'kafka-topics', '--bootstrap-server', 'kafka-broker:29092',
                 '--create', '--if-not-exists', '--topic', 'user_behavior_events', '--partitions', '1', '--replication-factor', '1'
             )) -FailureMessage 'Kafka topic initialization failed.' | Out-Null
-            Invoke-Chapter105Native -FilePath 'powershell' -Arguments @(
+            $dorisArguments = @(
                 '-NoProfile', '-File', (Join-Path $PSScriptRoot 'init_doris_realtime_metrics.ps1'),
                 '-EnvFile', $envPath
-            ) -FailureMessage 'Doris initialization failed.' | Out-Null
+            )
+            if (-not [string]::IsNullOrWhiteSpace($context.ComposeProjectName)) {
+                $dorisArguments += @('-ComposeProjectName', $context.ComposeProjectName)
+            }
+            Invoke-Chapter105Native -FilePath 'powershell' -Arguments $dorisArguments `
+                -FailureMessage 'Doris initialization failed.' | Out-Null
             @{ topic = 'user_behavior_events'; doris = 'initialized'; minio_buckets = 'compose-init' }
         }
         Invoke-Chapter105BootstrapStage -Report $report -Name 'catalog' -Action {
-            Invoke-Chapter105Native -FilePath 'powershell' -Arguments @(
+            $catalogArguments = @(
                 '-NoProfile', '-File', (Join-Path $PSScriptRoot 'restore_chapter_10_5_catalog.ps1'),
                 '-EnvFile', $envPath
-            ) -FailureMessage 'Catalog recovery failed.' | Out-Null
+            )
+            if (-not [string]::IsNullOrWhiteSpace($context.ComposeProjectName)) {
+                $catalogArguments += @('-ComposeProjectName', $context.ComposeProjectName)
+            }
+            Invoke-Chapter105Native -FilePath 'powershell' -Arguments $catalogArguments `
+                -FailureMessage 'Catalog recovery failed.' | Out-Null
             @{ catalog = 'recovered' }
         }
         Invoke-Chapter105BootstrapStage -Report $report -Name 'jobs' -Action {
@@ -581,4 +594,5 @@ function Invoke-Chapter105Bootstrap {
 
 if ($FunctionsOnly) { return }
 
-Invoke-Chapter105Bootstrap -EnvFile $EnvFile -SkipBuild:$SkipBuild -ReportPath $ReportPath
+Invoke-Chapter105Bootstrap -EnvFile $EnvFile -SkipBuild:$SkipBuild -ReportPath $ReportPath `
+    -ComposeProjectName $ComposeProjectName

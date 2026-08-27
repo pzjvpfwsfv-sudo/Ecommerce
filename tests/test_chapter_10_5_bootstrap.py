@@ -10,6 +10,8 @@ ROOT = Path(__file__).resolve().parent.parent
 BOOTSTRAP = ROOT / "scripts" / "bootstrap_chapter_10_5.ps1"
 MIGRATE = ROOT / "scripts" / "migrate_chapter_10_5.ps1"
 RESET = ROOT / "scripts" / "reset_chapter_10_5_realtime.ps1"
+DORIS_INIT = ROOT / "scripts" / "init_doris_realtime_metrics.ps1"
+CATALOG_RESTORE = ROOT / "scripts" / "restore_chapter_10_5_catalog.ps1"
 
 
 class Chapter105BootstrapTest(unittest.TestCase):
@@ -950,6 +952,160 @@ $restoreFrozen = @($restoreCalls | Where-Object {{
         self.assertFalse(payload["attacker_seen"])
         self.assertEqual(1, payload["restore_calls"])
         self.assertTrue(payload["restore_frozen"])
+
+    def test_bootstrap_nested_doris_and_restore_keep_frozen_project_after_env_mutation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            primary = Path(directory) / "primary"
+            env_file = primary / "infra" / ".env"
+            env_file.parent.mkdir(parents=True)
+            env_file.write_text(
+                "\n".join(
+                    [
+                        "PROJECT_NAME=frozen-project",
+                        "FLINK_REST_PORT=8081",
+                        "API_PORT=8000",
+                        "FLINK_CHECKPOINT_MAX_AGE_SECONDS=300",
+                        "CHAPTER9_CHECKPOINT_URI=s3a://flink-state/checkpoints/chapter-9",
+                        "CHAPTER9_SAVEPOINT_URI=s3a://flink-state/savepoints/chapter-9",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            payload = self._powershell_payload(
+                rf'''
+. "{BOOTSTRAP}" -FunctionsOnly
+$script:childCalls = @()
+function Get-Chapter105PrimaryRepositoryRoot {{ param($StartPath) return "{primary}" }}
+function Resolve-Chapter105RepositoryPath {{
+    param($RepositoryRoot, $Path, $AllowedRelativeRoot)
+    if ([System.IO.Path]::IsPathRooted($Path)) {{ return [System.IO.Path]::GetFullPath($Path) }}
+    return [System.IO.Path]::GetFullPath((Join-Path $RepositoryRoot $Path))
+}}
+function Assert-Chapter105ReportPathWritable {{ param($Path) }}
+function Get-Chapter105StableMinioDataPath {{
+    param($RepositoryRoot)
+    return (Join-Path $RepositoryRoot "infra/compose/minio/data")
+}}
+function Assert-Chapter105Preflight {{ param($RepositoryRoot, $Environment) }}
+function Wait-Chapter105ComposeReady {{ param($ComposePrefix) }}
+function Invoke-Chapter105FlinkOverview {{ return [pscustomobject]@{{ jobs = @() }} }}
+function Invoke-Chapter105JobsStage {{
+    return [pscustomobject]@{{ action = "no_op"; job_id = "99999999999999999999999999999999" }}
+}}
+function Invoke-Chapter105Acceptance {{ return [pscustomobject]@{{ ready = $true }} }}
+function Write-Chapter105BootstrapReport {{ param($Report, $Path) }}
+function Invoke-Chapter105Native {{
+    param([string]$FilePath, [string[]]$Arguments, [string]$FailureMessage)
+    if ($FilePath -ceq "powershell" -and
+        ($Arguments -contains "{DORIS_INIT}" -or $Arguments -contains "{CATALOG_RESTORE}")) {{
+        $script:childCalls += ,([pscustomobject]@{{ arguments = @($Arguments) }})
+        if ($Arguments -contains "{DORIS_INIT}") {{
+            [System.IO.File]::WriteAllText("{env_file}", "PROJECT_NAME=attacker`n")
+        }}
+    }}
+    return @()
+}}
+$bootstrapError = $null
+try {{
+    Invoke-Chapter105Bootstrap -EnvFile "infra/.env" `
+        -ReportPath "tmp/chapter-10-5/test-report.json" `
+        -ComposeProjectName "frozen-project"
+}} catch {{ $bootstrapError = $_.Exception.Message }}
+
+$childProjects = @($script:childCalls | ForEach-Object {{
+    $index = [Array]::IndexOf([object[]]$_.arguments, "-ComposeProjectName")
+    if ($index -ge 0 -and $index + 1 -lt $_.arguments.Count) {{
+        [string]$_.arguments[$index + 1]
+    }} else {{ "missing" }}
+}})
+
+$global:chapter105NestedDockerCalls = @()
+function global:docker {{
+    [CmdletBinding(PositionalBinding = $false)]
+    param(
+        [Parameter(ValueFromPipeline = $true)]$InputObject,
+        [Parameter(ValueFromRemainingArguments = $true)][string[]]$Arguments
+    )
+    process {{
+        if ($Arguments.Count -gt 0 -and $Arguments[0] -ceq "compose") {{
+            $global:chapter105NestedDockerCalls += ,@($Arguments)
+        }}
+        $global:LASTEXITCODE = 0
+        if (($Arguments -join " ") -match "SHOW BACKENDS") {{ return "be`ttrue`tready" }}
+    }}
+}}
+
+$dorisLoadError = $null
+try {{
+    . "{DORIS_INIT}" -FunctionsOnly -EnvFile "{env_file}" `
+        -ComposeProjectName "frozen-project"
+}} catch {{ $dorisLoadError = $_.Exception.Message }}
+$dorisRunError = $null
+if ($null -eq $dorisLoadError) {{
+    try {{
+        Invoke-DorisRealtimeMetricsInitialization -EnvFile "{env_file}" `
+            -ComposeProjectName "frozen-project"
+    }} catch {{ $dorisRunError = $_.Exception.Message }}
+}}
+$dorisCalls = @($global:chapter105NestedDockerCalls)
+
+$global:chapter105NestedDockerCalls = @()
+. "{CATALOG_RESTORE}" -FunctionsOnly -EnvFile "{env_file}" `
+    -ComposeProjectName "frozen-project"
+$null = Invoke-Chapter105Compose -Arguments @("ps") -FailureMessage "catalog failed"
+$restoreCalls = @($global:chapter105NestedDockerCalls)
+
+function Test-FrozenProjectArgv {{
+    param([object[]]$Calls)
+    if ($Calls.Count -eq 0) {{ return $false }}
+    foreach ($call in $Calls) {{
+        $arguments = @($call)
+        $index = [Array]::IndexOf([object[]]$arguments, "--project-name")
+        if ($index -lt 0 -or $index + 1 -ge $arguments.Count -or
+            $arguments[$index + 1] -cne "frozen-project" -or
+            ($arguments -join " ") -match "attacker") {{ return $false }}
+    }}
+    return $true
+}}
+
+[ordered]@{{
+    bootstrap_error = $bootstrapError
+    env_project = ((Get-Content -LiteralPath "{env_file}" -Raw).Trim())
+    child_projects = $childProjects
+    doris_load_error = $dorisLoadError
+    doris_run_error = $dorisRunError
+    doris_compose_calls = $dorisCalls.Count
+    doris_frozen = Test-FrozenProjectArgv -Calls $dorisCalls
+    restore_compose_calls = $restoreCalls.Count
+    restore_frozen = Test-FrozenProjectArgv -Calls $restoreCalls
+}} | ConvertTo-Json -Depth 6 -Compress
+'''
+            )
+
+        self.assertIsNone(payload["bootstrap_error"])
+        self.assertEqual("PROJECT_NAME=attacker", payload["env_project"])
+        self.assertEqual(["frozen-project", "frozen-project"], payload["child_projects"])
+        self.assertIsNone(payload["doris_load_error"])
+        self.assertIsNone(payload["doris_run_error"])
+        self.assertGreaterEqual(payload["doris_compose_calls"], 4)
+        self.assertTrue(payload["doris_frozen"])
+        self.assertEqual(1, payload["restore_compose_calls"])
+        self.assertTrue(payload["restore_frozen"])
+
+    def test_doris_functions_only_real_entry_resolves_default_env_on_powershell_51(self):
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-File", str(DORIS_INIT), "-FunctionsOnly"],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=10,
+            check=False,
+        )
+
+        self.assertEqual(0, result.returncode, result.stderr or result.stdout)
 
     def test_strict_volume_label_json_rejects_case_duplicates_and_non_strings(self):
         payload = self._powershell_payload(
