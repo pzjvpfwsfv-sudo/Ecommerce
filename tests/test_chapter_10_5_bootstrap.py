@@ -16,6 +16,7 @@ CATALOG_RESTORE = ROOT / "scripts" / "restore_chapter_10_5_catalog.ps1"
 
 class Chapter105BootstrapTest(unittest.TestCase):
     def _run_powershell(self, command):
+        command = '[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false);' + command
         return subprocess.run(
             ["powershell", "-NoProfile", "-Command", command],
             cwd=ROOT,
@@ -24,6 +25,7 @@ class Chapter105BootstrapTest(unittest.TestCase):
             encoding="utf-8",
             errors="replace",
             check=False,
+            timeout=30,
         )
 
     def _powershell_payload(self, command):
@@ -188,6 +190,8 @@ try {{
             self.assertTrue(payload["junction_rejected"])
             self.assertTrue(payload["nested_junction_rejected"])
             self.assertTrue(payload["file_rejected"])
+            os.rmdir(state_root / "tmp")
+            os.rmdir(junction)
 
     def test_linked_worktree_production_orchestrators_share_defaults_in_both_orders(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -2377,6 +2381,7 @@ try {{ Resolve-Chapter105RepositoryPath -RepositoryRoot "{repo}" -Path "tmp/chap
 [ordered]@{{ valid_env = $validEnv; valid_report = $validReport; traversal = $traversal; escape = $escape; reparse = $reparse }} | ConvertTo-Json -Compress
 '''
             )
+            os.rmdir(repo / "tmp" / "chapter-10-5" / "linked")
             self.assertTrue(
                 os.path.samefile(repo / "infra" / "custom.env", payload["valid_env"])
             )
@@ -2406,6 +2411,7 @@ try {{
 [ordered]@{{ rejected = $rejected }} | ConvertTo-Json -Compress
 '''
             )
+            os.rmdir(root_link)
         self.assertEqual({"rejected": True}, payload)
 
     def test_malformed_flink_job_collections_fail_before_mutation(self):
@@ -2976,6 +2982,7 @@ $junctionReport = Get-Content -LiteralPath "{fallback}" -Raw | ConvertFrom-Json
 }} | ConvertTo-Json -Compress
 '''
             )
+            os.rmdir(root_link)
         if fallback.exists():
             fallback.unlink()
         expected_error = "Chapter 10.5 bootstrap failed. See the bootstrap report for safe stage status."

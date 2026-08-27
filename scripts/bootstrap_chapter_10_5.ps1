@@ -283,15 +283,34 @@ function Invoke-Chapter105JobSubmission {
 function Get-Chapter105Task4RecoveryPlan {
     param(
         [Parameter(Mandatory = $true)][string]$RepositoryRoot,
-        [Parameter(Mandatory = $true)][string]$SavepointUri
+        [Parameter(Mandatory = $true)][string]$SavepointUri,
+        [string]$StateRoot
     )
 
     $validatedSavepointUri = Get-Chapter9StateUri -Kind 'savepoint' -Environment @{
         CHAPTER9_SAVEPOINT_URI = $SavepointUri
     }
-    $stateRoot = Join-Path $RepositoryRoot 'tmp\chapter-9'
-    $finalPath = Join-Path $stateRoot 'cutover-manifest.json'
-    $partialPath = Join-Path $stateRoot 'cutover-manifest.json.partial'
+    if ($StateRoot) {
+        $restartPath = Join-Path $StateRoot 'tmp\chapter-9\acceptance-restart-recovery.json'
+        if (Test-Path -LiteralPath $restartPath -PathType Leaf) {
+            try {
+                $restart = Get-Content -LiteralPath $restartPath -Raw -Encoding UTF8 | ConvertFrom-Json -ErrorAction Stop
+                if ($restart.schema_version -isnot [int] -or [int]$restart.schema_version -ne 1 -or
+                    [string]$restart.kind -cne 'chapter10_5_acceptance_restart' -or
+                    [string]$restart.job_name -cne 'chapter-9-datastream-quality-production' -or
+                    [string]$restart.previous_job_id -cnotmatch '^[0-9a-f]{32}$') {
+                    throw 'invalid restart recovery'
+                }
+                $restartSavepoint = Assert-CutoverSavepointPath -Path ([string]$restart.savepoint_path)
+                return [pscustomobject]@{ action = 'restore'; savepoint_path = $restartSavepoint }
+            } catch {
+                throw 'Task 4 recovery state is invalid.'
+            }
+        }
+    }
+    $task4StateRoot = Join-Path $RepositoryRoot 'tmp\chapter-9'
+    $finalPath = Join-Path $task4StateRoot 'cutover-manifest.json'
+    $partialPath = Join-Path $task4StateRoot 'cutover-manifest.json.partial'
     if (Test-Path -LiteralPath $finalPath -PathType Leaf) {
         throw 'Task 4 recovery state is invalid.'
     }
@@ -334,20 +353,25 @@ function Invoke-Chapter105JobsStage {
         [Parameter(Mandatory = $true)][object]$Overview,
         [Parameter(Mandatory = $true)][string]$JobName,
         [Parameter(Mandatory = $true)][string]$SavepointUri,
+        [switch]$IsolatedAcceptance,
         [Parameter(Mandatory = $true)][scriptblock]$SubmitAction
     )
 
+    $hasStateRoot = -not [string]::IsNullOrWhiteSpace($StateRoot)
     $statePathArguments = @{ RepositoryRoot = $RepositoryRoot }
-    if ($PSBoundParameters.ContainsKey('StateRoot')) {
+    if ($hasStateRoot) {
         $statePathArguments['StateRoot'] = $StateRoot
     }
     $statePath = Get-CutoverProductionSubmitStatePath @statePathArguments
-    $legacyStatePath = Get-CutoverLegacyProductionSubmitStatePath -RepositoryRoot $RepositoryRoot
     $bootstrapSubmitAction = $SubmitAction
-    return Invoke-CutoverProductionSubmitBoundary -Path $statePath -Jobs $Overview `
-        -ExpectedName $JobName -LegacyStatePath $legacyStatePath -Action {
-            $recovery = Get-Chapter105Task4RecoveryPlan -RepositoryRoot $RepositoryRoot `
-                -SavepointUri $SavepointUri
+    $boundaryArguments = @{ Path = $statePath; Jobs = $Overview; ExpectedName = $JobName }
+    if (-not $IsolatedAcceptance) {
+        $boundaryArguments['LegacyStatePath'] = Get-CutoverLegacyProductionSubmitStatePath -RepositoryRoot $RepositoryRoot
+    }
+    return Invoke-CutoverProductionSubmitBoundary @boundaryArguments -Action {
+            $recoveryArguments = @{ RepositoryRoot = $RepositoryRoot; SavepointUri = $SavepointUri }
+            if ($hasStateRoot) { $recoveryArguments['StateRoot'] = $StateRoot }
+            $recovery = Get-Chapter105Task4RecoveryPlan @recoveryArguments
             return & $bootstrapSubmitAction $recovery.savepoint_path
         }
 }
@@ -457,13 +481,75 @@ function Initialize-Chapter105EmptyCatalog {
     param([Parameter(Mandatory = $true)][string[]]$ComposePrefix)
 
     foreach ($statement in @(
-            'CREATE SCHEMA IF NOT EXISTS lakehouse.analytics',
-            'CREATE TABLE IF NOT EXISTS lakehouse.analytics.user_behavior_detail (event_id VARCHAR, user_id VARCHAR, product_id VARCHAR, event_type VARCHAR, event_time VARCHAR, channel VARCHAR, device_type VARCHAR, page_id VARCHAR)'
+            "CREATE SCHEMA IF NOT EXISTS lakehouse.analytics WITH (location = 's3a://warehouse/iceberg/analytics.db')",
+            "CREATE TABLE IF NOT EXISTS lakehouse.analytics.user_behavior_detail (event_id VARCHAR, user_id VARCHAR, product_id VARCHAR, event_type VARCHAR, event_time VARCHAR, channel VARCHAR, device_type VARCHAR, page_id VARCHAR) WITH (location = 's3a://warehouse/iceberg/analytics.db/user_behavior_detail')"
         )) {
         Invoke-Chapter105Native -FilePath 'docker' -Arguments ($ComposePrefix + @(
             'exec', '-T', 'trino', 'trino', '--server', 'http://localhost:8080',
             '--catalog', 'lakehouse', '--execute', $statement
         )) -FailureMessage 'Isolated empty catalog initialization failed.' | Out-Null
+    }
+}
+
+function Assert-Chapter105EmptyCatalogGate {
+    param([switch]$InitializeEmptyCatalog, [switch]$IsolatedAcceptance)
+
+    if ($InitializeEmptyCatalog -and -not $IsolatedAcceptance) {
+        throw 'Empty catalog initialization requires isolated acceptance.'
+    }
+}
+
+function Resolve-Chapter105IsolationContext {
+    param(
+        [Parameter(Mandatory = $true)][string]$RepositoryRoot,
+        [Parameter(Mandatory = $true)][string]$ProjectName,
+        [Parameter(Mandatory = $true)][string]$EnvPath,
+        [Parameter(Mandatory = $true)][string]$ReportPath,
+        [Parameter(Mandatory = $true)][string]$MinioDataPath,
+        [switch]$InitializeEmptyCatalog
+    )
+
+    $safeError = 'Isolated acceptance identity is unsafe.'
+    try {
+        $match = [regex]::Match($ProjectName, '^chapter105-acceptance-(?<run>[a-f0-9]{12})$')
+        if (-not $match.Success) { throw $safeError }
+        $root = [System.IO.Path]::GetFullPath($RepositoryRoot).TrimEnd('\', '/')
+        $runId = $match.Groups['run'].Value
+        $runRoot = [System.IO.Path]::GetFullPath((Join-Path $root "acceptance/$runId")).TrimEnd('\', '/')
+        $expectedEnv = Join-Path $runRoot 'isolated.env'
+        $expectedMinio = Join-Path $runRoot 'minio-data'
+        $resolvedEnv = [System.IO.Path]::GetFullPath($EnvPath)
+        $resolvedReport = [System.IO.Path]::GetFullPath($ReportPath)
+        $resolvedMinio = [System.IO.Path]::GetFullPath($MinioDataPath).TrimEnd('\', '/')
+        if (-not $resolvedEnv.Equals($expectedEnv, [System.StringComparison]::OrdinalIgnoreCase) -or
+            -not (Split-Path -Parent $resolvedReport).Equals($runRoot, [System.StringComparison]::OrdinalIgnoreCase) -or
+            [System.IO.Path]::GetFileName($resolvedReport) -cnotmatch '^bootstrap-(first|second|recovery)\.json$' -or
+            -not $resolvedMinio.Equals($expectedMinio, [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw $safeError
+        }
+        $environment = Read-Chapter105EnvFile -Path $resolvedEnv
+        if ([string]$environment['PROJECT_NAME'] -cne $ProjectName -or
+            -not [System.IO.Path]::GetFullPath([string]$environment['MINIO_DATA_DIR']).TrimEnd('\', '/').Equals(
+                $expectedMinio, [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw $safeError
+        }
+        foreach ($candidate in @($root, $runRoot, $resolvedEnv, $resolvedReport, $resolvedMinio)) {
+            $current = [System.IO.Path]::GetPathRoot($candidate)
+            $relative = $candidate.Substring($current.Length)
+            foreach ($segment in $relative.Split(@('\', '/'), [System.StringSplitOptions]::RemoveEmptyEntries)) {
+                $current = Join-Path $current $segment
+                if (-not (Test-Path -LiteralPath $current)) { break }
+                if (((Get-Item -LiteralPath $current -Force).Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+                    throw $safeError
+                }
+            }
+        }
+        if ($InitializeEmptyCatalog -and -not $ProjectName.StartsWith('chapter105-acceptance-', [System.StringComparison]::Ordinal)) {
+            throw $safeError
+        }
+        return [pscustomobject]@{ run_id = $runId; state_root = $runRoot; run_root = $runRoot }
+    } catch {
+        throw $safeError
     }
 }
 
@@ -473,6 +559,7 @@ function Invoke-Chapter105Bootstrap {
         [switch]$SkipBuild,
         [string]$ReportPath = 'tmp/chapter-10-5/bootstrap-report.json',
         [string]$ComposeProjectName,
+        [switch]$InitializeEmptyCatalog,
         [switch]$IsolatedAcceptance
     )
 
@@ -488,6 +575,7 @@ function Invoke-Chapter105Bootstrap {
         Environment = $null
         ComposePrefix = $null
         ComposeProjectName = $null
+        StateRoot = $null
         CheckpointUri = $null
         SavepointUri = $null
     }
@@ -497,6 +585,8 @@ function Invoke-Chapter105Bootstrap {
     $previousMinioDataDir = [Environment]::GetEnvironmentVariable('MINIO_DATA_DIR', 'Process')
     try {
         Invoke-Chapter105BootstrapStage -Report $report -Name 'preflight' -Action {
+            Assert-Chapter105EmptyCatalogGate -InitializeEmptyCatalog:$InitializeEmptyCatalog `
+                -IsolatedAcceptance:$IsolatedAcceptance
             if ($IsolatedAcceptance) {
                 if ([string]::IsNullOrWhiteSpace($ComposeProjectName) -or
                     $ComposeProjectName -cnotmatch '^chapter105-acceptance-[a-f0-9]{12}$') {
@@ -529,8 +619,8 @@ function Invoke-Chapter105Bootstrap {
                 -Path $EnvFile -AllowedRelativeRoot $(if ($isAcceptanceEnv) { 'tmp/chapter-10-5/acceptance' } else { 'infra' })
             $context.Environment = Read-Chapter105EnvFile -Path $context.EnvPath
             $acceptanceDirectory = Split-Path -Parent $acceptanceRoot
-            $configuredMinioData = [System.IO.Path]::GetFullPath([string]$context.Environment['MINIO_DATA_DIR'])
             if ($isAcceptanceEnv) {
+                $configuredMinioData = [System.IO.Path]::GetFullPath([string]$context.Environment['MINIO_DATA_DIR'])
                 if (-not $configuredMinioData.StartsWith($acceptanceDirectory + [System.IO.Path]::DirectorySeparatorChar,
                         [System.StringComparison]::OrdinalIgnoreCase)) {
                     throw 'Isolated MinIO data directory is outside the acceptance root.'
@@ -539,6 +629,14 @@ function Invoke-Chapter105Bootstrap {
                 $configuredMinioData = Get-Chapter105StableMinioDataPath -RepositoryRoot $context.RepositoryRoot
             }
             $context.Environment['MINIO_DATA_DIR'] = $configuredMinioData
+            if ($IsolatedAcceptance) {
+                $isolation = Resolve-Chapter105IsolationContext `
+                    -RepositoryRoot (Join-Path $context.RepositoryRoot 'tmp/chapter-10-5') `
+                    -ProjectName $ComposeProjectName -EnvPath $context.EnvPath `
+                    -ReportPath $context.ReportPath -MinioDataPath $configuredMinioData `
+                    -InitializeEmptyCatalog:$InitializeEmptyCatalog
+                $context.StateRoot = $isolation.state_root
+            }
             [Environment]::SetEnvironmentVariable('MINIO_DATA_DIR', $context.Environment['MINIO_DATA_DIR'], 'Process')
             if (-not [string]::IsNullOrWhiteSpace($ComposeProjectName) -and
                 $ComposeProjectName -cnotmatch '^[a-z0-9][a-z0-9_-]*$') {
@@ -601,15 +699,24 @@ function Invoke-Chapter105Bootstrap {
             if (-not [string]::IsNullOrWhiteSpace($context.ComposeProjectName)) {
                 $catalogArguments += @('-ComposeProjectName', $context.ComposeProjectName)
             }
-            Invoke-Chapter105Native -FilePath 'powershell' -Arguments $catalogArguments `
-                -FailureMessage 'Catalog recovery failed.' | Out-Null
-            @{ catalog = 'recovered' }
+            $catalogOutput = @(Invoke-Chapter105Native -FilePath 'powershell' -Arguments $catalogArguments `
+                -FailureMessage 'Catalog recovery failed.'
+            )
+            $catalogAction = if ($catalogOutput.Count -gt 0) { [string]$catalogOutput[-1] } else { 'recovered' }
+            @{ catalog = 'recovered'; action = $catalogAction }
         }
         Invoke-Chapter105BootstrapStage -Report $report -Name 'jobs' -Action {
             . (Join-Path $PSScriptRoot 'run_chapter_9_production_cutover.ps1') -FunctionsOnly
             $overview = Invoke-Chapter105FlinkOverview -Port ([int]$context.Environment['FLINK_REST_PORT'])
-            $decision = Invoke-Chapter105JobsStage -RepositoryRoot $cutoverRepositoryRoot -Overview $overview `
-                -JobName $jobName -SavepointUri $context.SavepointUri -SubmitAction {
+            $jobArguments = @{
+                RepositoryRoot = $cutoverRepositoryRoot
+                Overview = $overview
+                JobName = $jobName
+                SavepointUri = $context.SavepointUri
+            }
+            if ($null -ne $context.StateRoot) { $jobArguments['StateRoot'] = $context.StateRoot }
+            if ($IsolatedAcceptance) { $jobArguments['IsolatedAcceptance'] = $true }
+            $decision = Invoke-Chapter105JobsStage @jobArguments -SubmitAction {
                 param($savepointPath)
                 $id = Invoke-Chapter105JobSubmission -RepositoryRoot $repositoryRoot -ComposePrefix $context.ComposePrefix `
                     -CheckpointUri $context.CheckpointUri -SavepointPath $savepointPath -SkipBuild:$SkipBuild
@@ -619,7 +726,7 @@ function Invoke-Chapter105Bootstrap {
                 $running = Wait-Chapter105UniqueRunningJob -FlinkPort ([int]$context.Environment['FLINK_REST_PORT']) -JobName $jobName
                 if ($running.job_id -ne $decision.job_id) { throw 'Submitted Flink job identity changed during recovery.' }
             }
-            @{ job_id = $decision.job_id; action = $decision.action }
+            @{ job_id = $decision.job_id; action = $decision.action; state_root = $context.StateRoot }
         }
         Invoke-Chapter105BootstrapStage -Report $report -Name 'acceptance' -Action {
             Invoke-Chapter105Acceptance -ApiPort ([int]$context.Environment['API_PORT']) `

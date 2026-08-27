@@ -149,6 +149,15 @@ function Assert-Chapter105FixedTableReadable {
     $null = Invoke-Chapter105Trino -Sql $sql -FailureMessage "Trino fixed table read validation failed."
 }
 
+function Assert-Chapter105FixedTableLocation {
+    $lines = @(Invoke-Chapter105Trino -Sql 'SHOW CREATE TABLE lakehouse.analytics.user_behavior_detail' `
+        -FailureMessage 'Trino fixed table location validation failed.')
+    $rendered = $lines -join "`n"
+    if ($rendered -notmatch "(?s)location\s*=\s*'s3a://warehouse/iceberg/analytics\.db/user_behavior_detail'") {
+        throw 'Trino fixed table location is invalid.'
+    }
+}
+
 function Get-Chapter105MetadataNames {
     $listCommand = 'mc alias set local http://minio:9000 "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD" >/dev/null && mc ls --recursive --json local/warehouse/iceberg/analytics.db/user_behavior_detail/metadata'
     $lines = Invoke-Chapter105Compose -Arguments @(
@@ -227,6 +236,7 @@ FROM lakehouse.analytics.user_behavior_detail
 function Restore-Chapter105Catalog {
     $tableCount = Get-Chapter105CatalogTableCount
     if ($tableCount -eq 1) {
+        Assert-Chapter105FixedTableLocation
         Assert-Chapter105FixedTableReadable
         return "already_registered"
     }

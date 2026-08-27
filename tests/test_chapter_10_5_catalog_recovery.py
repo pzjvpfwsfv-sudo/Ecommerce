@@ -252,6 +252,7 @@ function Invoke-Chapter105Compose {
     $script:commands += ,@($Arguments)
     $sql = [string]$Arguments[-1]
     if ($sql -match "information_schema") { return @("table_count", "1") }
+    if ($sql -match "SHOW CREATE TABLE") { return @("Create Table", "CREATE TABLE lakehouse.analytics.user_behavior_detail WITH ( location = 's3a://warehouse/iceberg/analytics.db/user_behavior_detail' )") }
     if ($sql -match "SELECT 1 FROM lakehouse\.analytics\.user_behavior_detail LIMIT 1") { return @("_col0") }
     throw "unexpected controlled command"
 }
@@ -265,7 +266,7 @@ $status = Restore-Chapter105Catalog
 '''
         )
         self.assertEqual(
-            {"status": "already_registered", "command_count": 2, "used_mc": False, "used_register": False},
+            {"status": "already_registered", "command_count": 3, "used_mc": False, "used_register": False},
             payload,
         )
 
