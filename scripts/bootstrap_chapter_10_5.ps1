@@ -4,6 +4,8 @@ param(
     [switch]$SkipBuild,
     [string]$ReportPath = 'tmp/chapter-10-5/bootstrap-report.json',
     [string]$ComposeProjectName,
+    [switch]$InitializeEmptyCatalog,
+    [switch]$IsolatedAcceptance,
     [switch]$FunctionsOnly
 )
 
@@ -145,7 +147,11 @@ function Invoke-Chapter105BootstrapStage {
 }
 
 function Assert-Chapter105Preflight {
-    param([Parameter(Mandatory = $true)][string]$RepositoryRoot, [Parameter(Mandatory = $true)][System.Collections.IDictionary]$Environment)
+    param(
+        [Parameter(Mandatory = $true)][string]$RepositoryRoot,
+        [Parameter(Mandatory = $true)][System.Collections.IDictionary]$Environment,
+        [Parameter(Mandatory = $true)][string]$MinioDataPath
+    )
 
     foreach ($key in @('FLINK_REST_PORT', 'API_PORT', 'MINIO_API_PORT', 'TRINO_PORT', 'DORIS_FE_QUERY_PORT')) {
         if (-not $Environment.ContainsKey($key) -or [int]$Environment[$key] -lt 1 -or [int]$Environment[$key] -gt 65535) {
@@ -165,7 +171,7 @@ function Assert-Chapter105Preflight {
     if (($java -join "`n") -notmatch '(?m)(?:version )?"?17(?:\.|\s|$)') { throw 'Java 17 is unavailable.' }
     Invoke-Chapter105Native -FilePath 'mvn' -Arguments @('-version') -FailureMessage 'Maven is unavailable.' | Out-Null
     Invoke-Chapter105Native -FilePath 'python' -Arguments @('--version') -FailureMessage 'Python is unavailable.' | Out-Null
-    $minioDataPath = Get-Chapter105StableMinioDataPath -RepositoryRoot $RepositoryRoot
+    $minioDataPath = $MinioDataPath
     [System.IO.Directory]::CreateDirectory($minioDataPath) | Out-Null
     $probePath = Join-Path $minioDataPath ".bootstrap-write-$([Guid]::NewGuid().ToString('N'))"
     try { [System.IO.File]::WriteAllText($probePath, '') } finally { if (Test-Path -LiteralPath $probePath) { Remove-Item -LiteralPath $probePath -Force } }
@@ -447,12 +453,27 @@ function Invoke-Chapter105Acceptance {
     return @{ job_id = $decision.job_id; ready = $true; tools = 'rule_based' }
 }
 
+function Initialize-Chapter105EmptyCatalog {
+    param([Parameter(Mandatory = $true)][string[]]$ComposePrefix)
+
+    foreach ($statement in @(
+            'CREATE SCHEMA IF NOT EXISTS lakehouse.analytics',
+            'CREATE TABLE IF NOT EXISTS lakehouse.analytics.user_behavior_detail (event_id VARCHAR, user_id VARCHAR, product_id VARCHAR, event_type VARCHAR, event_time VARCHAR, channel VARCHAR, device_type VARCHAR, page_id VARCHAR)'
+        )) {
+        Invoke-Chapter105Native -FilePath 'docker' -Arguments ($ComposePrefix + @(
+            'exec', '-T', 'trino', 'trino', '--server', 'http://localhost:8080',
+            '--catalog', 'lakehouse', '--execute', $statement
+        )) -FailureMessage 'Isolated empty catalog initialization failed.' | Out-Null
+    }
+}
+
 function Invoke-Chapter105Bootstrap {
     param(
         [string]$EnvFile = 'infra/.env',
         [switch]$SkipBuild,
         [string]$ReportPath = 'tmp/chapter-10-5/bootstrap-report.json',
-        [string]$ComposeProjectName
+        [string]$ComposeProjectName,
+        [switch]$IsolatedAcceptance
     )
 
     Set-StrictMode -Version Latest
@@ -476,7 +497,15 @@ function Invoke-Chapter105Bootstrap {
     $previousMinioDataDir = [Environment]::GetEnvironmentVariable('MINIO_DATA_DIR', 'Process')
     try {
         Invoke-Chapter105BootstrapStage -Report $report -Name 'preflight' -Action {
-            $context.RepositoryRoot = Get-Chapter105PrimaryRepositoryRoot -StartPath $PSScriptRoot
+            if ($IsolatedAcceptance) {
+                if ([string]::IsNullOrWhiteSpace($ComposeProjectName) -or
+                    $ComposeProjectName -cnotmatch '^chapter105-acceptance-[a-f0-9]{12}$') {
+                    throw 'Isolated acceptance identity is unsafe.'
+                }
+                $context.RepositoryRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..')).TrimEnd('\', '/')
+            } else {
+                $context.RepositoryRoot = Get-Chapter105PrimaryRepositoryRoot -StartPath $PSScriptRoot
+            }
             $defaultReportPath = Resolve-Chapter105RepositoryPath -RepositoryRoot $context.RepositoryRoot `
                 -Path 'tmp/chapter-10-5/bootstrap-report.json' -AllowedRelativeRoot 'tmp/chapter-10-5'
             $requestedReportPath = if ($ReportPath -ceq 'tmp/chapter-10-5/bootstrap-report.json') {
@@ -487,10 +516,29 @@ function Invoke-Chapter105Bootstrap {
             }
             Assert-Chapter105ReportPathWritable -Path $requestedReportPath
             $context.ReportPath = $requestedReportPath
+            $envCandidate = if ([System.IO.Path]::IsPathRooted($EnvFile)) {
+                [System.IO.Path]::GetFullPath($EnvFile)
+            } else {
+                [System.IO.Path]::GetFullPath((Join-Path $context.RepositoryRoot $EnvFile))
+            }
+            $acceptanceRoot = Resolve-Chapter105RepositoryPath -RepositoryRoot $context.RepositoryRoot `
+                -Path 'tmp/chapter-10-5/acceptance/.bootstrap-anchor' -AllowedRelativeRoot 'tmp/chapter-10-5'
+            $isAcceptanceEnv = $envCandidate.StartsWith((Split-Path -Parent $acceptanceRoot) + [System.IO.Path]::DirectorySeparatorChar,
+                [System.StringComparison]::OrdinalIgnoreCase)
             $context.EnvPath = Resolve-Chapter105RepositoryPath -RepositoryRoot $context.RepositoryRoot `
-                -Path $EnvFile -AllowedRelativeRoot 'infra'
+                -Path $EnvFile -AllowedRelativeRoot $(if ($isAcceptanceEnv) { 'tmp/chapter-10-5/acceptance' } else { 'infra' })
             $context.Environment = Read-Chapter105EnvFile -Path $context.EnvPath
-            $context.Environment['MINIO_DATA_DIR'] = Get-Chapter105StableMinioDataPath -RepositoryRoot $context.RepositoryRoot
+            $acceptanceDirectory = Split-Path -Parent $acceptanceRoot
+            $configuredMinioData = [System.IO.Path]::GetFullPath([string]$context.Environment['MINIO_DATA_DIR'])
+            if ($isAcceptanceEnv) {
+                if (-not $configuredMinioData.StartsWith($acceptanceDirectory + [System.IO.Path]::DirectorySeparatorChar,
+                        [System.StringComparison]::OrdinalIgnoreCase)) {
+                    throw 'Isolated MinIO data directory is outside the acceptance root.'
+                }
+            } else {
+                $configuredMinioData = Get-Chapter105StableMinioDataPath -RepositoryRoot $context.RepositoryRoot
+            }
+            $context.Environment['MINIO_DATA_DIR'] = $configuredMinioData
             [Environment]::SetEnvironmentVariable('MINIO_DATA_DIR', $context.Environment['MINIO_DATA_DIR'], 'Process')
             if (-not [string]::IsNullOrWhiteSpace($ComposeProjectName) -and
                 $ComposeProjectName -cnotmatch '^[a-z0-9][a-z0-9_-]*$') {
@@ -508,7 +556,8 @@ function Invoke-Chapter105Bootstrap {
             . (Join-Path $PSScriptRoot 'run_chapter_9_production_cutover.ps1') -FunctionsOnly
             $context.CheckpointUri = Get-Chapter9StateUri -Kind 'checkpoint' -Environment $context.Environment
             $context.SavepointUri = Get-Chapter9StateUri -Kind 'savepoint' -Environment $context.Environment
-            Assert-Chapter105Preflight -RepositoryRoot $context.RepositoryRoot -Environment $context.Environment
+            Assert-Chapter105Preflight -RepositoryRoot $context.RepositoryRoot -Environment $context.Environment `
+                -MinioDataPath $context.Environment['MINIO_DATA_DIR']
         }
         $repositoryRoot = $context.RepositoryRoot
         $cutoverRepositoryRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..')).TrimEnd('\', '/')
@@ -542,6 +591,9 @@ function Invoke-Chapter105Bootstrap {
             @{ topic = 'user_behavior_events'; doris = 'initialized'; minio_buckets = 'compose-init' }
         }
         Invoke-Chapter105BootstrapStage -Report $report -Name 'catalog' -Action {
+            if ($InitializeEmptyCatalog) {
+                Initialize-Chapter105EmptyCatalog -ComposePrefix $context.ComposePrefix
+            }
             $catalogArguments = @(
                 '-NoProfile', '-File', (Join-Path $PSScriptRoot 'restore_chapter_10_5_catalog.ps1'),
                 '-EnvFile', $envPath
@@ -595,4 +647,5 @@ function Invoke-Chapter105Bootstrap {
 if ($FunctionsOnly) { return }
 
 Invoke-Chapter105Bootstrap -EnvFile $EnvFile -SkipBuild:$SkipBuild -ReportPath $ReportPath `
-    -ComposeProjectName $ComposeProjectName
+    -ComposeProjectName $ComposeProjectName -InitializeEmptyCatalog:$InitializeEmptyCatalog `
+    -IsolatedAcceptance:$IsolatedAcceptance

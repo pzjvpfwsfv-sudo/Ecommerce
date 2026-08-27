@@ -7,8 +7,8 @@ networks:
     driver: bridge
     ipam:
       config:
-        - subnet: 172.21.80.0/24
-          ip_range: 172.21.80.128/25
+        - subnet: ${DORIS_NETWORK_SUBNET}
+          ip_range: ${DORIS_NETWORK_IP_RANGE}
 
 services:
   kafka-controller:
@@ -231,9 +231,9 @@ services:
     ports:
       - "${DORIS_FE_HTTP_PORT}:8030"
       - "${DORIS_FE_QUERY_PORT}:9030"
-      - "9010:9010"
+      - "${DORIS_FE_EDIT_LOG_PORT}:9010"
     environment:
-      FE_SERVERS: fe1:172.21.80.2:9010
+      FE_SERVERS: fe1:${DORIS_FE_STATIC_IP}:9010
       FE_ID: 1
     command:
       - sh
@@ -243,7 +243,7 @@ services:
       - doris-fe-meta:/opt/apache-doris/fe/doris-meta
     networks:
       custom_network:
-        ipv4_address: 172.21.80.2
+        ipv4_address: ${DORIS_FE_STATIC_IP}
 
   doris-be:
     profiles: ["serving"]
@@ -253,11 +253,11 @@ services:
     depends_on:
       - doris-fe
     ports:
-      - "8040:8040"
+      - "${DORIS_BE_HTTP_PORT}:8040"
       - "${DORIS_BE_HEARTBEAT_PORT}:9050"
     environment:
-      FE_SERVERS: fe1:172.21.80.2:9010
-      BE_ADDR: 172.21.80.3:9050
+      FE_SERVERS: fe1:${DORIS_FE_STATIC_IP}:9010
+      BE_ADDR: ${DORIS_BE_STATIC_IP}:9050
       SKIP_CHECK_ULIMIT: "true"
     command:
       - sh
@@ -267,12 +267,12 @@ services:
       - doris-be-storage:/opt/apache-doris/be/storage
     networks:
       custom_network:
-        ipv4_address: 172.21.80.3
+        ipv4_address: ${DORIS_BE_STATIC_IP}
 
   minio:
     profiles: ["lakehouse"]
     image: minio/minio:RELEASE.2025-02-28T09-55-16Z
-    container_name: ecom-minio
+    container_name: ${MINIO_CONTAINER_NAME}
     hostname: minio
     command: server /data --console-address ":9001"
     environment:
@@ -294,7 +294,7 @@ services:
   minio-init:
     profiles: ["lakehouse"]
     image: minio/mc:RELEASE.2025-03-12T17-29-24Z
-    container_name: ecom-minio-init
+    container_name: ${MINIO_INIT_CONTAINER_NAME}
     depends_on:
       minio:
         condition: service_healthy
@@ -311,6 +311,7 @@ services:
   metastore-postgres:
     profiles: ["lakehouse"]
     image: postgres:16.4-alpine
+    container_name: ${METASTORE_POSTGRES_CONTAINER_NAME}
     environment:
       POSTGRES_DB: ${METASTORE_POSTGRES_DB}
       POSTGRES_USER: ${METASTORE_POSTGRES_USER}
