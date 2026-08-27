@@ -25,6 +25,41 @@ function ConvertTo-AcceptanceNativeArgument {
     return '"' + $escaped + '"'
 }
 
+function Stop-AcceptanceProcessTree {
+    param([Parameter(Mandatory = $true)][System.Diagnostics.Process]$Process)
+
+    try { if ($Process.HasExited) { return } } catch { return }
+    if ($env:OS -ceq 'Windows_NT') {
+        $taskkill = [System.Diagnostics.ProcessStartInfo]::new()
+        $taskkill.FileName = Join-Path $env:SystemRoot 'System32\taskkill.exe'
+        $taskkill.Arguments = "/PID $($Process.Id) /T /F"
+        $taskkill.UseShellExecute = $false
+        $taskkill.CreateNoWindow = $true
+        $taskkill.RedirectStandardOutput = $true
+        $taskkill.RedirectStandardError = $true
+        $killer = [System.Diagnostics.Process]::new()
+        $killer.StartInfo = $taskkill
+        try {
+            if (-not $killer.Start()) { throw 'start failed' }
+            $null = $killer.StandardOutput.ReadToEndAsync()
+            $null = $killer.StandardError.ReadToEndAsync()
+            if (-not $killer.WaitForExit(5000)) {
+                try { $killer.Kill() } catch { }
+                throw 'timeout'
+            }
+        } catch {
+            throw 'Timed-out process tree could not be terminated safely.'
+        } finally {
+            $killer.Dispose()
+        }
+    } else {
+        try { $Process.Kill() } catch { }
+    }
+    if (-not $Process.WaitForExit(5000)) {
+        throw 'Timed-out process tree could not be terminated safely.'
+    }
+}
+
 function Invoke-AcceptanceProcess {
     param(
         [Parameter(Mandatory = $true)][string]$FilePath,
@@ -51,7 +86,7 @@ function Invoke-AcceptanceProcess {
         $stdoutTask = $process.StandardOutput.ReadToEndAsync()
         $stderrTask = $process.StandardError.ReadToEndAsync()
         if (-not $process.WaitForExit($remaining)) {
-            try { $process.Kill() } catch { }
+            Stop-AcceptanceProcessTree -Process $process
             throw 'Chapter 10.5 acceptance deadline expired.'
         }
         $stdout = $stdoutTask.GetAwaiter().GetResult()
@@ -102,6 +137,31 @@ function Get-AcceptanceActualDefaultEnvPath {
         Join-Path $RepositoryRoot 'infra/.env.example'
     }
     return [System.IO.Path]::GetFullPath($candidate)
+}
+
+function New-AcceptanceIsolatedEnvironment {
+    param(
+        [Parameter(Mandatory = $true)][System.Collections.IDictionary]$ReferenceValues,
+        [Parameter(Mandatory = $true)][System.Collections.IDictionary]$DefaultValues,
+        [Parameter(Mandatory = $true)][System.Collections.IDictionary]$IsolationValues
+    )
+
+    $values = [ordered]@{}
+    foreach ($source in @($ReferenceValues, $DefaultValues, $IsolationValues)) {
+        foreach ($entry in $source.GetEnumerator()) { $values[[string]$entry.Key] = [string]$entry.Value }
+    }
+    foreach ($entry in ([ordered]@{
+            API_BIND_HOST = '127.0.0.1'
+            TRINO_BASE_URL = 'http://trino:8080'
+            FLINK_REST_URL = 'http://flink-jobmanager:8081'
+            DORIS_INTERNAL_QUERY_PORT = '9030'
+            KAFKA_CONTROLLER_HOST = 'kafka-controller'
+            KAFKA_CONTROLLER_PORT = '9093'
+            CHAPTER9_PRODUCTION_JOB_NAME = 'chapter-9-datastream-quality-production'
+        }).GetEnumerator()) {
+        $values[[string]$entry.Key] = [string]$entry.Value
+    }
+    return $values
 }
 
 function Set-AcceptanceEnvironment {
@@ -240,6 +300,30 @@ function Assert-AcceptanceRenderedConfig {
                 throw $safeError
             }
         }
+        if ($ExpectedValues.Contains('API_BIND_HOST')) {
+            $apiPorts = @($config.services.api.ports | Where-Object { [int]$_.target -eq 8000 })
+            if ($apiPorts.Count -ne 1 -or
+                [string]$apiPorts[0].host_ip -cne [string]$ExpectedValues['API_BIND_HOST']) { throw $safeError }
+        }
+        $apiEnvironment = $config.services.api.environment
+        $endpointMap = [ordered]@{
+            TRINO_BASE_URL = 'TRINO_BASE_URL'
+            FLINK_REST_URL = 'FLINK_REST_URL'
+            CHAPTER9_PRODUCTION_JOB_NAME = 'CHAPTER9_PRODUCTION_JOB_NAME'
+        }
+        foreach ($entry in $endpointMap.GetEnumerator()) {
+            if ($ExpectedValues.Contains($entry.Key) -and
+                [string]$apiEnvironment.($entry.Value) -cne [string]$ExpectedValues[$entry.Key]) { throw $safeError }
+        }
+        if ([string]$apiEnvironment.DORIS_HOST -cne 'doris-fe' -or
+            [string]$apiEnvironment.DORIS_PORT -cne [string]$ExpectedValues['DORIS_INTERNAL_QUERY_PORT']) { throw $safeError }
+        if ($ExpectedValues.Contains('KAFKA_CONTROLLER_HOST') -and $ExpectedValues.Contains('KAFKA_CONTROLLER_PORT')) {
+            $expectedVoterSuffix = "@$([string]$ExpectedValues['KAFKA_CONTROLLER_HOST']):$([string]$ExpectedValues['KAFKA_CONTROLLER_PORT'])"
+            foreach ($serviceName in @('kafka-controller', 'kafka-broker')) {
+                $voters = [string]$config.services.($serviceName).environment.KAFKA_CONTROLLER_QUORUM_VOTERS
+                if (-not $voters.EndsWith($expectedVoterSuffix, [System.StringComparison]::Ordinal)) { throw $safeError }
+            }
+        }
         return 'validated'
     } catch {
         throw $safeError
@@ -367,7 +451,8 @@ function Get-AcceptanceBootstrapEvidence {
     param(
         [Parameter(Mandatory = $true)][string]$Path,
         [Parameter(Mandatory = $true)][ValidateSet('submitted', 'no_op')][string]$ExpectedJobAction,
-        [string]$ExpectedCatalogAction
+        [string]$ExpectedCatalogAction,
+        [switch]$RequireInitializationNoOp
     )
     $safeError = 'Bootstrap phase report is invalid.'
     try {
@@ -389,10 +474,30 @@ function Get-AcceptanceBootstrapEvidence {
         if ([string]$jobs.action -cne $ExpectedJobAction -or [string]$jobs.job_id -cnotmatch '^[0-9a-f]{32}$') { throw $safeError }
         $catalogAction = [string]$report.stages.catalog.details.action
         if ($ExpectedCatalogAction -and $catalogAction -cne $ExpectedCatalogAction) { throw $safeError }
+        $initialization = $report.stages.initialization.details
+        $buckets = @($initialization.minio_buckets)
+        if ([string]$initialization.topic.name -cne 'user_behavior_events' -or
+            [string]$initialization.doris.name -cne 'analytics.realtime_metrics' -or
+            $buckets.Count -ne 2 -or [string]$buckets[0].name -cne 'warehouse' -or
+            [string]$buckets[1].name -cne 'flink-state') { throw $safeError }
+        $initializationActions = @(
+            [string]$initialization.topic.action,
+            [string]$initialization.doris.action,
+            [string]$buckets[0].action,
+            [string]$buckets[1].action
+        )
+        foreach ($action in $initializationActions) {
+            if ($action -cne 'created' -and $action -cne 'no_op') { throw $safeError }
+            if ($RequireInitializationNoOp -and $action -cne 'no_op') { throw $safeError }
+        }
         return [ordered]@{
             path = [System.IO.Path]::GetFullPath($Path); started_at = [string]$report.started_at
             completed_at = [string]$report.completed_at; job_action = [string]$jobs.action; job_id = [string]$jobs.job_id
             catalog_action = $catalogAction
+            initialization = [ordered]@{
+                topic = $initializationActions[0]; doris = $initializationActions[1]
+                warehouse = $initializationActions[2]; flink_state = $initializationActions[3]
+            }
         }
     } catch { throw $safeError }
 }
@@ -412,41 +517,79 @@ function Invoke-AcceptanceArtifactBuild {
     return $jar
 }
 
-function Get-AcceptanceSha256 {
-    param([Parameter(Mandatory = $true)][string]$Path, [Parameter(Mandatory = $true)][DateTimeOffset]$Deadline)
-    Get-AcceptanceRemainingMilliseconds -Deadline $Deadline | Out-Null
-    $stream = [System.IO.File]::OpenRead($Path)
-    $algorithm = [System.Security.Cryptography.SHA256]::Create()
+function Invoke-AcceptanceBoundarySnapshot {
+    param(
+        [Parameter(Mandatory = $true)][ValidateSet('File', 'Directory')][string]$Kind,
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][DateTimeOffset]$Deadline
+    )
+
+    $encodedPath = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($Path))
+    $snapshotScript = @"
+`$kind = '$Kind'
+`$path = [IO.Path]::GetFullPath([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$encodedPath')))
+"@ + "`n" + @'
+$ErrorActionPreference = 'Stop'
+function Get-Hash([string]$FilePath) {
+    $stream = [IO.File]::OpenRead($FilePath)
+    $algorithm = [Security.Cryptography.SHA256]::Create()
     try { $bytes = $algorithm.ComputeHash($stream) }
     finally { $algorithm.Dispose(); $stream.Dispose() }
-    Get-AcceptanceRemainingMilliseconds -Deadline $Deadline | Out-Null
     return ([BitConverter]::ToString($bytes)).Replace('-', '').ToLowerInvariant()
+}
+if ($kind -ceq 'File') {
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+        $result = [ordered]@{ exists = $false; sha256 = $null }
+    } else {
+        $item = Get-Item -LiteralPath $path -Force
+        if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'reparse point' }
+        $result = [ordered]@{ exists = $true; sha256 = Get-Hash $path }
+    }
+} elseif (-not (Test-Path -LiteralPath $path -PathType Container)) {
+    $result = [ordered]@{ exists = $false; files = @() }
+} else {
+    $root = $path.TrimEnd('\', '/')
+    $rootItem = Get-Item -LiteralPath $root -Force
+    if (($rootItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'reparse point' }
+    $stack = [Collections.Generic.Stack[string]]::new()
+    $stack.Push($root)
+    $files = [Collections.Generic.List[object]]::new()
+    while ($stack.Count -gt 0) {
+        $current = $stack.Pop()
+        foreach ($entry in [IO.Directory]::EnumerateFileSystemEntries($current)) {
+            $item = Get-Item -LiteralPath $entry -Force
+            if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'reparse point' }
+            if ($item.PSIsContainer) { $stack.Push($item.FullName) }
+            else {
+                $files.Add([ordered]@{
+                    path = $item.FullName.Substring($root.Length).TrimStart('\', '/')
+                    length = [int64]$item.Length
+                    sha256 = Get-Hash $item.FullName
+                }) | Out-Null
+            }
+        }
+    }
+    $result = [ordered]@{ exists = $true; files = @($files | Sort-Object path) }
+}
+$result | ConvertTo-Json -Depth 8 -Compress
+'@
+    $encodedScript = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($snapshotScript))
+    $lines = @(Invoke-AcceptanceProcess -FilePath 'powershell' -Arguments @(
+        '-NoProfile', '-EncodedCommand', $encodedScript
+    ) -Deadline $Deadline -FailureMessage 'Shared-state boundary snapshot failed.')
+    if ($lines.Count -ne 1) { throw 'Shared-state boundary snapshot failed.' }
+    try { return $lines[0] | ConvertFrom-Json -ErrorAction Stop }
+    catch { throw 'Shared-state boundary snapshot failed.' }
 }
 
 function Get-AcceptanceFileBoundary {
     param([Parameter(Mandatory = $true)][string]$Path, [Parameter(Mandatory = $true)][DateTimeOffset]$Deadline)
-    Get-AcceptanceRemainingMilliseconds -Deadline $Deadline | Out-Null
-    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return [ordered]@{ exists = $false; sha256 = $null } }
-    $hash = Get-AcceptanceSha256 -Path $Path -Deadline $Deadline
-    Get-AcceptanceRemainingMilliseconds -Deadline $Deadline | Out-Null
-    return [ordered]@{ exists = $true; sha256 = $hash }
+    return Invoke-AcceptanceBoundarySnapshot -Kind File -Path $Path -Deadline $Deadline
 }
 
 function Get-AcceptanceDirectoryBoundary {
     param([Parameter(Mandatory = $true)][string]$Path, [Parameter(Mandatory = $true)][DateTimeOffset]$Deadline)
-    Get-AcceptanceRemainingMilliseconds -Deadline $Deadline | Out-Null
-    if (-not (Test-Path -LiteralPath $Path -PathType Container)) { return [ordered]@{ exists = $false; files = @() } }
-    $root = [System.IO.Path]::GetFullPath($Path).TrimEnd('\', '/')
-    $items = @(Get-ChildItem -LiteralPath $root -Force -Recurse | Sort-Object FullName)
-    $files = @($items | ForEach-Object {
-        Get-AcceptanceRemainingMilliseconds -Deadline $Deadline | Out-Null
-        if (($_.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'Default shared-state boundary contains a reparse point.' }
-        if (-not $_.PSIsContainer) {
-            [ordered]@{ path = $_.FullName.Substring($root.Length).TrimStart('\', '/'); length = $_.Length; sha256 = Get-AcceptanceSha256 -Path $_.FullName -Deadline $Deadline }
-        }
-    })
-    Get-AcceptanceRemainingMilliseconds -Deadline $Deadline | Out-Null
-    return [ordered]@{ exists = $true; files = $files }
+    return Invoke-AcceptanceBoundarySnapshot -Kind Directory -Path $Path -Deadline $Deadline
 }
 
 function Get-AcceptanceDefaultProjectState {
@@ -633,6 +776,7 @@ function Invoke-Chapter105ColdStartVerification {
     $acceptanceRoot = [System.IO.Path]::GetFullPath((Join-Path $repositoryRoot 'tmp/chapter-10-5/acceptance'))
     $defaultEnvPath = Get-AcceptanceActualDefaultEnvPath -RepositoryRoot $repositoryRoot -RequestedPath $DefaultEnvFile
     $defaultEnvironment = Read-AcceptanceEnv -Path $defaultEnvPath
+    $referenceEnvironment = Read-AcceptanceEnv -Path (Join-Path $repositoryRoot 'infra/.env.example')
     $runId = [Guid]::NewGuid().ToString('N').Substring(0, 12)
     $projectName = "chapter105-acceptance-$runId"
     Assert-AcceptanceProjectName -ProjectName $projectName -DefaultProjectName ([string]$defaultEnvironment['PROJECT_NAME'])
@@ -672,15 +816,14 @@ function Invoke-Chapter105ColdStartVerification {
             HIVE_METASTORE_CONTAINER_NAME = "$projectName-hive"; TRINO_CONTAINER_NAME = "$projectName-trino"
         }
         foreach ($entry in $ports.GetEnumerator()) { $isolationValues[$entry.Key] = $entry.Value }
-        $isolatedEnvironment = [ordered]@{}
-        foreach ($entry in $defaultEnvironment.GetEnumerator()) { $isolatedEnvironment[$entry.Key] = [string]$entry.Value }
-        foreach ($entry in $isolationValues.GetEnumerator()) { $isolatedEnvironment[$entry.Key] = [string]$entry.Value }
+        $isolatedEnvironment = New-AcceptanceIsolatedEnvironment -ReferenceValues $referenceEnvironment `
+            -DefaultValues $defaultEnvironment -IsolationValues $isolationValues
         [System.IO.File]::WriteAllLines($envPath, @($isolatedEnvironment.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }), [System.Text.UTF8Encoding]::new($false))
-        $previousEnvironment = Set-AcceptanceEnvironment -Values $isolationValues
+        $previousEnvironment = Set-AcceptanceEnvironment -Values $isolatedEnvironment
         $composePrefix = @('compose', '--project-name', $projectName, '--env-file', $envPath, '-f', (Join-Path $repositoryRoot 'infra/docker-compose.yml'),
             '--profile', 'flink', '--profile', 'serving', '--profile', 'lakehouse')
         $rendered = (Invoke-AcceptanceDocker -Arguments ($composePrefix + @('config', '--format', 'json')) -Deadline $deadline -FailureMessage 'Isolated Compose render failed.') -join "`n"
-        Assert-AcceptanceRenderedConfig -ConfigJson $rendered -ExpectedValues $isolationValues | Out-Null
+        Assert-AcceptanceRenderedConfig -ConfigJson $rendered -ExpectedValues $isolatedEnvironment | Out-Null
 
         Invoke-AcceptanceBootstrap -RepositoryRoot $repositoryRoot -EnvFile $envPath -ProjectName $projectName -ReportPath $firstReport -Deadline $deadline -InitializeEmptyCatalog
         $firstBootstrap = Get-AcceptanceBootstrapEvidence -Path $firstReport -ExpectedJobAction 'submitted' -ExpectedCatalogAction 'already_registered'
@@ -688,7 +831,8 @@ function Invoke-Chapter105ColdStartVerification {
         $report.cold_start = 'passed'; $report.evidence.cold_start = [ordered]@{ bootstrap = $firstBootstrap; checkpoint = $firstCheckpoint }
 
         Invoke-AcceptanceBootstrap -RepositoryRoot $repositoryRoot -EnvFile $envPath -ProjectName $projectName -ReportPath $secondReport -Deadline $deadline
-        $secondBootstrap = Get-AcceptanceBootstrapEvidence -Path $secondReport -ExpectedJobAction 'no_op' -ExpectedCatalogAction 'already_registered'
+        $secondBootstrap = Get-AcceptanceBootstrapEvidence -Path $secondReport -ExpectedJobAction 'no_op' `
+            -ExpectedCatalogAction 'already_registered' -RequireInitializationNoOp
         $secondCheckpoint = Get-AcceptanceCheckpoint -FlinkPort ([int]$ports['FLINK_REST_PORT']) -Deadline $deadline
         if ($secondBootstrap.job_id -cne $firstBootstrap.job_id -or $secondCheckpoint.job_id -cne $firstCheckpoint.job_id) { throw 'Second Bootstrap was not idempotent.' }
         $report.idempotent_second_run = 'passed'; $report.evidence.idempotent_second_run = [ordered]@{ bootstrap = $secondBootstrap; checkpoint = $secondCheckpoint }
@@ -703,7 +847,8 @@ function Invoke-Chapter105ColdStartVerification {
         Invoke-AcceptanceDocker -Arguments ($composePrefix + @('rm', '-sf', 'hive-metastore', 'trino', 'flink-jobmanager', 'flink-taskmanager', 'flink-sql-client')) -Deadline $deadline -FailureMessage 'Isolated service recreation failed.' | Out-Null
         Invoke-AcceptanceDocker -Arguments ($composePrefix + @('up', '-d', 'hive-metastore', 'trino', 'flink-jobmanager', 'flink-taskmanager', 'flink-sql-client')) -Deadline $deadline -FailureMessage 'Isolated service restart failed.' | Out-Null
         Invoke-AcceptanceBootstrap -RepositoryRoot $repositoryRoot -EnvFile $envPath -ProjectName $projectName -ReportPath $recoveryReport -Deadline $deadline
-        $recoveryBootstrap = Get-AcceptanceBootstrapEvidence -Path $recoveryReport -ExpectedJobAction 'submitted' -ExpectedCatalogAction 'already_registered'
+        $recoveryBootstrap = Get-AcceptanceBootstrapEvidence -Path $recoveryReport -ExpectedJobAction 'submitted' `
+            -ExpectedCatalogAction 'already_registered' -RequireInitializationNoOp
         $recoveryCheckpoint = Get-AcceptanceCheckpoint -FlinkPort ([int]$ports['FLINK_REST_PORT']) -Deadline $deadline
         $rowAfter = [int64](Invoke-AcceptanceTrinoScalar -ComposePrefix $composePrefix -Sql 'SELECT count(*) FROM lakehouse.analytics.user_behavior_detail' -Deadline $deadline)
         $snapshotAfter = Invoke-AcceptanceTrinoScalar -ComposePrefix $composePrefix -Sql 'SELECT snapshot_id FROM "user_behavior_detail$snapshots" ORDER BY committed_at DESC LIMIT 1' -Deadline $deadline
@@ -731,7 +876,7 @@ function Invoke-Chapter105ColdStartVerification {
                 throw 'Default project shared state changed during isolated acceptance.'
             }
             if ($completed -and -not $KeepOnFailure) {
-                $cleanupPrevious = Set-AcceptanceEnvironment -Values $isolationValues
+                $cleanupPrevious = Set-AcceptanceEnvironment -Values $isolatedEnvironment
                 try { Remove-AcceptanceOwnedResources -ComposePrefix $composePrefix -ProjectName $projectName -AcceptanceRoot $acceptanceRoot -RunRoot $runRoot -RunId $runId -Deadline $deadline }
                 finally { Restore-AcceptanceEnvironment -Previous $cleanupPrevious }
                 $report.cleanup = 'passed'

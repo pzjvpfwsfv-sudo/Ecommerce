@@ -150,12 +150,16 @@ function Assert-Chapter105FixedTableReadable {
 }
 
 function Assert-Chapter105FixedTableLocation {
+    $expected = 's3a://warehouse/iceberg/analytics.db/user_behavior_detail'
     $lines = @(Invoke-Chapter105Trino -Sql 'SHOW CREATE TABLE lakehouse.analytics.user_behavior_detail' `
         -FailureMessage 'Trino fixed table location validation failed.')
     $rendered = $lines -join "`n"
-    if ($rendered -notmatch "(?s)location\s*=\s*'s3a://warehouse/iceberg/analytics\.db/user_behavior_detail'") {
+    $locations = [regex]::Matches($rendered, "(?im)(?:^|[\s,(])location\s*=\s*'(?<value>[^']*)'")
+    if ($locations.Count -ne 1 -or
+        -not $locations[0].Groups['value'].Value.Equals($expected, [System.StringComparison]::Ordinal)) {
         throw 'Trino fixed table location is invalid.'
     }
+    return 'validated'
 }
 
 function Get-Chapter105MetadataNames {

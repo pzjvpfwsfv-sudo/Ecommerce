@@ -160,6 +160,25 @@ try {{ Set-AcceptanceRestartRecoveryState -StateRoot "{run_root}" -RunId "abcdef
             self.assertEqual(str(state_dir / "acceptance-restart-recovery.json"), payload["recovery"])
             self.assertEqual("Isolated restart recovery state is unsafe.", payload["wrong"])
 
+    def test_first_isolated_recovery_plan_ignores_repository_task4_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state_root = root / "tmp" / "chapter-10-5" / "acceptance" / "abcdef123456"
+            state_root.mkdir(parents=True)
+            foreign = root / "tmp" / "chapter-9"
+            foreign.mkdir(parents=True)
+            (foreign / "cutover-manifest.json").write_text("foreign", encoding="utf-8")
+            payload = self._payload(f'''
+. "scripts/bootstrap_chapter_10_5.ps1" -FunctionsOnly
+function Get-Chapter9StateUri {{ param($Kind,$Environment); return [string]$Environment.CHAPTER9_SAVEPOINT_URI }}
+function Assert-CutoverSavepointPath {{ param($Path); return $Path }}
+$plan=Get-Chapter105Task4RecoveryPlan -RepositoryRoot "{root}" `
+  -SavepointUri "s3a://flink-state/savepoints/chapter-9" -StateRoot "{state_root}"
+[ordered]@{{action=$plan.action;savepoint=$plan.savepoint_path}}|ConvertTo-Json -Compress
+''')
+            self.assertEqual("fresh", payload["action"])
+            self.assertIsNone(payload["savepoint"])
+
     def test_recursive_cleanup_path_rejects_junction_and_run_id_mismatch(self):
         with tempfile.TemporaryDirectory(dir=ROOT / "tmp" / "chapter-10-5") as directory:
             base = Path(directory)
@@ -202,6 +221,51 @@ try { Invoke-AcceptanceProcess -FilePath "powershell" -Arguments @("-NoProfile",
         self.assertEqual(["native argument ok"], payload["output"])
         self.assertEqual("Chapter 10.5 acceptance deadline expired.", payload["caught"])
 
+    def test_native_timeout_kills_descendant_before_it_can_mutate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            marker = root / "descendant-mutated.txt"
+            ready = root / "descendant-ready.txt"
+            parent = root / "parent.ps1"
+            child_source = (
+                f'[IO.File]::WriteAllText("{ready}", "ready")\n'
+                'Start-Sleep -Milliseconds 3000\n'
+                f'[IO.File]::WriteAllText("{marker}", "mutated")\n'
+            )
+            encoded = __import__("base64").b64encode(child_source.encode("utf-16-le")).decode("ascii")
+            parent.write_text(
+                f'Start-Process powershell -WindowStyle Hidden -ArgumentList @("-NoProfile","-EncodedCommand","{encoded}")\n'
+                'Start-Sleep -Seconds 10\n',
+                encoding="utf-8",
+            )
+            payload = self._payload(f'''
+. "scripts/verify_chapter_10_5_cold_start.ps1" -FunctionsOnly
+$caught=$null
+try {{ Invoke-AcceptanceProcess -FilePath "powershell" -Arguments @("-NoProfile","-File","{parent}") `
+  -Deadline ([DateTimeOffset]::UtcNow.AddMilliseconds(1500)) -FailureMessage "native failed" }} catch {{ $caught=$_.Exception.Message }}
+Start-Sleep -Milliseconds 3500
+[ordered]@{{caught=$caught;ready=(Test-Path -LiteralPath "{ready}");mutated=(Test-Path -LiteralPath "{marker}")}}|ConvertTo-Json -Compress
+''')
+            self.assertEqual("Chapter 10.5 acceptance deadline expired.", payload["caught"])
+            self.assertTrue(payload["ready"])
+            self.assertFalse(payload["mutated"])
+
+    def test_recursive_boundary_scan_runs_in_bounded_child_process(self):
+        payload = self._payload(r'''
+. "scripts/verify_chapter_10_5_cold_start.ps1" -FunctionsOnly
+$script:call=$null
+function Invoke-AcceptanceProcess { param($FilePath,$Arguments,$Deadline,$FailureMessage)
+  $script:call=[ordered]@{file=$FilePath;argv=@($Arguments);deadline=$Deadline.ToString('o')}
+  return @('{"exists":true,"files":[]}')
+}
+$deadline=[DateTimeOffset]::Parse("2026-08-27T12:34:56Z")
+$boundary=Get-AcceptanceDirectoryBoundary -Path "C:\bounded-state" -Deadline $deadline
+[ordered]@{boundary=$boundary;call=$script:call}|ConvertTo-Json -Depth 8 -Compress
+''')
+        self.assertTrue(payload["boundary"]["exists"])
+        self.assertEqual("powershell", payload["call"]["file"])
+        self.assertEqual("2026-08-27T12:34:56.0000000+00:00", payload["call"]["deadline"])
+
     def test_frozen_environment_overrides_ambient_values_and_restores_them(self):
         payload = self._payload(r'''
 . "scripts/verify_chapter_10_5_cold_start.ps1" -FunctionsOnly
@@ -215,10 +279,48 @@ $after=[Environment]::GetEnvironmentVariable("PROJECT_NAME", "Process")
         self.assertEqual("chapter105-acceptance-123456789abc", payload["during"])
         self.assertEqual("ambient-default", payload["after"])
 
+    def test_complete_isolated_environment_overrides_ambient_internal_endpoints(self):
+        payload = self._payload(r'''
+. "scripts/verify_chapter_10_5_cold_start.ps1" -FunctionsOnly
+$reference=[ordered]@{PROJECT_NAME='reference';API_BIND_HOST='0.0.0.0';TRINO_BASE_URL='http://foreign:8080';FLINK_REST_URL='http://foreign:8081';KAFKA_CONTROLLER_HOST='foreign';KAFKA_CONTROLLER_PORT='19093';CHAPTER9_PRODUCTION_JOB_NAME='foreign-job'}
+$actual=[ordered]@{PROJECT_NAME='actual';TRINO_BASE_URL='http://default-redirect:8080';FLINK_REST_URL='http://default-redirect:8081'}
+$isolation=[ordered]@{PROJECT_NAME='chapter105-acceptance-123456789abc';MINIO_DATA_DIR='C:\safe\minio-data';DORIS_INTERNAL_QUERY_PORT='9030'}
+[Environment]::SetEnvironmentVariable('TRINO_BASE_URL','http://ambient-redirect:8080','Process')
+$values=New-AcceptanceIsolatedEnvironment -ReferenceValues $reference -DefaultValues $actual -IsolationValues $isolation
+$previous=Set-AcceptanceEnvironment -Values $values
+$during=[Environment]::GetEnvironmentVariable('TRINO_BASE_URL','Process')
+Restore-AcceptanceEnvironment -Previous $previous
+[ordered]@{values=$values;during=$during;after=[Environment]::GetEnvironmentVariable('TRINO_BASE_URL','Process')}|ConvertTo-Json -Depth 8 -Compress
+''')
+        values = payload["values"]
+        self.assertEqual("127.0.0.1", values["API_BIND_HOST"])
+        self.assertEqual("http://trino:8080", values["TRINO_BASE_URL"])
+        self.assertEqual("http://flink-jobmanager:8081", values["FLINK_REST_URL"])
+        self.assertEqual("kafka-controller", values["KAFKA_CONTROLLER_HOST"])
+        self.assertEqual("9093", values["KAFKA_CONTROLLER_PORT"])
+        self.assertEqual("chapter-9-datastream-quality-production", values["CHAPTER9_PRODUCTION_JOB_NAME"])
+        self.assertEqual("http://trino:8080", payload["during"])
+        self.assertEqual("http://ambient-redirect:8080", payload["after"])
+
+    def test_complete_isolated_environment_defines_every_compose_interpolation(self):
+        payload = self._payload(r'''
+. "scripts/verify_chapter_10_5_cold_start.ps1" -FunctionsOnly
+$reference=Read-AcceptanceEnv -Path "infra/.env.example"
+$values=New-AcceptanceIsolatedEnvironment -ReferenceValues $reference -DefaultValues ([ordered]@{}) `
+  -IsolationValues ([ordered]@{PROJECT_NAME='chapter105-acceptance-123456789abc';MINIO_DATA_DIR='C:\safe\minio-data'})
+$compose=Get-Content -LiteralPath "infra/docker-compose.yml" -Raw -Encoding UTF8
+$names=@([regex]::Matches($compose,'(?<!\$)\$\{(?<name>[A-Z0-9_]+)')|ForEach-Object{$_.Groups['name'].Value}|Sort-Object -Unique)
+$missing=@($names|Where-Object{-not $values.Contains($_)})
+[ordered]@{compose_variables=$names.Count;missing=$missing;controlled_values=$values.Count}|ConvertTo-Json -Compress
+''')
+        self.assertGreater(payload["compose_variables"], 60)
+        self.assertEqual([], payload["missing"])
+        self.assertGreaterEqual(payload["controlled_values"], payload["compose_variables"])
+
     def test_rendered_compose_preflight_rejects_redirected_identity(self):
         payload = self._payload(r'''
 . "scripts/verify_chapter_10_5_cold_start.ps1" -FunctionsOnly
-$valid='{"name":"chapter105-acceptance-123456789abc","networks":{"platform-net":{"name":"chapter105-acceptance-123456789abc-net"}},"services":{"minio":{"container_name":"chapter105-acceptance-123456789abc-minio","volumes":[{"type":"bind","source":"C:\\safe\\minio-data","target":"/data"}]},"api":{"environment":{"DORIS_PORT":"9030"}}}}'
+$valid='{"name":"chapter105-acceptance-123456789abc","networks":{"platform-net":{"name":"chapter105-acceptance-123456789abc-net"}},"services":{"minio":{"container_name":"chapter105-acceptance-123456789abc-minio","volumes":[{"type":"bind","source":"C:\\safe\\minio-data","target":"/data"}]},"api":{"environment":{"DORIS_HOST":"doris-fe","DORIS_PORT":"9030"}}}}'
 $ok=Assert-AcceptanceRenderedConfig -ConfigJson $valid -ProjectName "chapter105-acceptance-123456789abc" -MinioContainerName "chapter105-acceptance-123456789abc-minio" -MinioDataPath "C:\safe\minio-data"
 $bad=$valid.Replace("chapter105-acceptance-123456789abc-net", "ecommerce-lakehouse-ai-net")
 $caught=$null
@@ -236,6 +338,8 @@ $expected=[ordered]@{
   PROJECT_NAME=$project; MINIO_CONTAINER_NAME="$project-minio"; MINIO_DATA_DIR="C:\safe\minio-data"
   DORIS_INTERNAL_QUERY_PORT="9030"; DORIS_NETWORK_SUBNET="172.30.40.0/24"; DORIS_NETWORK_IP_RANGE="172.30.40.128/25"
   DORIS_FE_STATIC_IP="172.30.40.2"; DORIS_BE_STATIC_IP="172.30.40.3"; API_PORT="25001"; DORIS_FE_QUERY_PORT="25002"
+  API_BIND_HOST="127.0.0.1"; TRINO_BASE_URL="http://trino:8080"; FLINK_REST_URL="http://flink-jobmanager:8081"
+  CHAPTER9_PRODUCTION_JOB_NAME="chapter-9-datastream-quality-production"; KAFKA_CONTROLLER_HOST="kafka-controller"; KAFKA_CONTROLLER_PORT="9093"
 }
 $config=[ordered]@{
   name=$project
@@ -245,13 +349,15 @@ $config=[ordered]@{
   }
   services=[ordered]@{
     minio=[ordered]@{container_name="$project-minio";volumes=@([ordered]@{type="bind";source="C:\safe\minio-data";target="/data"})}
-    api=[ordered]@{container_name="$project-api";environment=[ordered]@{DORIS_PORT="9030"};ports=@([ordered]@{target=8000;published="25001"})}
+    api=[ordered]@{container_name="$project-api";environment=[ordered]@{DORIS_HOST="doris-fe";DORIS_PORT="9030";TRINO_BASE_URL="http://trino:8080";FLINK_REST_URL="http://flink-jobmanager:8081";CHAPTER9_PRODUCTION_JOB_NAME="chapter-9-datastream-quality-production"};ports=@([ordered]@{host_ip="127.0.0.1";target=8000;published="25001"})}
+    'kafka-controller'=[ordered]@{environment=[ordered]@{KAFKA_CONTROLLER_QUORUM_VOTERS="1@kafka-controller:9093"}}
+    'kafka-broker'=[ordered]@{environment=[ordered]@{KAFKA_CONTROLLER_QUORUM_VOTERS="1@kafka-controller:9093"}}
     'doris-fe'=[ordered]@{container_name="$project-doris-fe";ports=@([ordered]@{target=9030;published="25002"});networks=[ordered]@{custom_network=[ordered]@{ipv4_address="172.30.40.2"}}}
     'doris-be'=[ordered]@{container_name="$project-doris-be";networks=[ordered]@{custom_network=[ordered]@{ipv4_address="172.30.40.3"}}}
   }
 }
 $ok=Assert-AcceptanceRenderedConfig -ConfigJson ($config|ConvertTo-Json -Depth 20 -Compress) -ExpectedValues $expected
-$config.services.api.ports[0].published="8000"
+$config.services.api.environment.TRINO_BASE_URL="http://foreign:8080"
 $caught=$null
 try { Assert-AcceptanceRenderedConfig -ConfigJson ($config|ConvertTo-Json -Depth 20 -Compress) -ExpectedValues $expected } catch { $caught=$_.Exception.Message }
 [ordered]@{ok=$ok;caught=$caught}|ConvertTo-Json -Compress
@@ -278,6 +384,10 @@ try { Assert-AcceptanceRenderedConfig -ConfigJson ($config|ConvertTo-Json -Depth
                 "DORIS_FE_EDIT_LOG_PORT": "25106", "DORIS_BE_HTTP_PORT": "25107",
                 "DORIS_BE_HEARTBEAT_PORT": "25108", "MINIO_API_PORT": "25109",
                 "MINIO_CONSOLE_PORT": "25110", "TRINO_PORT": "25111",
+                "API_BIND_HOST": "127.0.0.1", "TRINO_BASE_URL": "http://trino:8080",
+                "FLINK_REST_URL": "http://flink-jobmanager:8081",
+                "CHAPTER9_PRODUCTION_JOB_NAME": "chapter-9-datastream-quality-production",
+                "KAFKA_CONTROLLER_HOST": "kafka-controller", "KAFKA_CONTROLLER_PORT": "9093",
             }
             container_keys = {
                 "KAFKA_CONTROLLER_CONTAINER_NAME": "kafka-controller", "KAFKA_CONTAINER_NAME": "kafka",
@@ -391,6 +501,7 @@ try { Assert-AcceptanceContinuity -RowCountInitial 10 -RowCountBeforeRestart 10 
             payload = self._payload(f'''
 . "scripts/verify_chapter_10_5_cold_start.ps1" -FunctionsOnly
 $script:process=$null
+$script:originalProcess=(Get-Command Invoke-AcceptanceProcess).ScriptBlock
 function Invoke-AcceptanceDocker {{ param($Arguments,$Deadline,$FailureMessage)
   if ($Arguments -contains 'config') {{
     $config=[ordered]@{{name='real-default';services=[ordered]@{{minio=[ordered]@{{volumes=@([ordered]@{{type='bind';source='{minio}';target='/data'}})}}}}}}
@@ -398,7 +509,13 @@ function Invoke-AcceptanceDocker {{ param($Arguments,$Deadline,$FailureMessage)
   }}
   return @()
 }}
-function Invoke-AcceptanceProcess {{ param($FilePath,$Arguments,$Deadline,$FailureMessage); $script:process=[ordered]@{{file=$FilePath;deadline=$Deadline.ToString('o');argv=@($Arguments)}}; return @("{root / '.git'}") }}
+function Invoke-AcceptanceProcess {{ param($FilePath,$Arguments,$Deadline,$FailureMessage)
+  if ($FilePath -ceq 'git') {{
+    $script:process=[ordered]@{{file=$FilePath;deadline=$Deadline.ToString('o');argv=@($Arguments)}}
+    return @("{root / '.git'}")
+  }}
+  return & $script:originalProcess -FilePath $FilePath -Arguments $Arguments -Deadline $Deadline -FailureMessage $FailureMessage
+}}
 $deadline=[DateTimeOffset]::Parse("2026-08-27T12:34:56Z")
 $state=Get-AcceptanceDefaultProjectState -RepositoryRoot "{root}" -DefaultEnvPath "{root / 'infra.env'}" -Deadline $deadline
 [ordered]@{{minio=$state.minio_data_path;files=@($state.minio_data.files).Count;process=$script:process}}|ConvertTo-Json -Depth 10 -Compress
@@ -435,7 +552,11 @@ Remove-AcceptanceOwnedResources -ComposePrefix $prefix -ProjectName 'chapter105-
             report.write_text(json.dumps({
                 "status": "passed", "started_at": "2026-08-27T00:00:00Z", "completed_at": "2026-08-27T00:01:00Z",
                 "stages": {name: {"status": "passed", "started_at": "2026-08-27T00:00:00Z", "completed_at": "2026-08-27T00:01:00Z",
-                    "details": ({"action": "no_op", "job_id": "1" * 32} if name == "jobs" else ({"action": "already_registered"} if name == "catalog" else {}))}
+                    "details": ({"action": "no_op", "job_id": "1" * 32} if name == "jobs" else ({"action": "already_registered"} if name == "catalog" else ({
+                        "topic": {"name": "user_behavior_events", "action": "no_op"},
+                        "doris": {"name": "analytics.realtime_metrics", "action": "no_op"},
+                        "minio_buckets": [{"name": "warehouse", "action": "no_op"}, {"name": "flink-state", "action": "no_op"}],
+                    } if name == "initialization" else {})))}
                     for name in ("preflight", "dependencies", "infrastructure", "initialization", "catalog", "jobs", "acceptance")},
             }), encoding="utf-8")
             payload = self._payload(f'''
@@ -449,6 +570,52 @@ try {{ Get-AcceptanceBootstrapEvidence -Path "{report}" -ExpectedJobAction "subm
             self.assertEqual("no_op", payload["action"])
             self.assertEqual("already_registered", payload["catalog"])
             self.assertEqual("Bootstrap phase report is invalid.", payload["error"])
+
+    def test_bootstrap_initialization_reports_stable_actions_and_second_run_requires_no_op(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory) / "abcdef123456"
+            state_root.mkdir()
+            payload = self._payload(f'''
+. "scripts/bootstrap_chapter_10_5.ps1" -FunctionsOnly
+$script:calls=@()
+function Invoke-Chapter105Native {{ param($FilePath,$Arguments,$FailureMessage); $script:calls += ,@($Arguments); return @() }}
+$first=Invoke-Chapter105Initialization -ComposePrefix @('compose') -EnvPath 'C:\\run\\isolated.env' `
+  -ComposeProjectName 'chapter105-acceptance-abcdef123456' -StateRoot '{state_root}'
+$firstCalls=$script:calls.Count
+$second=Invoke-Chapter105Initialization -ComposePrefix @('compose') -EnvPath 'C:\\run\\isolated.env' `
+  -ComposeProjectName 'chapter105-acceptance-abcdef123456' -StateRoot '{state_root}'
+[ordered]@{{first=$first;second=$second;first_calls=$firstCalls;total_calls=$script:calls.Count}}|ConvertTo-Json -Depth 10 -Compress
+''')
+            self.assertEqual("created", payload["first"]["topic"]["action"])
+            self.assertEqual("created", payload["first"]["doris"]["action"])
+            self.assertTrue(all(item["action"] == "created" for item in payload["first"]["minio_buckets"]))
+            self.assertEqual("no_op", payload["second"]["topic"]["action"])
+            self.assertEqual("no_op", payload["second"]["doris"]["action"])
+            self.assertTrue(all(item["action"] == "no_op" for item in payload["second"]["minio_buckets"]))
+            self.assertGreater(payload["first_calls"], 0)
+            self.assertEqual(payload["first_calls"], payload["total_calls"])
+
+    def test_bootstrap_report_rejects_second_run_with_non_no_op_initialization(self):
+        with tempfile.TemporaryDirectory() as directory:
+            report = Path(directory) / "bootstrap.json"
+            details = {
+                "topic": {"name": "user_behavior_events", "action": "created"},
+                "doris": {"name": "analytics.realtime_metrics", "action": "no_op"},
+                "minio_buckets": [{"name": "warehouse", "action": "no_op"}, {"name": "flink-state", "action": "no_op"}],
+            }
+            report.write_text(json.dumps({
+                "status": "passed", "started_at": "2026-08-27T00:00:00Z", "completed_at": "2026-08-27T00:01:00Z",
+                "stages": {name: {"status": "passed", "started_at": "2026-08-27T00:00:00Z", "completed_at": "2026-08-27T00:01:00Z",
+                    "details": ({"action": "no_op", "job_id": "1" * 32} if name == "jobs" else ({"action": "already_registered"} if name == "catalog" else (details if name == "initialization" else {})))}
+                    for name in ("preflight", "dependencies", "infrastructure", "initialization", "catalog", "jobs", "acceptance")},
+            }), encoding="utf-8")
+            payload = self._payload(f'''
+. "scripts/verify_chapter_10_5_cold_start.ps1" -FunctionsOnly
+$caught=$null
+try {{ Get-AcceptanceBootstrapEvidence -Path "{report}" -ExpectedJobAction no_op -RequireInitializationNoOp }} catch {{ $caught=$_.Exception.Message }}
+[ordered]@{{caught=$caught}}|ConvertTo-Json -Compress
+''')
+            self.assertEqual("Bootstrap phase report is invalid.", payload["caught"])
 
     def test_fixed_catalog_initialization_and_existing_table_validation_use_fixed_location(self):
         payload = self._payload(r'''
@@ -465,6 +632,26 @@ try { Assert-Chapter105FixedTableLocation } catch { $caught=$_.Exception.Message
         self.assertTrue(any("s3a://warehouse/iceberg/analytics.db" in sql for sql in payload["sql"]))
         self.assertTrue(any("s3a://warehouse/iceberg/analytics.db/user_behavior_detail" in sql for sql in payload["sql"]))
         self.assertEqual("Trino fixed table location is invalid.", payload["error"])
+
+    def test_fixed_table_location_is_ordinal_and_unambiguous(self):
+        payload = self._payload(r'''
+. "scripts/restore_chapter_10_5_catalog.ps1" -FunctionsOnly
+$script:mode='exact'
+function Invoke-Chapter105Trino { param($Sql,$FailureMessage)
+  if ($script:mode -ceq 'case') { return @('Create Table',"CREATE TABLE x WITH ( location = 's3a://warehouse/iceberg/Analytics.db/user_behavior_detail' )") }
+  if ($script:mode -ceq 'duplicate') { return @('Create Table',"CREATE TABLE x WITH ( location = 's3a://warehouse/iceberg/analytics.db/user_behavior_detail', location = 's3a://warehouse/iceberg/analytics.db/user_behavior_detail' )") }
+  return @('Create Table',"CREATE TABLE x WITH ( location = 's3a://warehouse/iceberg/analytics.db/user_behavior_detail' )")
+}
+$exact=Assert-Chapter105FixedTableLocation
+$script:mode='case';$caseError=$null
+try { Assert-Chapter105FixedTableLocation } catch { $caseError=$_.Exception.Message }
+$script:mode='duplicate';$duplicateError=$null
+try { Assert-Chapter105FixedTableLocation } catch { $duplicateError=$_.Exception.Message }
+[ordered]@{exact=$exact;case_error=$caseError;duplicate_error=$duplicateError}|ConvertTo-Json -Compress
+''')
+        self.assertEqual("validated", payload["exact"])
+        self.assertEqual("Trino fixed table location is invalid.", payload["case_error"])
+        self.assertEqual("Trino fixed table location is invalid.", payload["duplicate_error"])
 
     def test_compose_keeps_legacy_defaults_and_splits_doris_internal_port(self):
         result = subprocess.run(

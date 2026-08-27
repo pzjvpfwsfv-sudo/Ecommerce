@@ -307,6 +307,7 @@ function Get-Chapter105Task4RecoveryPlan {
                 throw 'Task 4 recovery state is invalid.'
             }
         }
+        return [pscustomobject]@{ action = 'fresh'; savepoint_path = $null }
     }
     $task4StateRoot = Join-Path $RepositoryRoot 'tmp\chapter-9'
     $finalPath = Join-Path $task4StateRoot 'cutover-manifest.json'
@@ -488,6 +489,69 @@ function Initialize-Chapter105EmptyCatalog {
             'exec', '-T', 'trino', 'trino', '--server', 'http://localhost:8080',
             '--catalog', 'lakehouse', '--execute', $statement
         )) -FailureMessage 'Isolated empty catalog initialization failed.' | Out-Null
+    }
+}
+
+function Invoke-Chapter105Initialization {
+    param(
+        [Parameter(Mandatory = $true)][string[]]$ComposePrefix,
+        [Parameter(Mandatory = $true)][string]$EnvPath,
+        [string]$ComposeProjectName,
+        [string]$StateRoot
+    )
+
+    $statePath = if ($StateRoot) { Join-Path $StateRoot 'tmp\chapter-10-5\initialization-state.json' } else { $null }
+    $action = 'created'
+    if ($statePath -and (Test-Path -LiteralPath $statePath -PathType Leaf)) {
+        try {
+            $state = Get-Content -LiteralPath $statePath -Raw -Encoding UTF8 | ConvertFrom-Json -ErrorAction Stop
+            if ([int]$state.schema_version -ne 1 -or [string]$state.kind -cne 'chapter10_5_initialization' -or
+                [string]$state.status -cne 'initialized' -or
+                (@($state.resources) -join ',') -cne 'user_behavior_events,analytics.realtime_metrics,warehouse,flink-state') {
+                throw 'invalid state'
+            }
+            $action = 'no_op'
+        } catch {
+            throw 'Chapter 10.5 initialization state is invalid.'
+        }
+    }
+
+    if ($action -ceq 'created') {
+        Invoke-Chapter105Native -FilePath 'docker' -Arguments ($ComposePrefix + @(
+            'exec', '-T', 'kafka-broker', 'kafka-topics', '--bootstrap-server', 'kafka-broker:29092',
+            '--create', '--if-not-exists', '--topic', 'user_behavior_events', '--partitions', '1', '--replication-factor', '1'
+        )) -FailureMessage 'Kafka topic initialization failed.' | Out-Null
+        $dorisArguments = @(
+            '-NoProfile', '-File', (Join-Path $PSScriptRoot 'init_doris_realtime_metrics.ps1'),
+            '-EnvFile', $EnvPath
+        )
+        if (-not [string]::IsNullOrWhiteSpace($ComposeProjectName)) {
+            $dorisArguments += @('-ComposeProjectName', $ComposeProjectName)
+        }
+        Invoke-Chapter105Native -FilePath 'powershell' -Arguments $dorisArguments `
+            -FailureMessage 'Doris initialization failed.' | Out-Null
+
+        if ($statePath) {
+            $stateDirectory = Split-Path -Parent $statePath
+            [System.IO.Directory]::CreateDirectory($stateDirectory) | Out-Null
+            $state = [ordered]@{
+                schema_version = 1; kind = 'chapter10_5_initialization'; status = 'initialized'
+                resources = @('user_behavior_events', 'analytics.realtime_metrics', 'warehouse', 'flink-state')
+                completed_at_utc = [DateTimeOffset]::UtcNow.ToString('o')
+            }
+            $partial = "$statePath.partial.$([Guid]::NewGuid().ToString('N'))"
+            [System.IO.File]::WriteAllText($partial, ($state | ConvertTo-Json -Depth 6), [System.Text.UTF8Encoding]::new($false))
+            Move-Item -LiteralPath $partial -Destination $statePath -Force
+        }
+    }
+
+    return [ordered]@{
+        topic = [ordered]@{ name = 'user_behavior_events'; action = $action }
+        doris = [ordered]@{ name = 'analytics.realtime_metrics'; action = $action }
+        minio_buckets = @(
+            [ordered]@{ name = 'warehouse'; action = $action },
+            [ordered]@{ name = 'flink-state'; action = $action }
+        )
     }
 }
 
@@ -673,20 +737,8 @@ function Invoke-Chapter105Bootstrap {
             Wait-Chapter105ComposeReady -ComposePrefix $context.ComposePrefix
         }
         Invoke-Chapter105BootstrapStage -Report $report -Name 'initialization' -Action {
-            Invoke-Chapter105Native -FilePath 'docker' -Arguments ($context.ComposePrefix + @(
-                'exec', '-T', 'kafka-broker', 'kafka-topics', '--bootstrap-server', 'kafka-broker:29092',
-                '--create', '--if-not-exists', '--topic', 'user_behavior_events', '--partitions', '1', '--replication-factor', '1'
-            )) -FailureMessage 'Kafka topic initialization failed.' | Out-Null
-            $dorisArguments = @(
-                '-NoProfile', '-File', (Join-Path $PSScriptRoot 'init_doris_realtime_metrics.ps1'),
-                '-EnvFile', $envPath
-            )
-            if (-not [string]::IsNullOrWhiteSpace($context.ComposeProjectName)) {
-                $dorisArguments += @('-ComposeProjectName', $context.ComposeProjectName)
-            }
-            Invoke-Chapter105Native -FilePath 'powershell' -Arguments $dorisArguments `
-                -FailureMessage 'Doris initialization failed.' | Out-Null
-            @{ topic = 'user_behavior_events'; doris = 'initialized'; minio_buckets = 'compose-init' }
+            Invoke-Chapter105Initialization -ComposePrefix $context.ComposePrefix -EnvPath $envPath `
+                -ComposeProjectName $context.ComposeProjectName -StateRoot $context.StateRoot
         }
         Invoke-Chapter105BootstrapStage -Report $report -Name 'catalog' -Action {
             if ($InitializeEmptyCatalog) {
