@@ -524,19 +524,154 @@ function Get-AcceptanceBootstrapEvidence {
     } catch { throw $safeError }
 }
 
+function ConvertTo-AcceptanceBuildDiagnostic {
+    param([AllowEmptyCollection()][string[]]$Lines)
+
+    $text = (@($Lines | Select-Object -Last 80) -join "`n")
+    if ([string]::IsNullOrWhiteSpace($text)) { return 'No Maven diagnostics were captured.' }
+    $text = [regex]::Replace($text, '(?i)(https?://)[^/\s:@]+:[^@\s/]+@', '$1[REDACTED]@')
+    $text = [regex]::Replace(
+        $text,
+        '(?i)(password|passwd|token|secret|access[_-]?key|secret[_-]?key)(\s*[:=]\s*)[^\s]+',
+        '$1$2[REDACTED]'
+    )
+    if ($text.Length -gt 2048) { $text = $text.Substring($text.Length - 2048) }
+    return $text
+}
+
+function Get-AcceptanceOwnedBuildContainer {
+    param(
+        [Parameter(Mandatory = $true)][string]$ContainerName,
+        [Parameter(Mandatory = $true)][string]$RunId,
+        [Parameter(Mandatory = $true)][DateTimeOffset]$Deadline
+    )
+
+    $ids = @(Invoke-AcceptanceDocker -Arguments @(
+        'ps', '-aq', '--no-trunc', '--filter', "name=^/$ContainerName$"
+    ) -Deadline $Deadline -FailureMessage 'Build container lookup failed.')
+    if ($ids.Count -eq 0) { return $null }
+    if ($ids.Count -ne 1 -or [string]$ids[0] -cnotmatch '^[a-f0-9]{64}$') {
+        throw 'Build container lookup identity is unsafe.'
+    }
+    $details = @(Invoke-AcceptanceDocker -Arguments @('inspect', '--format', '{{json .}}', [string]$ids[0]) -Deadline $Deadline `
+        -FailureMessage 'Build container ownership inspection failed.')
+    if ($details.Count -ne 1) { throw 'Build container inspection result is unsafe.' }
+    try { $container = $details[0] | ConvertFrom-Json -ErrorAction Stop }
+    catch { throw 'Build container inspection JSON is unsafe.' }
+    if ([string]$container.Id -cne [string]$ids[0] -or [string]$container.Name -cne "/$ContainerName" -or
+        [string]$container.Config.Labels.'com.ecommerce.chapter105.acceptance.run-id' -cne $RunId -or
+        [string]$container.Config.Labels.'com.ecommerce.chapter105.acceptance.role' -cne 'maven-build') {
+        throw 'Build container ownership is unsafe.'
+    }
+    return [string]$container.Id
+}
+
+function Remove-AcceptanceBuildContainer {
+    param(
+        [Parameter(Mandatory = $true)][string]$ContainerName,
+        [Parameter(Mandatory = $true)][string]$AcceptanceRoot,
+        [Parameter(Mandatory = $true)][string]$RunRoot,
+        [Parameter(Mandatory = $true)][string]$RunId,
+        [Parameter(Mandatory = $true)][DateTimeOffset]$Deadline
+    )
+
+    Assert-AcceptanceRunRoot -AcceptanceRoot $AcceptanceRoot -RunRoot $RunRoot -RunId $RunId | Out-Null
+    if ($ContainerName -cne "chapter105-acceptance-$RunId-maven") { throw 'Build container identity is unsafe.' }
+    $containerId = Get-AcceptanceOwnedBuildContainer -ContainerName $ContainerName -RunId $RunId -Deadline $Deadline
+    if ($null -ne $containerId) {
+        Invoke-AcceptanceDocker -Arguments @('rm', '-f', $containerId) -Deadline $Deadline `
+            -FailureMessage 'Build container cleanup failed.' | Out-Null
+    }
+}
+
 function Invoke-AcceptanceArtifactBuild {
     param(
         [Parameter(Mandatory = $true)][string]$RepositoryRoot,
+        [Parameter(Mandatory = $true)][string]$AcceptanceRoot,
+        [Parameter(Mandatory = $true)][string]$RunRoot,
+        [Parameter(Mandatory = $true)][string]$RunId,
         [Parameter(Mandatory = $true)][DateTimeOffset]$Deadline
     )
-    Invoke-AcceptanceProcess -FilePath 'mvn' -Arguments @(
-        '-f', (Join-Path $RepositoryRoot 'jobs/datastream-quality/pom.xml'), 'clean', '-DskipTests', 'package'
-    ) -Deadline $Deadline -FailureMessage 'Clean-checkout DataStream artifact build failed.' | Out-Null
+
+    $validatedRunRoot = Assert-AcceptanceRunRoot -AcceptanceRoot $AcceptanceRoot -RunRoot $RunRoot -RunId $RunId
+    $mavenCache = Join-Path $validatedRunRoot 'maven-cache'
+    [System.IO.Directory]::CreateDirectory($mavenCache) | Out-Null
+    Assert-AcceptanceRunRoot -AcceptanceRoot $AcceptanceRoot -RunRoot $validatedRunRoot -RunId $RunId | Out-Null
+    $cacheItem = Get-Item -LiteralPath $mavenCache -Force
+    if (($cacheItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or
+        -not ([System.IO.Path]::GetFullPath($cacheItem.Parent.FullName)).Equals(
+            [System.IO.Path]::GetFullPath($validatedRunRoot), [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw 'Acceptance Maven cache path is unsafe.'
+    }
+
+    $image = 'maven:3.9.9-eclipse-temurin-17'
+    $containerName = "chapter105-acceptance-$RunId-maven"
+    $cidFile = Join-Path $validatedRunRoot 'maven-build.cid'
+    if (Test-Path -LiteralPath $cidFile) { throw 'Acceptance Maven container identity file already exists.' }
+    $containerId = $null
+    $diagnostics = 'No Maven diagnostics were captured.'
+    $buildFailure = $null
+    $cleanupFailure = $null
+    try {
+        $created = @(Invoke-AcceptanceDocker -Arguments @(
+            'create', '--name', $containerName, '--cidfile', $cidFile,
+            '--label', "com.ecommerce.chapter105.acceptance.run-id=$RunId",
+            '--label', 'com.ecommerce.chapter105.acceptance.role=maven-build',
+            '--volume', "$RepositoryRoot`:/workspace",
+            '--volume', "$mavenCache`:/root/.m2",
+            '--workdir', '/workspace/jobs/datastream-quality',
+            $image, 'mvn', '--batch-mode', '--no-transfer-progress', 'clean', '-DskipTests', 'package'
+        ) -Deadline $Deadline -FailureMessage 'Clean-checkout DataStream build container creation failed.')
+        if ($created.Count -ne 1 -or [string]$created[0] -cnotmatch '^[a-f0-9]{64}$') {
+            throw 'Clean-checkout DataStream build container identity is invalid.'
+        }
+        $containerId = [string]$created[0]
+        $output = @(Invoke-AcceptanceDocker -Arguments @('start', '-a', $containerId) -Deadline $Deadline `
+            -FailureMessage 'Clean-checkout DataStream artifact build failed.')
+        $diagnostics = ConvertTo-AcceptanceBuildDiagnostic -Lines $output
+    } catch {
+        $buildFailure = $_.Exception.Message
+        $cleanupDeadline = [DateTimeOffset]::UtcNow.AddSeconds(15)
+        try {
+            $ownedContainerId = Get-AcceptanceOwnedBuildContainer -ContainerName $containerName -RunId $RunId -Deadline $cleanupDeadline
+            if ($null -ne $ownedContainerId) {
+                $logs = @(Invoke-AcceptanceDocker -Arguments @('logs', '--tail', '80', $ownedContainerId) -Deadline $cleanupDeadline `
+                    -FailureMessage 'Build diagnostics unavailable.')
+                if ($logs.Count -gt 0) { $diagnostics = ConvertTo-AcceptanceBuildDiagnostic -Lines $logs }
+            }
+        } catch { }
+    } finally {
+        $cleanupDeadline = [DateTimeOffset]::UtcNow.AddSeconds(15)
+        try {
+            Remove-AcceptanceBuildContainer -ContainerName $containerName -AcceptanceRoot $AcceptanceRoot `
+                -RunRoot $validatedRunRoot -RunId $RunId -Deadline $cleanupDeadline
+        } catch {
+            $cleanupFailure = $_.Exception.Message
+        }
+    }
+
+    if ($null -ne $cleanupFailure) {
+        throw "Clean-checkout DataStream build container cleanup failed: $containerName. $cleanupFailure Diagnostics: $diagnostics"
+    }
+    if ($null -ne $buildFailure) {
+        $failurePrefix = if ($buildFailure -ceq 'Chapter 10.5 acceptance deadline expired.') {
+            $buildFailure
+        } else {
+            'Clean-checkout DataStream artifact build failed.'
+        }
+        throw "$failurePrefix Diagnostics: $diagnostics"
+    }
     $jar = Join-Path $RepositoryRoot 'jobs/datastream-quality/target/datastream-quality-1.0.0.jar'
     if (-not (Test-Path -LiteralPath $jar -PathType Leaf) -or (Get-Item -LiteralPath $jar).Length -lt 1) {
         throw 'Clean-checkout DataStream artifact is missing.'
     }
-    return $jar
+    return [ordered]@{
+        jar_path = $jar
+        image = $image
+        container_name = $containerName
+        cache = 'maven-cache'
+        diagnostics = $diagnostics
+    }
 }
 
 function Invoke-AcceptanceBoundarySnapshot {
@@ -817,7 +952,15 @@ function Invoke-Chapter105ColdStartVerification {
     $completed = $false
     try {
         Invoke-AcceptanceDocker -Arguments @('info') -Deadline $deadline -FailureMessage 'Docker engine is unavailable.' | Out-Null
-        $jar = Invoke-AcceptanceArtifactBuild -RepositoryRoot $repositoryRoot -Deadline $deadline
+        $build = Invoke-AcceptanceArtifactBuild -RepositoryRoot $repositoryRoot -AcceptanceRoot $acceptanceRoot `
+            -RunRoot $runRoot -RunId $runId -Deadline $deadline
+        $jar = [string]$build.jar_path
+        $report.evidence.artifact_build = [ordered]@{
+            image = [string]$build.image
+            container_name = [string]$build.container_name
+            cache = [string]$build.cache
+            diagnostics = [string]$build.diagnostics
+        }
 
         $report.default_project_before = Get-AcceptanceDefaultProjectState -RepositoryRoot $repositoryRoot -DefaultEnvPath $defaultEnvPath -Deadline $deadline
         $subnet = Get-AcceptanceSubnet -Deadline $deadline

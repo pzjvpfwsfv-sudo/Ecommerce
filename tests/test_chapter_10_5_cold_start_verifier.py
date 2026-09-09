@@ -501,28 +501,119 @@ $script:call | ConvertTo-Json -Depth 5 -Compress
         self.assertEqual("chapter105-acceptance-123456789abc", payload["argv"][payload["argv"].index("-ComposeProjectName") + 1])
         self.assertEqual("C:\\run\\isolated.env", payload["argv"][payload["argv"].index("-EnvFile") + 1])
 
-    def test_clean_checkout_artifact_build_uses_clean_package_before_preflight(self):
-        with tempfile.TemporaryDirectory() as directory:
+    def test_clean_checkout_artifact_build_uses_owned_java17_container_and_run_cache(self):
+        with tempfile.TemporaryDirectory(dir=ROOT / "tmp" / "chapter-10-5") as directory:
             root = Path(directory)
+            acceptance = root / "acceptance"
+            run_id = "123456789abc"
+            run_root = acceptance / run_id
+            run_root.mkdir(parents=True)
             (root / "jobs" / "datastream-quality").mkdir(parents=True)
             payload = self._payload(f'''
 . "scripts/verify_chapter_10_5_cold_start.ps1" -FunctionsOnly
-$script:call=$null
-function Invoke-AcceptanceProcess {{ param($FilePath,$Arguments,$Deadline,$FailureMessage)
-  $script:call=[ordered]@{{file=$FilePath;argv=@($Arguments);deadline=$Deadline.ToString('o')}}
-  $target=Join-Path "{root}" 'jobs/datastream-quality/target'
-  [IO.Directory]::CreateDirectory($target)|Out-Null
-  [IO.File]::WriteAllBytes((Join-Path $target 'datastream-quality-1.0.0.jar'),[byte[]](1,2,3))
+$script:calls=@()
+$script:containerId='{'1' * 64}'
+function Invoke-AcceptanceDocker {{ param($Arguments,$Deadline,$FailureMessage)
+  $script:calls += ,[ordered]@{{argv=@($Arguments);deadline=$Deadline.ToString('o')}}
+  if ($Arguments[0] -ceq 'create') {{ return @($script:containerId) }}
+  if ($Arguments[0] -ceq 'start') {{
+    $target=Join-Path "{root}" 'jobs/datastream-quality/target'
+    [IO.Directory]::CreateDirectory($target)|Out-Null
+    [IO.File]::WriteAllBytes((Join-Path $target 'datastream-quality-1.0.0.jar'),[byte[]](1,2,3))
+    return @('[INFO] BUILD SUCCESS','[INFO] Total time: 1.2 s')
+  }}
+  if ($Arguments[0] -ceq 'ps') {{ return @($script:containerId) }}
+  if ($Arguments[0] -ceq 'inspect') {{
+    return @(([ordered]@{{Id=$script:containerId;Name='/chapter105-acceptance-{run_id}-maven';Config=[ordered]@{{Labels=[ordered]@{{'com.ecommerce.chapter105.acceptance.run-id'='{run_id}';'com.ecommerce.chapter105.acceptance.role'='maven-build'}}}}}}|ConvertTo-Json -Depth 8 -Compress))
+  }}
+  return @()
 }}
-$deadline=[DateTimeOffset]::Parse("2026-08-27T12:34:56Z")
-$jar=Invoke-AcceptanceArtifactBuild -RepositoryRoot "{root}" -Deadline $deadline
-[ordered]@{{jar=$jar;call=$script:call}}|ConvertTo-Json -Depth 5 -Compress
+$deadline=[DateTimeOffset]::UtcNow.AddMinutes(2)
+$result=Invoke-AcceptanceArtifactBuild -RepositoryRoot "{root}" -AcceptanceRoot "{acceptance}" `
+  -RunRoot "{run_root}" -RunId "{run_id}" -Deadline $deadline
+[ordered]@{{result=$result;calls=$script:calls}}|ConvertTo-Json -Depth 8 -Compress
 ''')
-            self.assertEqual("mvn", payload["call"]["file"])
-            self.assertIn("clean", payload["call"]["argv"])
-            self.assertIn("package", payload["call"]["argv"])
-            self.assertEqual("2026-08-27T12:34:56.0000000+00:00", payload["call"]["deadline"])
-            self.assertTrue(payload["jar"].endswith("datastream-quality-1.0.0.jar"))
+            create = payload["calls"][0]["argv"]
+            self.assertEqual("create", create[0])
+            self.assertIn("maven:3.9.9-eclipse-temurin-17", create)
+            self.assertIn("--batch-mode", create)
+            self.assertIn("--no-transfer-progress", create)
+            self.assertIn("clean", create)
+            self.assertIn("package", create)
+            self.assertIn(f"{run_root / 'maven-cache'}:/root/.m2", create)
+            self.assertNotIn("ecommerce-maven-cache:/root/.m2", create)
+            self.assertEqual(f"chapter105-acceptance-{run_id}-maven", create[create.index("--name") + 1])
+            self.assertEqual(str(run_root / "maven-build.cid"), create[create.index("--cidfile") + 1])
+            self.assertTrue(any(call["argv"][:2] == ["rm", "-f"] for call in payload["calls"]))
+            self.assertTrue(payload["result"]["jar_path"].endswith("datastream-quality-1.0.0.jar"))
+            self.assertEqual("maven:3.9.9-eclipse-temurin-17", payload["result"]["image"])
+            self.assertLessEqual(len(payload["result"]["diagnostics"]), 2048)
+
+    def test_artifact_build_failure_redacts_diagnostics_and_removes_owned_container(self):
+        with tempfile.TemporaryDirectory(dir=ROOT / "tmp" / "chapter-10-5") as directory:
+            root = Path(directory)
+            acceptance = root / "acceptance"
+            run_id = "abcdef123456"
+            run_root = acceptance / run_id
+            run_root.mkdir(parents=True)
+            (root / "jobs" / "datastream-quality").mkdir(parents=True)
+            payload = self._payload(f'''
+. "scripts/verify_chapter_10_5_cold_start.ps1" -FunctionsOnly
+$script:calls=@()
+$script:containerId='{'2' * 64}'
+function Invoke-AcceptanceDocker {{ param($Arguments,$Deadline,$FailureMessage)
+  $script:calls += ,@($Arguments)
+  if ($Arguments[0] -ceq 'create') {{ return @($script:containerId) }}
+  if ($Arguments[0] -ceq 'start') {{ throw 'Clean-checkout DataStream artifact build failed.' }}
+  if ($Arguments[0] -ceq 'logs') {{ return @('[ERROR] Failed to execute goal','password=hunter2 token=abc123') }}
+  if ($Arguments[0] -ceq 'ps') {{ return @($script:containerId) }}
+  if ($Arguments[0] -ceq 'inspect') {{
+    return @(([ordered]@{{Id=$script:containerId;Name='/chapter105-acceptance-{run_id}-maven';Config=[ordered]@{{Labels=[ordered]@{{'com.ecommerce.chapter105.acceptance.run-id'='{run_id}';'com.ecommerce.chapter105.acceptance.role'='maven-build'}}}}}}|ConvertTo-Json -Depth 8 -Compress))
+  }}
+  return @()
+}}
+$errorText=$null
+try {{ Invoke-AcceptanceArtifactBuild -RepositoryRoot "{root}" -AcceptanceRoot "{acceptance}" `
+  -RunRoot "{run_root}" -RunId "{run_id}" -Deadline ([DateTimeOffset]::UtcNow.AddMinutes(2)) }} catch {{ $errorText=$_.Exception.Message }}
+[ordered]@{{error=$errorText;calls=$script:calls}}|ConvertTo-Json -Depth 8 -Compress
+''')
+            self.assertIn("Failed to execute goal", payload["error"])
+            self.assertNotIn("hunter2", payload["error"])
+            self.assertNotIn("abc123", payload["error"])
+            self.assertIn("[REDACTED]", payload["error"])
+            self.assertTrue(any(call[:2] == ["rm", "-f"] for call in payload["calls"]))
+
+    def test_artifact_build_timeout_preserves_deadline_error_and_removes_container(self):
+        with tempfile.TemporaryDirectory(dir=ROOT / "tmp" / "chapter-10-5") as directory:
+            root = Path(directory)
+            acceptance = root / "acceptance"
+            run_id = "fedcba654321"
+            run_root = acceptance / run_id
+            run_root.mkdir(parents=True)
+            (root / "jobs" / "datastream-quality").mkdir(parents=True)
+            payload = self._payload(f'''
+. "scripts/verify_chapter_10_5_cold_start.ps1" -FunctionsOnly
+$script:calls=@()
+$script:containerId='{'3' * 64}'
+function Invoke-AcceptanceDocker {{ param($Arguments,$Deadline,$FailureMessage)
+  $script:calls += ,@($Arguments)
+  if ($Arguments[0] -ceq 'create') {{ return @($script:containerId) }}
+  if ($Arguments[0] -ceq 'start') {{ throw 'Chapter 10.5 acceptance deadline expired.' }}
+  if ($Arguments[0] -ceq 'logs') {{ return @('[INFO] Downloading dependencies') }}
+  if ($Arguments[0] -ceq 'ps') {{ return @($script:containerId) }}
+  if ($Arguments[0] -ceq 'inspect') {{
+    return @(([ordered]@{{Id=$script:containerId;Name='/chapter105-acceptance-{run_id}-maven';Config=[ordered]@{{Labels=[ordered]@{{'com.ecommerce.chapter105.acceptance.run-id'='{run_id}';'com.ecommerce.chapter105.acceptance.role'='maven-build'}}}}}}|ConvertTo-Json -Depth 8 -Compress))
+  }}
+  return @()
+}}
+$errorText=$null
+try {{ Invoke-AcceptanceArtifactBuild -RepositoryRoot "{root}" -AcceptanceRoot "{acceptance}" `
+  -RunRoot "{run_root}" -RunId "{run_id}" -Deadline ([DateTimeOffset]::UtcNow.AddMinutes(2)) }} catch {{ $errorText=$_.Exception.Message }}
+[ordered]@{{error=$errorText;calls=$script:calls}}|ConvertTo-Json -Depth 8 -Compress
+''')
+            self.assertTrue(payload["error"].startswith("Chapter 10.5 acceptance deadline expired."))
+            self.assertIn("Downloading dependencies", payload["error"])
+            self.assertTrue(any(call[:2] == ["rm", "-f"] for call in payload["calls"]))
 
     def test_continuity_evidence_requires_insert_and_exact_restart_preservation(self):
         payload = self._payload(r'''
