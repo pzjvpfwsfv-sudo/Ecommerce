@@ -250,11 +250,12 @@ Start-Sleep -Milliseconds 3500
             self.assertTrue(payload["ready"])
             self.assertFalse(payload["mutated"])
 
-    def test_native_timeout_contains_descendant_when_parent_exits_at_boundary(self):
+    def test_native_runner_closes_job_after_parent_exits_before_descendant(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             marker = root / "boundary-descendant-mutated.txt"
             ready = root / "boundary-descendant-ready.txt"
+            parent_exiting = root / "boundary-parent-exiting.txt"
             parent = root / "boundary-parent.ps1"
             child_source = (
                 f'[IO.File]::WriteAllText("{ready}", "ready")\n'
@@ -263,26 +264,35 @@ Start-Sleep -Milliseconds 3500
             )
             encoded = __import__("base64").b64encode(child_source.encode("utf-16-le")).decode("ascii")
             parent.write_text(
-                f'Start-Process powershell -WindowStyle Hidden -ArgumentList @("-NoProfile","-EncodedCommand","{encoded}")\n'
-                'Start-Sleep -Milliseconds 1500\n',
-                encoding="utf-8",
+                '$childStart=[Diagnostics.ProcessStartInfo]::new()\n'
+                '$childStart.FileName="powershell"\n'
+                f'$childStart.Arguments="-NoProfile -EncodedCommand {encoded}"\n'
+                '$childStart.UseShellExecute=$false\n'
+                '$childStart.CreateNoWindow=$true\n'
+                '$child=[Diagnostics.Process]::Start($childStart)\n'
+                '$child.Dispose()\n'
+                '$readyDeadline=[DateTimeOffset]::UtcNow.AddSeconds(2)\n'
+                f'while (-not (Test-Path -LiteralPath "{ready}")) {{\n'
+                '  if ([DateTimeOffset]::UtcNow -ge $readyDeadline) { exit 41 }\n'
+                '  Start-Sleep -Milliseconds 20\n'
+                '}\n'
+                f'[IO.File]::WriteAllText("{parent_exiting}", "exiting")\n',
+                encoding="utf-8-sig",
             )
             payload = self._payload(f'''
 . "scripts/verify_chapter_10_5_cold_start.ps1" -FunctionsOnly
-$script:originalStop=(Get-Command Stop-AcceptanceProcessTree).ScriptBlock
-function Stop-AcceptanceProcessTree {{
-  param([System.Diagnostics.Process]$Process)
-  Start-Sleep -Milliseconds 800
-  & $script:originalStop -Process $Process
-}}
 $caught=$null
-try {{ Invoke-AcceptanceProcess -FilePath "powershell" -Arguments @("-NoProfile","-File","{parent}") `
-  -Deadline ([DateTimeOffset]::UtcNow.AddMilliseconds(1200)) -FailureMessage "native failed" }} catch {{ $caught=$_.Exception.Message }}
+$started=[DateTimeOffset]::UtcNow
+try {{ $null=Invoke-AcceptanceProcess -FilePath "powershell" -Arguments @("-NoProfile","-File","{parent}") `
+  -Deadline $started.AddSeconds(5) -FailureMessage "native failed" }} catch {{ $caught=$_.Exception.Message }}
+$runnerElapsed=([DateTimeOffset]::UtcNow-$started).TotalMilliseconds
 Start-Sleep -Milliseconds 3000
-[ordered]@{{caught=$caught;ready=(Test-Path -LiteralPath "{ready}");mutated=(Test-Path -LiteralPath "{marker}")}}|ConvertTo-Json -Compress
+[ordered]@{{caught=$caught;runner_elapsed_ms=$runnerElapsed;ready=(Test-Path -LiteralPath "{ready}");parent_exiting=(Test-Path -LiteralPath "{parent_exiting}");mutated=(Test-Path -LiteralPath "{marker}")}}|ConvertTo-Json -Compress
 ''')
-            self.assertEqual("Chapter 10.5 acceptance deadline expired.", payload["caught"])
+            self.assertIsNone(payload["caught"])
             self.assertTrue(payload["ready"])
+            self.assertTrue(payload["parent_exiting"])
+            self.assertLess(payload["runner_elapsed_ms"], 2500)
             self.assertFalse(payload["mutated"])
 
     def test_recursive_boundary_scan_runs_in_bounded_child_process(self):
