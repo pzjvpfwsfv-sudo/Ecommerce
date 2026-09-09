@@ -60,6 +60,11 @@ function Stop-AcceptanceProcessTree {
     }
 }
 
+function Initialize-AcceptanceWindowsJobInterop {
+    if ($null -ne ('Chapter105.AcceptanceJobRunner' -as [type])) { return }
+    Add-Type -Path (Join-Path $PSScriptRoot 'lib\Chapter105.AcceptanceJob.cs') -ErrorAction Stop
+}
+
 function Invoke-AcceptanceProcess {
     param(
         [Parameter(Mandatory = $true)][string]$FilePath,
@@ -74,6 +79,23 @@ function Invoke-AcceptanceProcess {
     $nativeArguments = @($Arguments | ForEach-Object {
         ConvertTo-AcceptanceNativeArgument -Value ([string]$_)
     })
+    if ($env:OS -ceq 'Windows_NT') {
+        $commandLine = @(
+            ConvertTo-AcceptanceNativeArgument -Value $FilePath
+            $nativeArguments
+        ) -join ' '
+        try {
+            Initialize-AcceptanceWindowsJobInterop
+            $result = [Chapter105.AcceptanceJobRunner]::Run($commandLine, $remaining)
+        } catch {
+            throw $FailureMessage
+        }
+        if ($result.TimedOut) { throw 'Chapter 10.5 acceptance deadline expired.' }
+        if ($result.ExitCode -ne 0) { throw $FailureMessage }
+        return @(([string]$result.StandardOutput -split "`r?`n") | Where-Object {
+            -not [string]::IsNullOrWhiteSpace($_)
+        })
+    }
     $startInfo.Arguments = $nativeArguments -join ' '
     $startInfo.UseShellExecute = $false
     $startInfo.CreateNoWindow = $true

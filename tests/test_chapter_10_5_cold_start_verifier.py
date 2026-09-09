@@ -250,6 +250,41 @@ Start-Sleep -Milliseconds 3500
             self.assertTrue(payload["ready"])
             self.assertFalse(payload["mutated"])
 
+    def test_native_timeout_contains_descendant_when_parent_exits_at_boundary(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            marker = root / "boundary-descendant-mutated.txt"
+            ready = root / "boundary-descendant-ready.txt"
+            parent = root / "boundary-parent.ps1"
+            child_source = (
+                f'[IO.File]::WriteAllText("{ready}", "ready")\n'
+                'Start-Sleep -Milliseconds 2500\n'
+                f'[IO.File]::WriteAllText("{marker}", "mutated")\n'
+            )
+            encoded = __import__("base64").b64encode(child_source.encode("utf-16-le")).decode("ascii")
+            parent.write_text(
+                f'Start-Process powershell -WindowStyle Hidden -ArgumentList @("-NoProfile","-EncodedCommand","{encoded}")\n'
+                'Start-Sleep -Milliseconds 1500\n',
+                encoding="utf-8",
+            )
+            payload = self._payload(f'''
+. "scripts/verify_chapter_10_5_cold_start.ps1" -FunctionsOnly
+$script:originalStop=(Get-Command Stop-AcceptanceProcessTree).ScriptBlock
+function Stop-AcceptanceProcessTree {{
+  param([System.Diagnostics.Process]$Process)
+  Start-Sleep -Milliseconds 800
+  & $script:originalStop -Process $Process
+}}
+$caught=$null
+try {{ Invoke-AcceptanceProcess -FilePath "powershell" -Arguments @("-NoProfile","-File","{parent}") `
+  -Deadline ([DateTimeOffset]::UtcNow.AddMilliseconds(1200)) -FailureMessage "native failed" }} catch {{ $caught=$_.Exception.Message }}
+Start-Sleep -Milliseconds 3000
+[ordered]@{{caught=$caught;ready=(Test-Path -LiteralPath "{ready}");mutated=(Test-Path -LiteralPath "{marker}")}}|ConvertTo-Json -Compress
+''')
+            self.assertEqual("Chapter 10.5 acceptance deadline expired.", payload["caught"])
+            self.assertTrue(payload["ready"])
+            self.assertFalse(payload["mutated"])
+
     def test_recursive_boundary_scan_runs_in_bounded_child_process(self):
         payload = self._payload(r'''
 . "scripts/verify_chapter_10_5_cold_start.ps1" -FunctionsOnly
@@ -516,14 +551,14 @@ function Invoke-AcceptanceProcess {{ param($FilePath,$Arguments,$Deadline,$Failu
   }}
   return & $script:originalProcess -FilePath $FilePath -Arguments $Arguments -Deadline $Deadline -FailureMessage $FailureMessage
 }}
-$deadline=[DateTimeOffset]::Parse("2026-08-27T12:34:56Z")
+$deadline=[DateTimeOffset]::UtcNow.AddSeconds(15)
 $state=Get-AcceptanceDefaultProjectState -RepositoryRoot "{root}" -DefaultEnvPath "{root / 'infra.env'}" -Deadline $deadline
-[ordered]@{{minio=$state.minio_data_path;files=@($state.minio_data.files).Count;process=$script:process}}|ConvertTo-Json -Depth 10 -Compress
+[ordered]@{{minio=$state.minio_data_path;files=@($state.minio_data.files).Count;deadline=$deadline.ToString('o');process=$script:process}}|ConvertTo-Json -Depth 10 -Compress
 ''')
             self.assertTrue(Path(payload["minio"]).samefile(minio))
             self.assertEqual(1, payload["files"])
             self.assertEqual("git", payload["process"]["file"])
-            self.assertEqual("2026-08-27T12:34:56.0000000+00:00", payload["process"]["deadline"])
+            self.assertEqual(payload["deadline"], payload["process"]["deadline"])
 
     def test_success_cleanup_uses_exact_project_argv_and_owned_path(self):
         with tempfile.TemporaryDirectory(dir=ROOT / "tmp" / "chapter-10-5") as directory:
