@@ -2304,6 +2304,27 @@ $id = Invoke-Chapter105ReconciledJobSubmission -RepositoryRoot "repo" `
         self.assertEqual("System.String", payload["type"])
         self.assertEqual(1, payload["reconciliations"])
 
+    def test_job_submission_confirms_scalar_cli_result_with_flink_rest(self):
+        payload = self._powershell_payload(
+            r'''
+. (Resolve-Path "scripts/bootstrap_chapter_10_5.ps1") -FunctionsOnly
+$script:reconciliations = 0
+function Invoke-Chapter105JobSubmission { "efefefefefefefefefefefefefefefef" }
+function Wait-Chapter105UniqueRunningJob {
+    param($FlinkPort, $JobName, $Attempts, $SleepSeconds)
+    $script:reconciliations++
+    return [pscustomobject]@{ job_id = "efefefefefefefefefefefefefefefef" }
+}
+$id = Invoke-Chapter105ReconciledJobSubmission -RepositoryRoot "repo" `
+    -ComposePrefix @("compose") -CheckpointUri "s3a://flink-state/checkpoints/chapter-9" `
+    -FlinkPort 18081 -JobName "chapter-9-datastream-quality-production" -SkipBuild
+[ordered]@{ id = $id; reconciliations = $script:reconciliations } | ConvertTo-Json -Compress
+'''
+        )
+
+        self.assertEqual("efefefefefefefefefefefefefefefef", payload["id"])
+        self.assertEqual(1, payload["reconciliations"])
+
     def test_bootstrap_deadline_uses_native_compose_wait_without_status_poll(self):
         run_id = secrets.token_hex(6)
         project = f"chapter105-acceptance-{run_id}"
