@@ -146,11 +146,53 @@ function Invoke-Chapter105BootstrapStage {
     }
 }
 
+function Assert-Chapter105JobArtifact {
+    param([Parameter(Mandatory = $true)][string]$RepositoryRoot)
+
+    $safeError = 'Flink job artifact is invalid.'
+    try {
+        $root = [System.IO.Path]::GetFullPath($RepositoryRoot).TrimEnd('\', '/')
+        if (-not (Test-Path -LiteralPath $root -PathType Container)) { throw $safeError }
+
+        $artifact = [System.IO.Path]::GetFullPath((Join-Path $root `
+                    'jobs\datastream-quality\target\datastream-quality-1.0.0.jar'))
+        $rootPrefix = $root + [System.IO.Path]::DirectorySeparatorChar
+        if (-not $artifact.StartsWith($rootPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw $safeError
+        }
+
+        $current = $root
+        $rootItem = Get-Item -LiteralPath $current -Force
+        if (-not $rootItem.PSIsContainer -or
+            ($rootItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw $safeError
+        }
+        foreach ($segment in $artifact.Substring($root.Length).Split(
+                @('\', '/'), [System.StringSplitOptions]::RemoveEmptyEntries)) {
+            $current = Join-Path $current $segment
+            if (-not (Test-Path -LiteralPath $current)) { throw $safeError }
+            $item = Get-Item -LiteralPath $current -Force
+            if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw $safeError
+            }
+        }
+        if ($item.PSIsContainer -or [int64]$item.Length -le 0 -or
+            -not [System.IO.Path]::GetFullPath($item.FullName).Equals(
+                $artifact, [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw $safeError
+        }
+        return $artifact
+    } catch {
+        throw $safeError
+    }
+}
+
 function Assert-Chapter105Preflight {
     param(
         [Parameter(Mandatory = $true)][string]$RepositoryRoot,
         [Parameter(Mandatory = $true)][System.Collections.IDictionary]$Environment,
-        [Parameter(Mandatory = $true)][string]$MinioDataPath
+        [Parameter(Mandatory = $true)][string]$MinioDataPath,
+        [switch]$SkipBuild
     )
 
     foreach ($key in @('FLINK_REST_PORT', 'API_PORT', 'MINIO_API_PORT', 'TRINO_PORT', 'DORIS_FE_QUERY_PORT')) {
@@ -164,12 +206,15 @@ function Assert-Chapter105Preflight {
         }
     }
     if ([int]$Environment['FLINK_CHECKPOINT_MAX_AGE_SECONDS'] -lt 1) { throw 'Flink checkpoint age configuration is invalid.' }
+    if ($SkipBuild) { Assert-Chapter105JobArtifact -RepositoryRoot $RepositoryRoot | Out-Null }
     Invoke-Chapter105Native -FilePath 'docker' -Arguments @('version') -FailureMessage 'Docker daemon is unavailable.' | Out-Null
     Invoke-Chapter105Native -FilePath 'docker' -Arguments @('compose', 'version') -FailureMessage 'Docker Compose is unavailable.' | Out-Null
     if ($PSVersionTable.PSVersion.Major -lt 5) { throw 'PowerShell version is unsupported.' }
-    $java = Invoke-Chapter105Native -FilePath 'java' -Arguments @('-version') -FailureMessage 'Java 17 is unavailable.'
-    if (($java -join "`n") -notmatch '(?m)(?:version )?"?17(?:\.|\s|$)') { throw 'Java 17 is unavailable.' }
-    Invoke-Chapter105Native -FilePath 'mvn' -Arguments @('-version') -FailureMessage 'Maven is unavailable.' | Out-Null
+    if (-not $SkipBuild) {
+        $java = Invoke-Chapter105Native -FilePath 'java' -Arguments @('-version') -FailureMessage 'Java 17 is unavailable.'
+        if (($java -join "`n") -notmatch '(?m)(?:version )?"?17(?:\.|\s|$)') { throw 'Java 17 is unavailable.' }
+        Invoke-Chapter105Native -FilePath 'mvn' -Arguments @('-version') -FailureMessage 'Maven is unavailable.' | Out-Null
+    }
     Invoke-Chapter105Native -FilePath 'python' -Arguments @('--version') -FailureMessage 'Python is unavailable.' | Out-Null
     $minioDataPath = $MinioDataPath
     [System.IO.Directory]::CreateDirectory($minioDataPath) | Out-Null
@@ -719,7 +764,7 @@ function Invoke-Chapter105Bootstrap {
             $context.CheckpointUri = Get-Chapter9StateUri -Kind 'checkpoint' -Environment $context.Environment
             $context.SavepointUri = Get-Chapter9StateUri -Kind 'savepoint' -Environment $context.Environment
             Assert-Chapter105Preflight -RepositoryRoot $context.RepositoryRoot -Environment $context.Environment `
-                -MinioDataPath $context.Environment['MINIO_DATA_DIR']
+                -MinioDataPath $context.Environment['MINIO_DATA_DIR'] -SkipBuild:$SkipBuild
         }
         $repositoryRoot = $context.RepositoryRoot
         $cutoverRepositoryRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..')).TrimEnd('\', '/')

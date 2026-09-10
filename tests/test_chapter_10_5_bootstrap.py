@@ -2929,6 +2929,230 @@ $checkpoint = Wait-Chapter105CompletedCheckpoint -FlinkPort 8081 -JobId "1111111
         self.assertEqual("completed", payload["checkpoint"])
         self.assertEqual(3, payload["checkpoint_calls"])
 
+    def test_skip_build_preflight_uses_valid_fixed_jar_without_host_java_or_maven(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository = Path(directory) / "repository"
+            artifact = (
+                repository
+                / "jobs"
+                / "datastream-quality"
+                / "target"
+                / "datastream-quality-1.0.0.jar"
+            )
+            artifact.parent.mkdir(parents=True)
+            artifact.write_bytes(b"verified-fat-jar")
+            minio = repository / "tmp" / "minio"
+            payload = self._powershell_payload(
+                rf'''
+. "{BOOTSTRAP}" -FunctionsOnly
+$script:calls = @()
+function Invoke-Chapter105Native {{
+    param([string]$FilePath, [string[]]$Arguments, [string]$FailureMessage)
+    $script:calls += ,([ordered]@{{ file = $FilePath; arguments = @($Arguments) }})
+    if ($FilePath -ceq "java" -or $FilePath -ceq "mvn") {{ throw "host toolchain must not run" }}
+    return @("available")
+}}
+$environment = @{{
+    FLINK_REST_PORT = "8081"; API_PORT = "8000"; MINIO_API_PORT = "9000"
+    TRINO_PORT = "8088"; DORIS_FE_QUERY_PORT = "9030"
+    MINIO_ROOT_USER = "user"; MINIO_ROOT_PASSWORD = "password"
+    DORIS_DATABASE = "ecommerce"; DORIS_TABLE_REALTIME_METRICS = "realtime_metrics"
+    CHAPTER9_CHECKPOINT_URI = "s3a://flink-state/checkpoints/chapter-9"
+    CHAPTER9_SAVEPOINT_URI = "s3a://flink-state/savepoints/chapter-9"
+    FLINK_CHECKPOINT_MAX_AGE_SECONDS = "300"
+}}
+$result = Assert-Chapter105Preflight -RepositoryRoot "{repository}" -Environment $environment `
+    -MinioDataPath "{minio}" -SkipBuild
+[ordered]@{{ calls = @($script:calls); minio = $result.minio_data_dir }} | ConvertTo-Json -Depth 6 -Compress
+'''
+            )
+
+        commands = [call["file"] for call in payload["calls"]]
+        self.assertNotIn("java", commands)
+        self.assertNotIn("mvn", commands)
+        self.assertEqual(["docker", "docker", "python"], commands)
+        self.assertEqual(
+            os.path.normcase(os.path.abspath(minio)),
+            os.path.normcase(os.path.abspath(payload["minio"])),
+        )
+
+    def test_skip_build_rejects_invalid_fixed_artifacts_before_native_commands(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repositories = {}
+            for name in ("missing", "empty", "wrong-location", "reparse"):
+                repositories[name] = root / name
+                (repositories[name] / "jobs" / "datastream-quality").mkdir(parents=True)
+
+            empty_artifact = (
+                repositories["empty"]
+                / "jobs"
+                / "datastream-quality"
+                / "target"
+                / "datastream-quality-1.0.0.jar"
+            )
+            empty_artifact.parent.mkdir()
+            empty_artifact.write_bytes(b"")
+
+            wrong_artifact = (
+                repositories["wrong-location"]
+                / "elsewhere"
+                / "datastream-quality-1.0.0.jar"
+            )
+            wrong_artifact.parent.mkdir()
+            wrong_artifact.write_bytes(b"valid-but-not-at-the-fixed-path")
+
+            reparse_target = root / "outside-target"
+            reparse_target.mkdir()
+            (reparse_target / "datastream-quality-1.0.0.jar").write_bytes(b"outside")
+            reparse_link = (
+                repositories["reparse"] / "jobs" / "datastream-quality" / "target"
+            )
+            payload = self._powershell_payload(
+                rf'''
+. "{BOOTSTRAP}" -FunctionsOnly
+New-Item -ItemType Junction -Path "{reparse_link}" -Target "{reparse_target}" | Out-Null
+$script:calls = @()
+function Invoke-Chapter105Native {{
+    param([string]$FilePath, [string[]]$Arguments, [string]$FailureMessage)
+    $script:calls += ,([ordered]@{{ file = $FilePath; arguments = @($Arguments) }})
+    return @("available")
+}}
+$environment = @{{
+    FLINK_REST_PORT = "8081"; API_PORT = "8000"; MINIO_API_PORT = "9000"
+    TRINO_PORT = "8088"; DORIS_FE_QUERY_PORT = "9030"
+    MINIO_ROOT_USER = "user"; MINIO_ROOT_PASSWORD = "password"
+    DORIS_DATABASE = "ecommerce"; DORIS_TABLE_REALTIME_METRICS = "realtime_metrics"
+    CHAPTER9_CHECKPOINT_URI = "s3a://flink-state/checkpoints/chapter-9"
+    CHAPTER9_SAVEPOINT_URI = "s3a://flink-state/savepoints/chapter-9"
+    FLINK_CHECKPOINT_MAX_AGE_SECONDS = "300"
+}}
+$results = @()
+foreach ($case in @(
+    [ordered]@{{ name = "missing"; root = "{repositories['missing']}" }},
+    [ordered]@{{ name = "empty"; root = "{repositories['empty']}" }},
+    [ordered]@{{ name = "wrong-location"; root = "{repositories['wrong-location']}" }},
+    [ordered]@{{ name = "reparse"; root = "{repositories['reparse']}" }}
+)) {{
+    $before = $script:calls.Count
+    $errorMessage = $null
+    try {{
+        Assert-Chapter105Preflight -RepositoryRoot $case.root -Environment $environment `
+            -MinioDataPath (Join-Path $case.root "minio") -SkipBuild | Out-Null
+    }} catch {{ $errorMessage = $_.Exception.Message }}
+    $results += ,[ordered]@{{
+        name = $case.name
+        error = $errorMessage
+        native_calls = $script:calls.Count - $before
+    }}
+}}
+$results | ConvertTo-Json -Depth 5 -Compress
+'''
+            )
+            os.rmdir(reparse_link)
+
+        self.assertEqual(
+            [
+                {"name": "missing", "error": "Flink job artifact is invalid.", "native_calls": 0},
+                {"name": "empty", "error": "Flink job artifact is invalid.", "native_calls": 0},
+                {
+                    "name": "wrong-location",
+                    "error": "Flink job artifact is invalid.",
+                    "native_calls": 0,
+                },
+                {"name": "reparse", "error": "Flink job artifact is invalid.", "native_calls": 0},
+            ],
+            payload,
+        )
+
+    def test_build_enabled_preflight_still_requires_java17_and_maven(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository = Path(directory) / "repository"
+            repository.mkdir()
+            minio = repository / "minio"
+            payload = self._powershell_payload(
+                rf'''
+. "{BOOTSTRAP}" -FunctionsOnly
+$script:mode = "java8"
+$script:calls = @()
+function Invoke-Chapter105Native {{
+    param([string]$FilePath, [string[]]$Arguments, [string]$FailureMessage)
+    $script:calls += $FilePath
+    if ($FilePath -ceq "java") {{
+        if ($script:mode -ceq "java8") {{ return @('java version "1.8.0_462"') }}
+        return @('openjdk version "17.0.12"')
+    }}
+    if ($FilePath -ceq "mvn" -and $script:mode -ceq "maven-missing") {{ throw $FailureMessage }}
+    return @("available")
+}}
+$environment = @{{
+    FLINK_REST_PORT = "8081"; API_PORT = "8000"; MINIO_API_PORT = "9000"
+    TRINO_PORT = "8088"; DORIS_FE_QUERY_PORT = "9030"
+    MINIO_ROOT_USER = "user"; MINIO_ROOT_PASSWORD = "password"
+    DORIS_DATABASE = "ecommerce"; DORIS_TABLE_REALTIME_METRICS = "realtime_metrics"
+    CHAPTER9_CHECKPOINT_URI = "s3a://flink-state/checkpoints/chapter-9"
+    CHAPTER9_SAVEPOINT_URI = "s3a://flink-state/savepoints/chapter-9"
+    FLINK_CHECKPOINT_MAX_AGE_SECONDS = "300"
+}}
+$javaError = $null
+try {{ Assert-Chapter105Preflight -RepositoryRoot "{repository}" -Environment $environment -MinioDataPath "{minio}" | Out-Null }} catch {{ $javaError = $_.Exception.Message }}
+$javaCalls = @($script:calls)
+$script:mode = "maven-missing"
+$script:calls = @()
+$mavenError = $null
+try {{ Assert-Chapter105Preflight -RepositoryRoot "{repository}" -Environment $environment -MinioDataPath "{minio}" | Out-Null }} catch {{ $mavenError = $_.Exception.Message }}
+[ordered]@{{ java_error = $javaError; java_calls = $javaCalls; maven_error = $mavenError; maven_calls = @($script:calls) }} | ConvertTo-Json -Depth 5 -Compress
+'''
+            )
+
+        self.assertEqual("Java 17 is unavailable.", payload["java_error"])
+        self.assertIn("java", payload["java_calls"])
+        self.assertNotIn("mvn", payload["java_calls"])
+        self.assertEqual("Maven is unavailable.", payload["maven_error"])
+        self.assertIn("java", payload["maven_calls"])
+        self.assertIn("mvn", payload["maven_calls"])
+
+    def test_bootstrap_entry_forwards_skip_build_to_preflight(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository = Path(directory) / "repository"
+            (repository / "infra").mkdir(parents=True)
+            payload = self._powershell_payload(
+                rf'''
+. "{BOOTSTRAP}" -FunctionsOnly
+$script:preflightSkipBuild = $null
+function Get-Chapter105PrimaryRepositoryRoot {{ param($StartPath) return "{repository}" }}
+function Resolve-Chapter105RepositoryPath {{
+    param($RepositoryRoot, $Path, $AllowedRelativeRoot)
+    return [System.IO.Path]::GetFullPath((Join-Path $RepositoryRoot $Path))
+}}
+function Assert-Chapter105ReportPathWritable {{ param($Path) }}
+function Get-Chapter105StableMinioDataPath {{ param($RepositoryRoot) return (Join-Path $RepositoryRoot "minio") }}
+function Read-Chapter105EnvFile {{
+    param($Path)
+    return [ordered]@{{
+        FLINK_REST_PORT = "8081"; API_PORT = "8000"
+        CHAPTER9_CHECKPOINT_URI = "s3a://flink-state/checkpoints/chapter-9"
+        CHAPTER9_SAVEPOINT_URI = "s3a://flink-state/savepoints/chapter-9"
+    }}
+}}
+function Assert-Chapter105Preflight {{
+    param($RepositoryRoot, $Environment, $MinioDataPath, [switch]$SkipBuild)
+    $script:preflightSkipBuild = $SkipBuild.IsPresent
+}}
+function Invoke-Chapter105Native {{ throw "stop after preflight" }}
+function Write-Chapter105BootstrapReport {{ param($Report, $Path) }}
+$errorMessage = $null
+try {{ Invoke-Chapter105Bootstrap -SkipBuild }} catch {{ $errorMessage = $_.Exception.Message }}
+[ordered]@{{ forwarded = $script:preflightSkipBuild; error = $errorMessage }} | ConvertTo-Json -Compress
+'''
+            )
+
+        self.assertTrue(payload["forwarded"])
+        self.assertEqual(
+            "Chapter 10.5 bootstrap failed. See the bootstrap report for safe stage status.",
+            payload["error"],
+        )
+
     def test_preflight_env_failure_closes_stage_and_writes_safe_report(self):
         report_name = f"preflight-failure-{next(tempfile._get_candidate_names())}.json"
         report_path = ROOT.parent.parent / "tmp" / "chapter-10-5" / report_name
