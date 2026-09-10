@@ -544,11 +544,13 @@ function Test-CutoverExactProperties {
     )
 
     if (-not (Test-CutoverRecord -Value $Record)) { return $false }
-    $actual = if ($Record -is [System.Collections.IDictionary]) {
-        @($Record.Keys | ForEach-Object { [string]$_ })
-    } else {
-        @($Record.PSObject.Properties.Name)
-    }
+    $actual = @(
+        if ($Record -is [System.Collections.IDictionary]) {
+            $Record.Keys | ForEach-Object { [string]$_ }
+        } else {
+            $Record.PSObject.Properties.Name
+        }
+    )
     if ($actual.Count -ne $Names.Count) { return $false }
     foreach ($name in $Names) {
         if ($actual -cnotcontains $name) { return $false }
