@@ -643,7 +643,7 @@ try {{
     for ($attempt = 0; $attempt -lt 100 -and -not (Test-Path -LiteralPath "{started}"); $attempt++) {{
         Start-Sleep -Milliseconds 25
     }}
-    Start-Sleep -Milliseconds 150
+    Start-Sleep -Milliseconds 1000
     $whileLocked = Get-Content -LiteralPath $partialPath -Raw -Encoding UTF8
     $unchangedWhileLocked = $before -ceq $whileLocked
     $canonicalAbsentWhileLocked = -not (Test-Path -LiteralPath $statePath)
@@ -2256,6 +2256,27 @@ $result = Wait-Chapter105ComposeReady -ComposePrefix @("compose-prefix") -Deadli
         )
         self.assertEqual(31, payload["polls"])
         self.assertEqual(13, payload["services"])
+
+    def test_job_submission_reconciles_an_ambiguous_cli_failure_from_flink_rest(self):
+        payload = self._powershell_payload(
+            r'''
+. (Resolve-Path "scripts/bootstrap_chapter_10_5.ps1") -FunctionsOnly
+$script:reconciliations = 0
+function Invoke-Chapter105JobSubmission { throw "ambiguous cli failure" }
+function Wait-Chapter105UniqueRunningJob {
+    param($FlinkPort, $JobName, $Attempts, $SleepSeconds)
+    $script:reconciliations++
+    return [pscustomobject]@{ job_id = "abababababababababababababababab" }
+}
+$id = Invoke-Chapter105ReconciledJobSubmission -RepositoryRoot "repo" `
+    -ComposePrefix @("compose") -CheckpointUri "s3a://flink-state/checkpoints/chapter-9" `
+    -FlinkPort 18081 -JobName "chapter-9-datastream-quality-production" -SkipBuild
+[ordered]@{ id = $id; reconciliations = $script:reconciliations } | ConvertTo-Json -Compress
+'''
+        )
+
+        self.assertEqual("abababababababababababababababab", payload["id"])
+        self.assertEqual(1, payload["reconciliations"])
 
     def test_bootstrap_deadline_uses_native_compose_wait_without_status_poll(self):
         run_id = secrets.token_hex(6)

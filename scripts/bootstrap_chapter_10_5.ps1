@@ -336,6 +336,29 @@ function Invoke-Chapter105JobSubmission {
     return Get-SubmittedJobId -Lines $output
 }
 
+function Invoke-Chapter105ReconciledJobSubmission {
+    param(
+        [Parameter(Mandatory = $true)][string]$RepositoryRoot,
+        [Parameter(Mandatory = $true)][string[]]$ComposePrefix,
+        [Parameter(Mandatory = $true)][string]$CheckpointUri,
+        [string]$SavepointPath,
+        [Parameter(Mandatory = $true)][int]$FlinkPort,
+        [Parameter(Mandatory = $true)][string]$JobName,
+        [switch]$SkipBuild
+    )
+
+    try {
+        return Invoke-Chapter105JobSubmission -RepositoryRoot $RepositoryRoot -ComposePrefix $ComposePrefix `
+            -CheckpointUri $CheckpointUri -SavepointPath $SavepointPath -SkipBuild:$SkipBuild
+    } catch {
+        $running = Wait-Chapter105UniqueRunningJob -FlinkPort $FlinkPort -JobName $JobName -Attempts 10 -SleepSeconds 1
+        if ($running.job_id -isnot [string] -or [string]$running.job_id -cnotmatch '^[0-9a-f]{32}$') {
+            throw 'Flink job submission failed.'
+        }
+        return [string]$running.job_id
+    }
+}
+
 function Get-Chapter105Task4RecoveryPlan {
     param(
         [Parameter(Mandatory = $true)][string]$RepositoryRoot,
@@ -849,8 +872,10 @@ function Invoke-Chapter105Bootstrap {
             if ($IsolatedAcceptance) { $jobArguments['IsolatedAcceptance'] = $true }
             $decision = Invoke-Chapter105JobsStage @jobArguments -SubmitAction {
                 param($savepointPath)
-                $id = Invoke-Chapter105JobSubmission -RepositoryRoot $repositoryRoot -ComposePrefix $context.ComposePrefix `
-                    -CheckpointUri $context.CheckpointUri -SavepointPath $savepointPath -SkipBuild:$SkipBuild
+                $id = Invoke-Chapter105ReconciledJobSubmission -RepositoryRoot $repositoryRoot `
+                    -ComposePrefix $context.ComposePrefix -CheckpointUri $context.CheckpointUri `
+                    -SavepointPath $savepointPath -FlinkPort ([int]$context.Environment['FLINK_REST_PORT']) `
+                    -JobName $jobName -SkipBuild:$SkipBuild
                 [pscustomobject]@{ job_id = $id }
             }
             if ($decision.action -eq 'submitted') {
