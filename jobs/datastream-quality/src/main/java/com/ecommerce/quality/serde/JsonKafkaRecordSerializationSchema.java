@@ -2,7 +2,7 @@ package com.ecommerce.quality.serde;
 
 import java.nio.charset.StandardCharsets;
 import org.apache.flink.connector.kafka.sink.KafkaRecordSerializationSchema;
-import org.apache.kafka.clients.producer.ProducerRecord;
+import org.apache.flink.kafka.shaded.org.apache.kafka.clients.producer.ProducerRecord;
 
 public final class JsonKafkaRecordSerializationSchema<T> implements KafkaRecordSerializationSchema<T> {
     private final String topic;

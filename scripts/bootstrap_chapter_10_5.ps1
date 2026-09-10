@@ -579,7 +579,7 @@ function Invoke-Chapter105Initialization {
         )) -FailureMessage 'Kafka topic initialization failed.' | Out-Null
         $dorisArguments = @(
             '-NoProfile', '-File', (Join-Path $PSScriptRoot 'init_doris_realtime_metrics.ps1'),
-            '-EnvFile', $EnvPath
+            '-EnvFile', $envPath
         )
         if (-not [string]::IsNullOrWhiteSpace($ComposeProjectName)) {
             $dorisArguments += @('-ComposeProjectName', $ComposeProjectName)
@@ -801,10 +801,20 @@ function Invoke-Chapter105Bootstrap {
             @{ installer = 'completed' }
         }
         Invoke-Chapter105BootstrapStage -Report $report -Name 'infrastructure' -Action {
-            Invoke-Chapter105Native -FilePath 'docker' -Arguments ($context.ComposePrefix + @('up', '-d')) `
+            $upArguments = @('up', '-d')
+            if ($null -ne $context.ComposeDeadline) {
+                $remainingSeconds = [int][Math]::Floor(($context.ComposeDeadline - [DateTimeOffset]::UtcNow).TotalSeconds)
+                if ($remainingSeconds -lt 1) { throw 'Acceptance deadline has expired.' }
+                $upArguments += @('--wait', '--wait-timeout', [string]$remainingSeconds)
+            }
+            Invoke-Chapter105Native -FilePath 'docker' -Arguments ($context.ComposePrefix + $upArguments) `
                 -FailureMessage 'Infrastructure startup failed.' | Out-Null
             $composeReadyArguments = @{ ComposePrefix = $context.ComposePrefix }
-            if ($null -ne $context.ComposeDeadline) { $composeReadyArguments['Deadline'] = $context.ComposeDeadline }
+            if ($null -ne $context.ComposeDeadline) {
+                $composeReadyArguments['Deadline'] = $context.ComposeDeadline
+                $composeReadyArguments['Attempts'] = 1
+                $composeReadyArguments['SleepSeconds'] = 0
+            }
             Wait-Chapter105ComposeReady @composeReadyArguments
         }
         Invoke-Chapter105BootstrapStage -Report $report -Name 'initialization' -Action {

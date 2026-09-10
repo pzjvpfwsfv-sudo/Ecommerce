@@ -5,7 +5,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.ecommerce.quality.model.UserBehaviorEvent;
 import java.nio.charset.StandardCharsets;
-import org.apache.kafka.clients.producer.ProducerRecord;
+import org.apache.flink.kafka.shaded.org.apache.kafka.clients.producer.ProducerRecord;
 import org.junit.jupiter.api.Test;
 
 class JsonKafkaRecordSerializationSchemaTest {

@@ -84,6 +84,13 @@ class FlinkSqlArtifactsTest(unittest.TestCase):
         self.assertIn("rest.address: flink-jobmanager", text)
         self.assertIn("/workspace", text)
         self.assertIn("flink-sql-connector-kafka-3.3.0-1.19.jar", text)
+        self.assertEqual(
+            3,
+            text.count("ENABLE_BUILT_IN_PLUGINS: flink-s3-fs-hadoop-1.19.2.jar"),
+        )
+        self.assertEqual(3, text.count("s3.endpoint: http://minio:9000"))
+        self.assertEqual(3, text.count("s3.access-key: ${MINIO_ROOT_USER}"))
+        self.assertEqual(3, text.count("s3.secret-key: ${MINIO_ROOT_PASSWORD}"))
 
 
 if __name__ == "__main__":

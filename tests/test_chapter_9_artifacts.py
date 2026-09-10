@@ -1,5 +1,6 @@
 from pathlib import Path
 import unittest
+import xml.etree.ElementTree as ET
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -23,6 +24,19 @@ class Chapter9ArtifactsTest(unittest.TestCase):
         self.assertIn("<kafka.connector.version>3.3.0-1.19</kafka.connector.version>", text)
         self.assertIn("maven-shade-plugin", text)
         self.assertIn("com.ecommerce.quality.DataQualityJob", text)
+
+    def test_datastream_job_compiles_against_the_runtime_kafka_connector(self):
+        root = ET.parse(POM).getroot()
+        namespace = {"m": "http://maven.apache.org/POM/4.0.0"}
+        dependencies = {
+            dependency.findtext("m:artifactId", namespaces=namespace): dependency.findtext(
+                "m:scope", default="compile", namespaces=namespace
+            )
+            for dependency in root.findall("m:dependencies/m:dependency", namespace)
+        }
+
+        self.assertEqual("provided", dependencies.get("flink-sql-connector-kafka"))
+        self.assertNotIn("flink-connector-kafka", dependencies)
 
     def test_build_and_run_scripts_are_java17_shadow_only_and_non_destructive(self):
         self.assertTrue(BUILD_SCRIPT.exists())

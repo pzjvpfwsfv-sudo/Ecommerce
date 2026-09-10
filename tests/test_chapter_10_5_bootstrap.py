@@ -2280,7 +2280,7 @@ $script:capturedDeadline = $null
 function Assert-Chapter105Preflight {{ param($RepositoryRoot, $Environment, $MinioDataPath, $SkipBuild) }}
 function Invoke-Chapter105Native {{ param($FilePath, $Arguments, $FailureMessage) return @() }}
 function Wait-Chapter105ComposeReady {{
-    param($ComposePrefix, $Deadline)
+    param($ComposePrefix, $Deadline, $Attempts, $SleepSeconds)
     $script:capturedDeadline = $Deadline.ToString("o")
     throw "stop-after-deadline-capture"
 }}

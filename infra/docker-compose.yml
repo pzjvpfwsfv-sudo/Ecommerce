@@ -122,9 +122,14 @@ services:
     ports:
       - "${FLINK_REST_PORT}:8081"
     environment:
+      ENABLE_BUILT_IN_PLUGINS: flink-s3-fs-hadoop-1.19.2.jar
       FLINK_PROPERTIES: |
         jobmanager.rpc.address: flink-jobmanager
         rest.address: flink-jobmanager
+        s3.endpoint: http://minio:9000
+        s3.path.style.access: true
+        s3.access-key: ${MINIO_ROOT_USER}
+        s3.secret-key: ${MINIO_ROOT_PASSWORD}
       HADOOP_CONF_DIR: /opt/hadoop-conf
       MINIO_ROOT_USER: ${MINIO_ROOT_USER}
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
@@ -158,10 +163,15 @@ services:
       - flink-jobmanager
     command: taskmanager
     environment:
+      ENABLE_BUILT_IN_PLUGINS: flink-s3-fs-hadoop-1.19.2.jar
       FLINK_PROPERTIES: |
         jobmanager.rpc.address: flink-jobmanager
         rest.address: flink-jobmanager
         taskmanager.numberOfTaskSlots: ${FLINK_TASKMANAGER_SLOTS}
+        s3.endpoint: http://minio:9000
+        s3.path.style.access: true
+        s3.access-key: ${MINIO_ROOT_USER}
+        s3.secret-key: ${MINIO_ROOT_PASSWORD}
       HADOOP_CONF_DIR: /opt/hadoop-conf
       MINIO_ROOT_USER: ${MINIO_ROOT_USER}
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
@@ -196,9 +206,14 @@ services:
       - flink-taskmanager
     command: ["tail", "-f", "/dev/null"]
     environment:
+      ENABLE_BUILT_IN_PLUGINS: flink-s3-fs-hadoop-1.19.2.jar
       FLINK_PROPERTIES: |
         jobmanager.rpc.address: flink-jobmanager
         rest.address: flink-jobmanager
+        s3.endpoint: http://minio:9000
+        s3.path.style.access: true
+        s3.access-key: ${MINIO_ROOT_USER}
+        s3.secret-key: ${MINIO_ROOT_PASSWORD}
       HADOOP_CONF_DIR: /opt/hadoop-conf
       MINIO_ROOT_USER: ${MINIO_ROOT_USER}
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
