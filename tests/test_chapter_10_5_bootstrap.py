@@ -2278,6 +2278,32 @@ $id = Invoke-Chapter105ReconciledJobSubmission -RepositoryRoot "repo" `
         self.assertEqual("abababababababababababababababab", payload["id"])
         self.assertEqual(1, payload["reconciliations"])
 
+    def test_job_submission_reconciles_non_scalar_cli_output(self):
+        payload = self._powershell_payload(
+            r'''
+. (Resolve-Path "scripts/bootstrap_chapter_10_5.ps1") -FunctionsOnly
+$script:reconciliations = 0
+function Invoke-Chapter105JobSubmission {
+    "non-fatal native warning"
+    "11111111111111111111111111111111"
+}
+function Wait-Chapter105UniqueRunningJob {
+    param($FlinkPort, $JobName, $Attempts, $SleepSeconds)
+    $script:reconciliations++
+    return [pscustomobject]@{ job_id = "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd" }
+}
+$id = Invoke-Chapter105ReconciledJobSubmission -RepositoryRoot "repo" `
+    -ComposePrefix @("compose") -CheckpointUri "s3a://flink-state/checkpoints/chapter-9" `
+    -FlinkPort 18081 -JobName "chapter-9-datastream-quality-production" -SkipBuild
+[ordered]@{ id = $id; type = $id.GetType().FullName; reconciliations = $script:reconciliations } |
+    ConvertTo-Json -Compress
+'''
+        )
+
+        self.assertEqual("cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd", payload["id"])
+        self.assertEqual("System.String", payload["type"])
+        self.assertEqual(1, payload["reconciliations"])
+
     def test_bootstrap_deadline_uses_native_compose_wait_without_status_poll(self):
         run_id = secrets.token_hex(6)
         project = f"chapter105-acceptance-{run_id}"

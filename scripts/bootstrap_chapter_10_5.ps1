@@ -348,8 +348,13 @@ function Invoke-Chapter105ReconciledJobSubmission {
     )
 
     try {
-        return Invoke-Chapter105JobSubmission -RepositoryRoot $RepositoryRoot -ComposePrefix $ComposePrefix `
-            -CheckpointUri $CheckpointUri -SavepointPath $SavepointPath -SkipBuild:$SkipBuild
+        $candidate = @(Invoke-Chapter105JobSubmission -RepositoryRoot $RepositoryRoot -ComposePrefix $ComposePrefix `
+                -CheckpointUri $CheckpointUri -SavepointPath $SavepointPath -SkipBuild:$SkipBuild)
+        if ($candidate.Count -ne 1 -or $candidate[0] -isnot [string] -or
+            [string]$candidate[0] -cnotmatch '^[0-9a-f]{32}$') {
+            throw 'Flink job submission result is ambiguous.'
+        }
+        return [string]$candidate[0]
     } catch {
         $running = Wait-Chapter105UniqueRunningJob -FlinkPort $FlinkPort -JobName $JobName -Attempts 10 -SleepSeconds 1
         if ($running.job_id -isnot [string] -or [string]$running.job_id -cnotmatch '^[0-9a-f]{32}$') {
