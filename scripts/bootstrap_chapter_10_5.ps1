@@ -196,12 +196,12 @@ function Assert-Chapter105Preflight {
     )
 
     foreach ($key in @('FLINK_REST_PORT', 'API_PORT', 'MINIO_API_PORT', 'TRINO_PORT', 'DORIS_FE_QUERY_PORT')) {
-        if (-not $Environment.ContainsKey($key) -or [int]$Environment[$key] -lt 1 -or [int]$Environment[$key] -gt 65535) {
+        if (-not $Environment.Contains($key) -or [int]$Environment[$key] -lt 1 -or [int]$Environment[$key] -gt 65535) {
             throw 'Environment port configuration is invalid.'
         }
     }
     foreach ($key in @('MINIO_ROOT_USER', 'MINIO_ROOT_PASSWORD', 'DORIS_DATABASE', 'DORIS_TABLE_REALTIME_METRICS', 'CHAPTER9_CHECKPOINT_URI', 'CHAPTER9_SAVEPOINT_URI', 'FLINK_CHECKPOINT_MAX_AGE_SECONDS')) {
-        if (-not $Environment.ContainsKey($key) -or [string]::IsNullOrWhiteSpace([string]$Environment[$key])) {
+        if (-not $Environment.Contains($key) -or [string]::IsNullOrWhiteSpace([string]$Environment[$key])) {
             throw 'Environment required configuration is missing.'
         }
     }

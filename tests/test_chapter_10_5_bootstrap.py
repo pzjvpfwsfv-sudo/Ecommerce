@@ -2952,7 +2952,7 @@ function Invoke-Chapter105Native {{
     if ($FilePath -ceq "java" -or $FilePath -ceq "mvn") {{ throw "host toolchain must not run" }}
     return @("available")
 }}
-$environment = @{{
+$environment = [ordered]@{{
     FLINK_REST_PORT = "8081"; API_PORT = "8000"; MINIO_API_PORT = "9000"
     TRINO_PORT = "8088"; DORIS_FE_QUERY_PORT = "9030"
     MINIO_ROOT_USER = "user"; MINIO_ROOT_PASSWORD = "password"
@@ -2975,6 +2975,68 @@ $result = Assert-Chapter105Preflight -RepositoryRoot "{repository}" -Environment
             os.path.normcase(os.path.abspath(minio)),
             os.path.normcase(os.path.abspath(payload["minio"])),
         )
+
+    def test_skip_build_preflight_ordered_environment_missing_key_fails_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository = Path(directory) / "repository"
+            artifact = (
+                repository
+                / "jobs"
+                / "datastream-quality"
+                / "target"
+                / "datastream-quality-1.0.0.jar"
+            )
+            artifact.parent.mkdir(parents=True)
+            artifact.write_bytes(b"verified-fat-jar")
+            payload = self._powershell_payload(
+                rf'''
+. "{BOOTSTRAP}" -FunctionsOnly
+$script:calls = @()
+function Invoke-Chapter105Native {{
+    param([string]$FilePath, [string[]]$Arguments, [string]$FailureMessage)
+    $script:calls += $FilePath
+    return @("available")
+}}
+$environment = [ordered]@{{
+    FLINK_REST_PORT = "8081"; API_PORT = "8000"; MINIO_API_PORT = "9000"
+    TRINO_PORT = "8088"; DORIS_FE_QUERY_PORT = "9030"
+    MINIO_ROOT_USER = "user"; MINIO_ROOT_PASSWORD = "password"
+    DORIS_DATABASE = "ecommerce"; DORIS_TABLE_REALTIME_METRICS = "realtime_metrics"
+    CHAPTER9_CHECKPOINT_URI = "s3a://flink-state/checkpoints/chapter-9"
+    CHAPTER9_SAVEPOINT_URI = "s3a://flink-state/savepoints/chapter-9"
+    FLINK_CHECKPOINT_MAX_AGE_SECONDS = "300"
+}}
+$results = @()
+foreach ($missingKey in @("FLINK_REST_PORT", "DORIS_TABLE_REALTIME_METRICS")) {{
+    $case = [ordered]@{{}}
+    foreach ($entry in $environment.GetEnumerator()) {{
+        if ([string]$entry.Key -cne $missingKey) {{ $case.Add($entry.Key, $entry.Value) }}
+    }}
+    $errorMessage = $null
+    try {{
+        Assert-Chapter105Preflight -RepositoryRoot "{repository}" -Environment $case `
+            -MinioDataPath (Join-Path "{repository}" "minio") -SkipBuild | Out-Null
+    }} catch {{ $errorMessage = $_.Exception.Message }}
+    $results += ,[ordered]@{{ key = $missingKey; error = $errorMessage }}
+}}
+[ordered]@{{ results = @($results); calls = @($script:calls) }} | ConvertTo-Json -Depth 5 -Compress
+'''
+            )
+
+        self.assertEqual(
+            [
+                {
+                    "key": "FLINK_REST_PORT",
+                    "error": "Environment port configuration is invalid.",
+                },
+                {
+                    "key": "DORIS_TABLE_REALTIME_METRICS",
+                    "error": "Environment required configuration is missing.",
+                },
+            ],
+            payload["results"],
+        )
+        self.assertEqual([], payload["calls"])
 
     def test_skip_build_rejects_invalid_fixed_artifacts_before_native_commands(self):
         with tempfile.TemporaryDirectory() as directory:
