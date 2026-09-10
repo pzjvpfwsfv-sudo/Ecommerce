@@ -1,6 +1,8 @@
 import json
 import os
 from pathlib import Path
+import secrets
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -2255,8 +2257,8 @@ $result = Wait-Chapter105ComposeReady -ComposePrefix @("compose-prefix") -Deadli
         self.assertEqual(31, payload["polls"])
         self.assertEqual(13, payload["services"])
 
-    def test_bootstrap_internal_function_forwards_exact_deadline_to_compose_readiness(self):
-        run_id = "abc123def456"
+    def test_bootstrap_deadline_uses_native_compose_wait_without_status_poll(self):
+        run_id = secrets.token_hex(6)
         project = f"chapter105-acceptance-{run_id}"
         run_root = ROOT / "tmp" / "chapter-10-5" / "acceptance" / run_id
         env_file = run_root / "isolated.env"
@@ -2275,14 +2277,19 @@ $result = Wait-Chapter105ComposeReady -ComposePrefix @("compose-prefix") -Deadli
             payload = self._powershell_payload(
                 f'''
 . (Resolve-Path "scripts/bootstrap_chapter_10_5.ps1") -FunctionsOnly
-$deadline = "2027-01-02T03:04:05.0000000+00:00"
-$script:capturedDeadline = $null
+$deadline = [DateTimeOffset]::UtcNow.AddSeconds(121).ToString("o")
+$script:upArguments = $null
+$script:readinessCalls = 0
 function Assert-Chapter105Preflight {{ param($RepositoryRoot, $Environment, $MinioDataPath, $SkipBuild) }}
-function Invoke-Chapter105Native {{ param($FilePath, $Arguments, $FailureMessage) return @() }}
+function Invoke-Chapter105Native {{
+    param($FilePath, $Arguments, $FailureMessage)
+    if ($Arguments -contains "up") {{ $script:upArguments = @($Arguments) }}
+    return @()
+}}
 function Wait-Chapter105ComposeReady {{
     param($ComposePrefix, $Deadline, $Attempts, $SleepSeconds)
-    $script:capturedDeadline = $Deadline.ToString("o")
-    throw "stop-after-deadline-capture"
+    $script:readinessCalls++
+    return @{{ services = 13 }}
 }}
 function Write-Chapter105BootstrapReport {{ param($Report, $Path) }}
 $failure = $null
@@ -2290,14 +2297,21 @@ try {{
     Invoke-Chapter105Bootstrap -EnvFile "{env_file}" -SkipBuild -IsolatedAcceptance `
         -ComposeProjectName "{project}" -ReportPath "{run_root / 'bootstrap-first.json'}" -DeadlineUtc $deadline
 }} catch {{ $failure = $_.Exception.Message }}
-[ordered]@{{ deadline = $script:capturedDeadline; error = $failure }} | ConvertTo-Json -Compress
+$timeoutIndex = [Array]::IndexOf($script:upArguments, "--wait-timeout")
+[ordered]@{{
+    wait = $script:upArguments -contains "--wait"
+    timeout = [int]$script:upArguments[$timeoutIndex + 1]
+    readiness_calls = $script:readinessCalls
+    error = $failure
+}} | ConvertTo-Json -Compress
 '''
             )
-            self.assertEqual("2027-01-02T03:04:05.0000000+00:00", payload["deadline"])
-            self.assertEqual("Chapter 10.5 bootstrap failed. See the bootstrap report for safe stage status.", payload["error"])
+            self.assertTrue(payload["wait"])
+            self.assertGreaterEqual(payload["timeout"], 118)
+            self.assertLessEqual(payload["timeout"], 121)
+            self.assertEqual(0, payload["readiness_calls"])
         finally:
-            env_file.unlink(missing_ok=True)
-            run_root.rmdir()
+            shutil.rmtree(run_root, ignore_errors=True)
 
     def test_bootstrap_rejects_invalid_or_expired_deadline_before_preflight_or_native_commands(self):
         run_id = "fed654cba321"

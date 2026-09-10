@@ -809,13 +809,11 @@ function Invoke-Chapter105Bootstrap {
             }
             Invoke-Chapter105Native -FilePath 'docker' -Arguments ($context.ComposePrefix + $upArguments) `
                 -FailureMessage 'Infrastructure startup failed.' | Out-Null
-            $composeReadyArguments = @{ ComposePrefix = $context.ComposePrefix }
             if ($null -ne $context.ComposeDeadline) {
-                $composeReadyArguments['Deadline'] = $context.ComposeDeadline
-                $composeReadyArguments['Attempts'] = 1
-                $composeReadyArguments['SleepSeconds'] = 0
+                @{ services = 13; readiness = 'compose_native_wait' }
+            } else {
+                Wait-Chapter105ComposeReady -ComposePrefix $context.ComposePrefix
             }
-            Wait-Chapter105ComposeReady @composeReadyArguments
         }
         Invoke-Chapter105BootstrapStage -Report $report -Name 'initialization' -Action {
             Invoke-Chapter105Initialization -ComposePrefix $context.ComposePrefix -EnvPath $envPath `
