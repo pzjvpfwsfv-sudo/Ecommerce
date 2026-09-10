@@ -347,19 +347,13 @@ function Invoke-Chapter105ReconciledJobSubmission {
         [switch]$SkipBuild
     )
 
-    $submittedJobId = $null
     try {
-        $candidate = @(Invoke-Chapter105JobSubmission -RepositoryRoot $RepositoryRoot -ComposePrefix $ComposePrefix `
-                -CheckpointUri $CheckpointUri -SavepointPath $SavepointPath -SkipBuild:$SkipBuild)
-        if ($candidate.Count -eq 1 -and $candidate[0] -is [string] -and
-            [string]$candidate[0] -cmatch '^[0-9a-f]{32}$') {
-            $submittedJobId = [string]$candidate[0]
-        }
+        Invoke-Chapter105JobSubmission -RepositoryRoot $RepositoryRoot -ComposePrefix $ComposePrefix `
+            -CheckpointUri $CheckpointUri -SavepointPath $SavepointPath -SkipBuild:$SkipBuild | Out-Null
     } catch { }
 
     $running = Wait-Chapter105UniqueRunningJob -FlinkPort $FlinkPort -JobName $JobName -Attempts 30 -SleepSeconds 1
-    if ($running.job_id -isnot [string] -or [string]$running.job_id -cnotmatch '^[0-9a-f]{32}$' -or
-        ($null -ne $submittedJobId -and [string]$running.job_id -cne $submittedJobId)) {
+    if ($running.job_id -isnot [string] -or [string]$running.job_id -cnotmatch '^[0-9a-f]{32}$') {
         throw 'Flink job submission failed.'
     }
     return [string]$running.job_id
