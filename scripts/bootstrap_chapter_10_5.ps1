@@ -680,7 +680,8 @@ function Invoke-Chapter105Bootstrap {
         [string]$ReportPath = 'tmp/chapter-10-5/bootstrap-report.json',
         [string]$ComposeProjectName,
         [switch]$InitializeEmptyCatalog,
-        [switch]$IsolatedAcceptance
+        [switch]$IsolatedAcceptance,
+        [string]$DeadlineUtc
     )
 
     Set-StrictMode -Version Latest
@@ -712,6 +713,9 @@ function Invoke-Chapter105Bootstrap {
                         $DeadlineUtc, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind)
                 } catch {
                     throw 'Acceptance deadline is invalid.'
+                }
+                if ($context.ComposeDeadline -le [DateTimeOffset]::UtcNow) {
+                    throw 'Acceptance deadline has expired.'
                 }
             }
             Assert-Chapter105EmptyCatalogGate -InitializeEmptyCatalog:$InitializeEmptyCatalog `

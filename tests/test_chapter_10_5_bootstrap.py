@@ -2255,6 +2255,98 @@ $result = Wait-Chapter105ComposeReady -ComposePrefix @("compose-prefix") -Deadli
         self.assertEqual(31, payload["polls"])
         self.assertEqual(13, payload["services"])
 
+    def test_bootstrap_internal_function_forwards_exact_deadline_to_compose_readiness(self):
+        run_id = "abc123def456"
+        project = f"chapter105-acceptance-{run_id}"
+        run_root = ROOT / "tmp" / "chapter-10-5" / "acceptance" / run_id
+        env_file = run_root / "isolated.env"
+        minio_data = run_root / "minio-data"
+        run_root.mkdir(parents=True)
+        values = [
+            line
+            for line in (ROOT / "infra" / ".env.example").read_text(encoding="utf-8").splitlines()
+            if not line.startswith(("PROJECT_NAME=", "MINIO_DATA_DIR="))
+        ]
+        env_file.write_text(
+            "\n".join(values + [f"PROJECT_NAME={project}", f"MINIO_DATA_DIR={minio_data}"]) + "\n",
+            encoding="utf-8",
+        )
+        try:
+            payload = self._powershell_payload(
+                f'''
+. (Resolve-Path "scripts/bootstrap_chapter_10_5.ps1") -FunctionsOnly
+$deadline = "2027-01-02T03:04:05.0000000+00:00"
+$script:capturedDeadline = $null
+function Assert-Chapter105Preflight {{ param($RepositoryRoot, $Environment, $MinioDataPath, $SkipBuild) }}
+function Invoke-Chapter105Native {{ param($FilePath, $Arguments, $FailureMessage) return @() }}
+function Wait-Chapter105ComposeReady {{
+    param($ComposePrefix, $Deadline)
+    $script:capturedDeadline = $Deadline.ToString("o")
+    throw "stop-after-deadline-capture"
+}}
+function Write-Chapter105BootstrapReport {{ param($Report, $Path) }}
+$failure = $null
+try {{
+    Invoke-Chapter105Bootstrap -EnvFile "{env_file}" -SkipBuild -IsolatedAcceptance `
+        -ComposeProjectName "{project}" -ReportPath "{run_root / 'bootstrap-first.json'}" -DeadlineUtc $deadline
+}} catch {{ $failure = $_.Exception.Message }}
+[ordered]@{{ deadline = $script:capturedDeadline; error = $failure }} | ConvertTo-Json -Compress
+'''
+            )
+            self.assertEqual("2027-01-02T03:04:05.0000000+00:00", payload["deadline"])
+            self.assertEqual("Chapter 10.5 bootstrap failed. See the bootstrap report for safe stage status.", payload["error"])
+        finally:
+            env_file.unlink(missing_ok=True)
+            run_root.rmdir()
+
+    def test_bootstrap_rejects_invalid_or_expired_deadline_before_preflight_or_native_commands(self):
+        run_id = "fed654cba321"
+        project = f"chapter105-acceptance-{run_id}"
+        run_root = ROOT / "tmp" / "chapter-10-5" / "acceptance" / run_id
+        env_file = run_root / "isolated.env"
+        minio_data = run_root / "minio-data"
+        run_root.mkdir(parents=True)
+        values = [
+            line
+            for line in (ROOT / "infra" / ".env.example").read_text(encoding="utf-8").splitlines()
+            if not line.startswith(("PROJECT_NAME=", "MINIO_DATA_DIR="))
+        ]
+        env_file.write_text(
+            "\n".join(values + [f"PROJECT_NAME={project}", f"MINIO_DATA_DIR={minio_data}"]) + "\n",
+            encoding="utf-8",
+        )
+        try:
+            payload = self._powershell_payload(
+                f'''
+. (Resolve-Path "scripts/bootstrap_chapter_10_5.ps1") -FunctionsOnly
+$script:preflightCalls = 0
+$script:nativeCalls = 0
+function Assert-Chapter105Preflight {{ param($RepositoryRoot, $Environment, $MinioDataPath, $SkipBuild); $script:preflightCalls += 1 }}
+function Invoke-Chapter105Native {{ param($FilePath, $Arguments, $FailureMessage); $script:nativeCalls += 1; throw "native command must not run" }}
+function Write-Chapter105BootstrapReport {{ param($Report, $Path) }}
+$results = @()
+foreach ($deadline in @("not-a-deadline", ([DateTimeOffset]::UtcNow.AddSeconds(-1).ToString("o")))) {{
+    $script:preflightCalls = 0
+    $script:nativeCalls = 0
+    $failure = $null
+    try {{
+        Invoke-Chapter105Bootstrap -EnvFile "{env_file}" -SkipBuild -IsolatedAcceptance `
+            -ComposeProjectName "{project}" -ReportPath "{run_root / 'bootstrap-first.json'}" -DeadlineUtc $deadline
+    }} catch {{ $failure = $_.Exception.Message }}
+    $results += [ordered]@{{ error = $failure; preflight_calls = $script:preflightCalls; native_calls = $script:nativeCalls }}
+}}
+$results | ConvertTo-Json -Depth 4 -Compress
+'''
+            )
+            self.assertEqual(2, len(payload))
+            for result in payload:
+                self.assertEqual("Chapter 10.5 bootstrap failed. See the bootstrap report for safe stage status.", result["error"])
+                self.assertEqual(0, result["preflight_calls"])
+                self.assertEqual(0, result["native_calls"])
+        finally:
+            env_file.unlink(missing_ok=True)
+            run_root.rmdir()
+
     def test_compose_ps_parser_accepts_array_ndjson_and_single_object_on_powershell_51(self):
         payload = self._powershell_payload(
             r'''
