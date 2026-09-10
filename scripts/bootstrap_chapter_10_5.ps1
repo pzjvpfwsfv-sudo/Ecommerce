@@ -525,7 +525,7 @@ function Invoke-Chapter105Acceptance {
     if ($doris.Count -ne 1 -or ($doris[0].Trim() -notmatch '^[0-9]+$')) { throw 'Doris metrics acceptance failed.' }
     $trino = Invoke-Chapter105Native -FilePath 'docker' -Arguments ($ComposePrefix + @(
         'exec', '-T', 'trino', 'trino', '--server', 'http://localhost:8080', '--catalog', 'lakehouse', '--schema', 'analytics',
-        '--output-format', 'CSV_HEADER', '--execute', 'SELECT COUNT(*) AS event_count FROM lakehouse.analytics.user_behavior_detail;'
+        '--output-format', 'CSV_HEADER_UNQUOTED', '--execute', 'SELECT COUNT(*) AS event_count FROM lakehouse.analytics.user_behavior_detail;'
     )) -FailureMessage 'Trino fixed table acceptance failed.'
     $trinoLines = @($trino | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
     if ($trinoLines.Count -ne 2 -or $trinoLines[0] -cne 'event_count' -or $trinoLines[1] -notmatch '^[0-9]+$') { throw 'Trino fixed table acceptance failed.' }

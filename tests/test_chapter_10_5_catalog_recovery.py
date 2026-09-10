@@ -12,6 +12,24 @@ UUID_TWO = "22222222-2222-4222-8222-222222222222"
 
 
 class Chapter105CatalogRecoveryTest(unittest.TestCase):
+    def test_compose_wrapper_ignores_successful_native_stderr_without_polluting_stdout(self):
+        payload = self._payload(
+            r'''
+. (Resolve-Path "scripts/restore_chapter_10_5_catalog.ps1") -FunctionsOnly
+function docker {
+    & powershell -NoProfile -Command "[Console]::Error.WriteLine('jline warning'); [Console]::Out.WriteLine('table_count'); exit 0"
+    $global:LASTEXITCODE = $LASTEXITCODE
+}
+$ErrorActionPreference = "Stop"
+$failure = ""
+$output = @()
+try { $output = @(Invoke-Chapter105Compose -Arguments @("ps") -FailureMessage "failed") } catch { $failure = $_.Exception.Message }
+[ordered]@{ failure = $failure; output = @($output) } | ConvertTo-Json -Depth 4 -Compress
+'''
+        )
+        self.assertEqual("", payload["failure"])
+        self.assertEqual(["table_count"], payload["output"])
+
     def test_custom_env_file_is_used_by_compose_wrapper(self):
         payload = self._payload(
             r'''

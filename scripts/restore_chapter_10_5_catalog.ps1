@@ -32,12 +32,17 @@ function Invoke-Chapter105Compose {
         "--profile", "lakehouse"
     ) + $Arguments
 
+    $previousErrorActionPreference = $ErrorActionPreference
     try {
-        $output = @(& docker @composeArguments 2>&1)
+        $ErrorActionPreference = 'Continue'
+        $output = @(& docker @composeArguments 2>$null)
+        $exitCode = $LASTEXITCODE
     } catch {
         throw $FailureMessage
+    } finally {
+        $ErrorActionPreference = $previousErrorActionPreference
     }
-    if ($LASTEXITCODE -ne 0) {
+    if ($exitCode -ne 0) {
         throw $FailureMessage
     }
     return @($output | ForEach-Object { [string]$_ })
@@ -55,7 +60,7 @@ function Invoke-Chapter105Trino {
         "--server", "http://localhost:8080",
         "--catalog", "lakehouse",
         "--schema", "analytics",
-        "--output-format", "CSV_HEADER",
+        "--output-format", "CSV_HEADER_UNQUOTED",
         "--execute", $Sql
     ) -FailureMessage $FailureMessage
 }
@@ -240,8 +245,8 @@ FROM lakehouse.analytics.user_behavior_detail
 function Restore-Chapter105Catalog {
     $tableCount = Get-Chapter105CatalogTableCount
     if ($tableCount -eq 1) {
-        Assert-Chapter105FixedTableLocation
-        Assert-Chapter105FixedTableReadable
+        $null = Assert-Chapter105FixedTableLocation
+        $null = Assert-Chapter105FixedTableReadable
         return "already_registered"
     }
     if ($tableCount -ne 0) {

@@ -851,7 +851,7 @@ function Invoke-AcceptanceTrinoScalar {
         [Parameter(Mandatory = $true)][DateTimeOffset]$Deadline
     )
     $lines = @(Invoke-AcceptanceDocker -Arguments ($ComposePrefix + @('exec', '-T', 'trino', 'trino', '--server', 'http://localhost:8080',
-        '--catalog', 'lakehouse', '--schema', 'analytics', '--output-format', 'CSV_HEADER', '--execute', $Sql)) `
+        '--catalog', 'lakehouse', '--schema', 'analytics', '--output-format', 'CSV_HEADER_UNQUOTED', '--execute', $Sql)) `
         -Deadline $Deadline -FailureMessage 'Isolated Trino query failed.')
     if ($lines.Count -ne 2) { throw 'Isolated Trino scalar query returned an invalid result.' }
     return $lines[1].Trim()
