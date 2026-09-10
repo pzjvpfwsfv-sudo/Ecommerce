@@ -215,4 +215,14 @@ docker compose --env-file infra/.env.example -f infra/docker-compose.yml --profi
 
 详细证据与排障过程见 `docs/chapter-9-datastream-quality-runbook.md`。
 
-当前边界：**影子链路已完成、主链路尚未切换。**
+当前状态：**影子验证和受控主链路切换均已完成，原始链路、回滚入口与验证证据仍保留。**
+
+## 第 10.5 章：幂等启动与恢复
+
+Java DataStream 生产 Job 已纳入统一工程化入口：
+
+```powershell
+./scripts/bootstrap_chapter_10_5.ps1
+```
+
+该入口负责构建并确保目标 Job 恰好一个且为 `RUNNING`，checkpoint/savepoint 使用 MinIO `flink-state` bucket。日常启动、首次迁移和故障诊断见 `../docs/chapter-10-5-engineering-hardening-runbook.md`。

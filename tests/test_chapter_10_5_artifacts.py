@@ -12,9 +12,64 @@ CATALOG_RECOVERY = ROOT / "scripts" / "restore_chapter_10_5_catalog.ps1"
 BOOTSTRAP = ROOT / "scripts" / "bootstrap_chapter_10_5.ps1"
 MIGRATE = ROOT / "scripts" / "migrate_chapter_10_5.ps1"
 RESET = ROOT / "scripts" / "reset_chapter_10_5_realtime.ps1"
+RUNBOOK = ROOT / "docs" / "chapter-10-5-engineering-hardening-runbook.md"
+README = ROOT / "README.md"
+JOBS_README = ROOT / "jobs" / "README.md"
 
 
 class Chapter105ArtifactsTest(unittest.TestCase):
+    def test_runbook_documents_safe_operational_contract(self):
+        self.assertTrue(RUNBOOK.is_file(), RUNBOOK)
+        if not RUNBOOK.is_file():
+            return
+
+        runbook = RUNBOOK.read_text(encoding="utf-8")
+        readme = README.read_text(encoding="utf-8")
+        jobs_readme = JOBS_README.read_text(encoding="utf-8")
+
+        for heading in (
+            "## 全新克隆",
+            "## 已有环境迁移",
+            "## 日常幂等启动",
+            "## 实时层 Reset",
+            "## Catalog 恢复",
+            "## Readiness 诊断",
+            "## 线程池饱和诊断",
+        ):
+            self.assertIn(heading, runbook)
+
+        for required in (
+            "bootstrap_chapter_10_5.ps1",
+            "migrate_chapter_10_5.ps1",
+            "reset_chapter_10_5_realtime.ps1",
+            "restore_chapter_10_5_catalog.ps1",
+            "verify_chapter_10_5_cold_start.ps1",
+            "-TrafficPaused",
+            "-ConfirmRealtimeReset",
+            "-ConfirmReset",
+            "/health",
+            "/ready",
+            "warehouse",
+            "flink-state",
+            "kafka-controller-data",
+            "kafka-broker-data",
+            "doris-fe-meta",
+            "doris-be-storage",
+            "metastore-postgres-data",
+            "PostgreSQL Metastore",
+            "统一 deadline",
+            "有界线程池",
+            "不得删除 warehouse",
+        ):
+            self.assertIn(required, runbook)
+
+        operational_docs = f"{runbook}\n{readme}\n{jobs_readme}"
+        self.assertNotIn("DB_DRIVER: derby", operational_docs)
+        self.assertNotIn(".worktrees", operational_docs)
+        self.assertNotIn("file:///opt/flink/checkpoints", operational_docs)
+        self.assertIn("chapter-10-5-engineering-hardening-runbook.md", readme)
+        self.assertIn("第 10.5 章", jobs_readme)
+
     def test_controlled_migration_and_reset_have_narrow_non_generic_surfaces(self):
         self.assertTrue(MIGRATE.is_file(), MIGRATE)
         self.assertTrue(RESET.is_file(), RESET)

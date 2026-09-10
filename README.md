@@ -249,6 +249,10 @@ MinIO 版当前已经通过真实验证，关键修复点是把 S3A 配置下沉
 
 运行前须让已有的 FastAPI、Doris、Trino、Flink REST 和第 9 章唯一生产质量 Job 处于可用状态。验收通过时最后一行输出 `{"status":"PASS","requests":5,"tools_verified":3,"prompt_injection_blocked":true}`；完整前提、失败排障和面试叙事见 [第 10 章运行手册](docs/chapter-10-controlled-tool-calling-runbook.md)。
 
+## 第 10.5 章：工程可靠性加固
+
+进入第 11 章前，使用 `./scripts/bootstrap_chapter_10_5.ps1` 作为唯一推荐启动入口。它统一处理 PostgreSQL Metastore、五个持久化命名卷、MinIO 湖数据与 Flink 状态、Catalog/Job 恢复、功能性 readiness 和严格验收；迁移、reset 与排障命令见 [第 10.5 章运行手册](docs/chapter-10-5-engineering-hardening-runbook.md)。当前边界仍是本地单机、非生产 HA、非公网安全部署。
+
 ## 章节路线
 
 1. 第 0 章：项目认知 + 环境准备 + 最小主链路设计
@@ -262,10 +266,11 @@ MinIO 版当前已经通过真实验证，关键修复点是把 S3A 配置下沉
 9. 第 8 章：可信指标 AI 分析助手
 10. 第 9 章：Java DataStream 数据质量治理、影子验证、受控切流与安全回滚
 11. 第 10 章：受控工具调用与审计
-12. 第 11 章：受控 NL2SQL
-13. 后续：产品化评测、可观测性、压测与状态调优
+12. 第 10.5 章：持久化、冷启动与运行可靠性加固
+13. 第 11 章：受控 NL2SQL
+14. 后续：产品化评测、可观测性、压测与状态调优
 
-第 10 章仍不生成或执行 SQL；模型只能选择后端注册的只读工具。
+第 10.5 章完成并通过隔离动态验收后才进入第 11 章。第 10 章仍不生成或执行 SQL；模型只能选择后端注册的只读工具。
 
 详细流程见 [docs/PROJECT_FLOW.md](/D:/桌面/实时湖仓电商行为数据平台 + AI 指标分析助手项目/docs/PROJECT_FLOW.md)。
 
