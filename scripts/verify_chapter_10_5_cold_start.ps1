@@ -839,7 +839,7 @@ function Invoke-AcceptanceBootstrap {
     )
     $arguments = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $RepositoryRoot 'scripts/bootstrap_chapter_10_5.ps1'),
         '-EnvFile', $EnvFile, '-ComposeProjectName', $ProjectName, '-ReportPath', $ReportPath,
-        '-SkipBuild', '-IsolatedAcceptance')
+        '-DeadlineUtc', $Deadline.ToString('o'), '-SkipBuild', '-IsolatedAcceptance')
     if ($InitializeEmptyCatalog) { $arguments += '-InitializeEmptyCatalog' }
     Invoke-AcceptanceProcess -FilePath 'powershell' -Arguments $arguments -Deadline $Deadline -FailureMessage 'Isolated Bootstrap failed.' | Out-Null
 }

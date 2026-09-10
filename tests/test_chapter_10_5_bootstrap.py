@@ -2222,6 +2222,39 @@ $result = Wait-Chapter105ComposeReady -ComposePrefix @("compose-prefix") -Attemp
         )
         self.assertEqual({"all": True, "services": 13}, payload)
 
+    def test_compose_readiness_uses_remaining_acceptance_deadline_not_fixed_sixty_seconds(self):
+        payload = self._powershell_payload(
+            r'''
+. (Resolve-Path "scripts/bootstrap_chapter_10_5.ps1") -FunctionsOnly
+$script:polls = 0
+function Start-Sleep { param($Seconds) }
+function Invoke-Chapter105Native {
+    param([string]$FilePath, [string[]]$Arguments, [string]$FailureMessage)
+    $script:polls += 1
+    $kafkaState = if ($script:polls -le 30) { "starting" } else { "running" }
+    return @(
+        ('{"Service":"kafka-controller","State":"' + $kafkaState + '","Health":""}'),
+        '{"Service":"kafka-broker","State":"running","Health":""}',
+        '{"Service":"api","State":"running","Health":""}',
+        '{"Service":"flink-jobmanager","State":"running","Health":""}',
+        '{"Service":"flink-taskmanager","State":"running","Health":""}',
+        '{"Service":"flink-sql-client","State":"running","Health":""}',
+        '{"Service":"doris-fe","State":"running","Health":""}',
+        '{"Service":"doris-be","State":"running","Health":""}',
+        '{"Service":"minio","State":"running","Health":"healthy"}',
+        '{"Service":"minio-init","State":"exited","Health":"","ExitCode":0}',
+        '{"Service":"metastore-postgres","State":"running","Health":"healthy"}',
+        '{"Service":"hive-metastore","State":"running","Health":""}',
+        '{"Service":"trino","State":"running","Health":""}'
+    )
+}
+$result = Wait-Chapter105ComposeReady -ComposePrefix @("compose-prefix") -Deadline ([DateTimeOffset]::UtcNow.AddSeconds(121)) -SleepSeconds 2
+[ordered]@{ polls = $script:polls; services = $result.services } | ConvertTo-Json -Compress
+'''
+        )
+        self.assertEqual(31, payload["polls"])
+        self.assertEqual(13, payload["services"])
+
     def test_compose_ps_parser_accepts_array_ndjson_and_single_object_on_powershell_51(self):
         payload = self._powershell_payload(
             r'''

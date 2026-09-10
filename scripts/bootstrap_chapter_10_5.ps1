@@ -6,6 +6,7 @@ param(
     [string]$ComposeProjectName,
     [switch]$InitializeEmptyCatalog,
     [switch]$IsolatedAcceptance,
+    [string]$DeadlineUtc,
     [switch]$FunctionsOnly
 )
 
@@ -264,10 +265,20 @@ function Wait-Chapter105ComposeReady {
     param(
         [Parameter(Mandatory = $true)][string[]]$ComposePrefix,
         [int]$Attempts = 30,
-        [int]$SleepSeconds = 2
+        [int]$SleepSeconds = 2,
+        [DateTimeOffset]$Deadline
     )
 
-    Invoke-Chapter105Retry -Attempts $Attempts -SleepSeconds $SleepSeconds -FailureMessage 'Compose services did not become ready.' -Action {
+    $effectiveAttempts = $Attempts
+    if ($PSBoundParameters.ContainsKey('Deadline')) {
+        $remainingSeconds = ($Deadline - [DateTimeOffset]::UtcNow).TotalSeconds
+        if ($remainingSeconds -le 0) { throw 'Compose services did not become ready.' }
+        $pollIntervalSeconds = [Math]::Max(1, $SleepSeconds)
+        # The verifier's 45-minute global deadline permits at most 1,350 two-second polls.
+        $effectiveAttempts = [Math]::Min(1350, [Math]::Max(1, [Math]::Ceiling($remainingSeconds / $pollIntervalSeconds)))
+    }
+
+    Invoke-Chapter105Retry -Attempts ([int]$effectiveAttempts) -SleepSeconds $SleepSeconds -FailureMessage 'Compose services did not become ready.' -Action {
         $raw = Invoke-Chapter105Native -FilePath 'docker' -Arguments ($ComposePrefix + @('ps', '--all', '--format', 'json')) -FailureMessage 'Compose status query failed.'
         $services = @(ConvertFrom-Chapter105ComposePsOutput -Lines $raw)
         $byService = @{}
@@ -687,6 +698,7 @@ function Invoke-Chapter105Bootstrap {
         StateRoot = $null
         CheckpointUri = $null
         SavepointUri = $null
+        ComposeDeadline = $null
     }
     $jobName = 'chapter-9-datastream-quality-production'
     $bootstrapFailed = $false
@@ -694,6 +706,14 @@ function Invoke-Chapter105Bootstrap {
     $previousMinioDataDir = [Environment]::GetEnvironmentVariable('MINIO_DATA_DIR', 'Process')
     try {
         Invoke-Chapter105BootstrapStage -Report $report -Name 'preflight' -Action {
+            if (-not [string]::IsNullOrWhiteSpace($DeadlineUtc)) {
+                try {
+                    $context.ComposeDeadline = [DateTimeOffset]::Parse(
+                        $DeadlineUtc, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind)
+                } catch {
+                    throw 'Acceptance deadline is invalid.'
+                }
+            }
             Assert-Chapter105EmptyCatalogGate -InitializeEmptyCatalog:$InitializeEmptyCatalog `
                 -IsolatedAcceptance:$IsolatedAcceptance
             if ($IsolatedAcceptance) {
@@ -779,7 +799,9 @@ function Invoke-Chapter105Bootstrap {
         Invoke-Chapter105BootstrapStage -Report $report -Name 'infrastructure' -Action {
             Invoke-Chapter105Native -FilePath 'docker' -Arguments ($context.ComposePrefix + @('up', '-d')) `
                 -FailureMessage 'Infrastructure startup failed.' | Out-Null
-            Wait-Chapter105ComposeReady -ComposePrefix $context.ComposePrefix
+            $composeReadyArguments = @{ ComposePrefix = $context.ComposePrefix }
+            if ($null -ne $context.ComposeDeadline) { $composeReadyArguments['Deadline'] = $context.ComposeDeadline }
+            Wait-Chapter105ComposeReady @composeReadyArguments
         }
         Invoke-Chapter105BootstrapStage -Report $report -Name 'initialization' -Action {
             Invoke-Chapter105Initialization -ComposePrefix $context.ComposePrefix -EnvPath $envPath `
@@ -852,4 +874,4 @@ if ($FunctionsOnly) { return }
 
 Invoke-Chapter105Bootstrap -EnvFile $EnvFile -SkipBuild:$SkipBuild -ReportPath $ReportPath `
     -ComposeProjectName $ComposeProjectName -InitializeEmptyCatalog:$InitializeEmptyCatalog `
-    -IsolatedAcceptance:$IsolatedAcceptance
+    -IsolatedAcceptance:$IsolatedAcceptance -DeadlineUtc $DeadlineUtc

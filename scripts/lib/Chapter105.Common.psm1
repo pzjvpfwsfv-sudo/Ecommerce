@@ -277,7 +277,7 @@ function Invoke-Chapter105Native {
 
 function Invoke-Chapter105Retry {
     param(
-        [Parameter(Mandatory = $true)][ValidateRange(1, 120)][int]$Attempts,
+        [Parameter(Mandatory = $true)][ValidateRange(1, 1350)][int]$Attempts,
         [Parameter(Mandatory = $true)][ValidateRange(0, 60)][int]$SleepSeconds,
         [Parameter(Mandatory = $true)][string]$FailureMessage,
         [Parameter(Mandatory = $true)][scriptblock]$Action

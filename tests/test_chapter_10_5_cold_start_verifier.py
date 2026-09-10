@@ -500,6 +500,7 @@ $script:call | ConvertTo-Json -Depth 5 -Compress
         self.assertEqual(1, payload["argv"].count("-InitializeEmptyCatalog"))
         self.assertEqual("chapter105-acceptance-123456789abc", payload["argv"][payload["argv"].index("-ComposeProjectName") + 1])
         self.assertEqual("C:\\run\\isolated.env", payload["argv"][payload["argv"].index("-EnvFile") + 1])
+        self.assertEqual("2026-08-27T12:34:56.0000000+00:00", payload["argv"][payload["argv"].index("-DeadlineUtc") + 1])
 
     def test_clean_checkout_artifact_build_uses_owned_java17_container_and_run_cache(self):
         with tempfile.TemporaryDirectory(dir=ROOT / "tmp" / "chapter-10-5") as directory:
