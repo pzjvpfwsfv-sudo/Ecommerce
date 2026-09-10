@@ -347,6 +347,12 @@ function powershell { $script:nativeCalls++; throw "powershell must not run" }
         self.assertIn("MINIO_ROOT_USER: ${MINIO_ROOT_USER}", compose_text)
         self.assertIn("MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}", compose_text)
 
+    def test_trino_healthcheck_allows_for_cold_jvm_startup(self):
+        compose_text = COMPOSE_FILE.read_text(encoding="utf-8")
+        trino_service = compose_text.split("  trino:\n", 1)[1].split("\nvolumes:\n", 1)[0]
+
+        self.assertIn("start_period: 60s", trino_service)
+
 
 if __name__ == "__main__":
     unittest.main()
