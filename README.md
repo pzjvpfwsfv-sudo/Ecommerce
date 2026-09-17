@@ -10,10 +10,13 @@
 - [G1 真实数据实施计划](docs/superpowers/plans/2026-09-17-graduation-phase-1-real-data.md)
 - [G1 跨月完整文件与稳定用户采样](docs/superpowers/plans/2026-09-17-graduation-cross-month-data.md)
 - [数据准备命令、真实画像与剩余验收](docs/graduation/data-readiness.md)
+- [G2-A 固定速率与可恢复历史回放](docs/graduation/replay-runbook.md)
 
 已新增不依赖 Docker 的真实数据准备工具：`python -m generators.real_data --help`。它与旧模拟生成器隔离，不自动写 Kafka，不把历史前缀样本当作完整分析窗口。
 
 当前真实数据依据：已完整扫描 2019 年 10/11 月共 109,950,743 条源记录，按稳定用户抽样得到 2,199,938 条事件，覆盖 61 天；最终复跑及 449 项 Python 测试通过。下一步为真实历史回放与新链路适配，业务页面和 RAG 尚未完成。GitHub 备份使用 `codex/chapter-10-controlled-tools` 开发分支；真实数据、密钥和服务卷不包含在 Git 中。
+
+G2-A 已提供 `python -m generators.real_data.replay`：默认离线试跑，显式 Kafka 模式只允许真实数据专用 Topic，支持限速、确认后保存进度和 Ctrl+C 恢复。真实样本 400+600 条离线恢复及逐条身份核对通过；Kafka 动态验收状态见运行手册，不等同于新 Flink/湖仓链路已完成。
 
 ## 项目目标
 

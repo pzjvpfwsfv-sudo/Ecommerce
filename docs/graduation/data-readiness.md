@@ -140,6 +140,8 @@ python -m generators.real_data sample-users --inputs data/rees46/months/2019-Oct
 
 下一步进入 G2 的可恢复历史回放：复用已验证的标准化 JSONL，不重复生成或改写业务时间；建立独立 Topic/表、DataStream 适配和版本化指标 API。各业务分组的有效样本量、会话边界及留存分母规则须在相应指标上线前验收。随后接前端与知识库；RAG 必须与最终指标口径同版本，不提前把待确认口径发布为可信知识。
 
+G2-A 回放器现已实现，真实样本 400+600 条离线恢复与逐条核验通过；其专用 Kafka 适配器、操作命令、动态验收状态及重复发送边界见 [回放运行手册](replay-runbook.md)。新 DataStream 事件格式和湖仓表尚未接入。
+
 ## GitHub 备份边界
 
 远程仓库为 https://github.com/pzjvpfwsfv-sudo/Ecommerce ，当前开发分支为 `codex/chapter-10-controlled-tools`。代码、配置模板、测试、中文设计及验收文档可以随该分支提交备份；主工作区未提交的其他修改不包含在本次开发提交中。
