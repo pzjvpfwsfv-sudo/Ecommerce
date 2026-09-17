@@ -2,6 +2,19 @@
 
 这是一个面向秋招展示与能力训练的实战项目，目标不是堆技术名词，而是做出一条能解释、能运行、能调优、能写进简历的数据工程主链路。
 
+## 毕设与校招版（2026-09）
+
+新增方向为“基于实时湖仓与检索增强智能体的电商行为分析系统”。真实数据、业务可视化、知识库和受控 Agent 是核心范围，以下历史章节不是新版功能完成声明。
+
+- [毕设总设计与功能边界](docs/superpowers/specs/2026-09-17-graduation-system-design.md)
+- [G1 真实数据实施计划](docs/superpowers/plans/2026-09-17-graduation-phase-1-real-data.md)
+- [G1 跨月完整文件与稳定用户采样](docs/superpowers/plans/2026-09-17-graduation-cross-month-data.md)
+- [数据准备命令、真实画像与剩余验收](docs/graduation/data-readiness.md)
+
+已新增不依赖 Docker 的真实数据准备工具：`python -m generators.real_data --help`。它与旧模拟生成器隔离，不自动写 Kafka，不把历史前缀样本当作完整分析窗口。
+
+当前真实数据依据：已完整扫描 2019 年 10/11 月共 109,950,743 条源记录，按稳定用户抽样得到 2,199,938 条事件，覆盖 61 天；最终复跑及 449 项 Python 测试通过。下一步为真实历史回放与新链路适配，业务页面和 RAG 尚未完成。GitHub 备份使用 `codex/chapter-10-controlled-tools` 开发分支；真实数据、密钥和服务卷不包含在 Git 中。
+
 ## 项目目标
 
 - 用真实工程化方式搭建电商行为实时数据链路

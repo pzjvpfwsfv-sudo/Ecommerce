@@ -1,0 +1,28 @@
+{
+  "dataset_id": "rees46-multicategory-2019-2020",
+  "publisher": "REES46 / Open CDP",
+  "catalog_url": "https://rees46.com/en/datasets",
+  "description_url": "https://www.kaggle.com/datasets/mkechinov/ecommerce-behavior-data-from-multi-category-store/data",
+  "download_catalog_url": "https://data.rees46.com/",
+  "source_file": "2019-Oct.csv.gz",
+  "source_url": "https://data.rees46.com/datasets/marketplace/2019-Oct.csv.gz",
+  "original_time_zone": "UTC",
+  "usage_note": "Publisher dataset card allows use in works, books and education with links to the dataset and REES46. Keep source attribution; check current terms before redistribution.",
+  "provenance_boundary": "Public anonymized historical events as described by the publisher; not independently audited production data.",
+  "missing_capabilities": ["verified_order_id", "item_quantity", "refund", "cost", "profit", "demographics", "channel", "device_type"],
+  "fetch_mode": "explicit_prefix_or_registered_full_month",
+  "months": {
+    "2019-Oct": {
+      "source_file": "2019-Oct.csv.gz",
+      "source_url": "https://data.rees46.com/datasets/marketplace/2019-Oct.csv.gz",
+      "window_start": "2019-10-01T00:00:00+00:00",
+      "window_end": "2019-11-01T00:00:00+00:00"
+    },
+    "2019-Nov": {
+      "source_file": "2019-Nov.csv.gz",
+      "source_url": "https://data.rees46.com/datasets/marketplace/2019-Nov.csv.gz",
+      "window_start": "2019-11-01T00:00:00+00:00",
+      "window_end": "2019-12-01T00:00:00+00:00"
+    }
+  }
+}

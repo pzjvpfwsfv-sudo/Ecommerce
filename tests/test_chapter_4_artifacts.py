@@ -36,9 +36,9 @@ class Chapter4ArtifactsTest(unittest.TestCase):
         text = COMPOSE_FILE.read_text(encoding="utf-8")
 
         self.assertIn("custom_network:", text)
-        self.assertIn("ip_range: 172.21.80.128/25", text)
-        self.assertIn("ipv4_address: 172.21.80.2", text)
-        self.assertIn("ipv4_address: 172.21.80.3", text)
+        self.assertIn("ip_range: ${DORIS_NETWORK_IP_RANGE:-172.21.80.128/25}", text)
+        self.assertIn("ipv4_address: ${DORIS_FE_STATIC_IP:-172.21.80.2}", text)
+        self.assertIn("ipv4_address: ${DORIS_BE_STATIC_IP:-172.21.80.3}", text)
         self.assertIn("doris-fe:", text)
         self.assertIn("doris-be:", text)
         self.assertIn('profiles: ["serving"]', text)
