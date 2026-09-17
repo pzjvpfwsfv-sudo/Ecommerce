@@ -21,12 +21,17 @@ python -m generators.real_data.replay --input data/rees46/oct-nov-users-2pct-ver
 
 ## Kafka 发送
 
-先确认 Docker 引擎及现有 Kafka 可用。只允许 `real_behavior_events_v1` 或带后缀的专用 Topic，旧 `user_behavior_*` 目标会被拒绝；发送器不会自动创建 Topic。下面的创建命令仅用于本机单 broker 验证，不是生产副本配置：
+先确认 Docker 引擎及现有 Kafka 可用，并通过 `docker ps -a` 与 `docker port <容器名> 9092/tcp` 核对实际容器和宿主端口，不假定是 `ecom-kafka` 或 `9092`。本次现有环境的宿主端口为 `32600`，容器内管理端口仍为 `29092`。
+
+只允许 `real_behavior_events_v1` 或带后缀的专用 Topic，旧 `user_behavior_*` 目标会被拒绝；发送器不会自动创建 Topic。下面使用新的 Topic 名和断点，创建命令仅用于本机单 broker 验证，不是生产副本配置：
 
 ```powershell
-docker exec ecom-kafka kafka-topics --bootstrap-server localhost:29092 --create --topic real_behavior_events_v1_verify_20260917 --partitions 1 --replication-factor 1
-python -m generators.real_data.replay --input data/rees46/oct-nov-users-2pct-verified.jsonl --checkpoint tmp/graduation/my-kafka-replay.json --mode kafka --topic real_behavior_events_v1_verify_20260917 --max-events 400 --rate 100
-python -m generators.real_data.replay --input data/rees46/oct-nov-users-2pct-verified.jsonl --checkpoint tmp/graduation/my-kafka-replay.json --mode kafka --topic real_behavior_events_v1_verify_20260917 --max-events 600 --rate 100
+$KafkaContainer = 'chapter105-acceptance-c6ee18cd5bba-kafka'
+$BootstrapServers = 'localhost:32600'
+$Topic = 'real_behavior_events_v1_my_verify_01'
+docker exec $KafkaContainer kafka-topics --bootstrap-server localhost:29092 --create --topic $Topic --partitions 1 --replication-factor 1 --config min.insync.replicas=1
+python -m generators.real_data.replay --input data/rees46/oct-nov-users-2pct-verified.jsonl --checkpoint tmp/graduation/my-kafka-replay.json --mode kafka --bootstrap-servers $BootstrapServers --topic $Topic --max-events 400 --rate 100
+python -m generators.real_data.replay --input data/rees46/oct-nov-users-2pct-verified.jsonl --checkpoint tmp/graduation/my-kafka-replay.json --mode kafka --bootstrap-servers $BootstrapServers --topic $Topic --max-events 600 --rate 100
 ```
 
 已有同名 Topic 时先检查其中的用途和数据，不删除重建。独立消费者必须按本轮 `replay_id` 核对实际接收条数、原始业务字段、事件 ID 与 key，不能只看发送端进度。
@@ -50,10 +55,46 @@ python -m generators.real_data.replay --input data/rees46/oct-nov-users-2pct-ver
 
 本地报告：`tmp/graduation/replay-dry-400.json`、`replay-dry-600.json`、`replay-offline-audit.json`。它们明确属于离线验证，不是 Kafka 接收证据。
 
-首次 Kafka 尝试因 Docker 引擎未启动而连接失败，退出码 1，`replay-kafka-checkpoint.json` 的确认位置保持为 0，未记录成功发送。真实 Kafka 消费对账仍需在运行环境可用后完成；不将连接失败或单元测试替代动态验收。
+### Docker 启动排障
 
-随后已尝试以隐藏窗口启动本机现有 Docker Desktop，但后端未就绪，`docker version` 查询持续无响应。核验 PID 和父进程后仅停止本任务的只读查询，未终止 Docker Desktop、未启动/重建容器、未拉取镜像、未清理卷。引擎启动失败原因尚未定位；环境阻塞保留，不扩大本轮为 Docker 重装排障。
+首次 Kafka 尝试因 Docker 引擎未启动而连接失败，退出码 1，`replay-kafka-checkpoint.json` 的确认位置保持为 0，未记录成功发送。随后 Docker Desktop 启动失败，命令行查询无响应；后续探针改用有超时的子进程，避免无限等待。
+
+本机 Docker Desktop 4.79.0 的日志先后指向 `%LOCALAPPDATA%\Docker\run\dockerInference` 与 `%LOCALAPPDATA%\docker-secrets-engine\engine.sock`，均为启动监听前移除 socket 失败。仅改名 `run` 不能处理另一个目录。检查时 `EnableDockerAI` 已为 false，未再修改配置；未将中文用户名或磁盘余量推断为已证实的根因。
+
+19:07 确认 Docker Desktop 和 backend 已退出、两个目录分别只有一个 0 字节 socket 后，重命名为同级 `.quarantine-20260917-190730` 备份。逐个确认旧路径消失、备份存在且文件 ID 不变，再重新启动。`docker version`、`docker info` 均成功，引擎版本 29.5.3，原有 13 个容器和 11 个镜像可见。本次恢复未重置、重装或清理 Docker 数据；不保证其他机器或后续版本均适用。
+
+### 真实 Kafka 发送与独立消费
+
+只启动现有 `chapter105-acceptance-c6ee18cd5bba-kafka-controller` 和 `chapter105-acceptance-c6ee18cd5bba-kafka`，没有重建容器、修改既有集群配置或启动其他湖仓服务。只读检查确认原有 Topic 为 `user_behavior_events`，再显式创建 `real_behavior_events_v1_verify_20260917`，1 分区、1 副本、`min.insync.replicas=1`，并确认开始和结束 offset 均为 0。
+
+实际连接地址为 `localhost:32600`，因此使用新断点 `tmp/graduation/replay-kafka-32600-checkpoint.json`，保留绑定旧地址且确认位置为 0 的失败断点，不手工篡改身份。
+
+- 任务 ID：`c701c1a3-bf13-4098-ab67-421c43462989`；两次 CLI 分别新增 400 和 600 条，累计 1,000 条，任务 ID 保持一致。
+- 独立消费者使用手工分配分区、无消费组、关闭自动提交和自动建 Topic，在两阶段分别核对 400/1,000 条；最终 offset 为 `[0, 1000)`，事件 ID 去重后仍为 1,000 个。
+- 逐条比较源 JSONL 的全部 14 个字段、顺序与 UTF-8 key，全部一致。原始 `event_time` 保留 2019 年，2026 年发送时间仅写入 `replayed_at`。
+- 最终事件 ID 序列 SHA 与前述离线审计一致：`6d0bf50f0f193632245329107cfc0b02d37a0121e7120e74b94c39513d21cdd7`。
+- 本地证据：`tmp/graduation/replay-kafka-400.json`、`replay-kafka-600.json`、`replay-kafka-audit-400.json`、`replay-kafka-audit-1000.json`；独立核对脚本为同目录 `audit_kafka_replay.py`，不依赖回放器内部验证函数。
+
+本次完成真实 Kafka 交付和正常退出后的断点续传验证，不代表故障强杀重试、端到端 exactly-once、220 万条全量回放或 Flink/湖仓落地已验收。Topic 和断点保留用于检查，未删除。后续重跑须另建任务，不能把已有 1,000 条的 Topic 当作空 Topic。
 
 Python 全回归 472 项通过，其中新增回放测试 23 项，耗时 169.508 秒；网络用可控适配器测试，文件锁、原子断点、暂停恢复、源文件校验使用实际实现。Java 新事件适配、湖仓落地和 RAG 不在本次验收范围内。
+
+Kafka 动态验收后再次运行 `python -m unittest discover -s tests -p 'test_real_data_replay*.py' -q`，23 项通过，耗时 0.607 秒。本次未改生产代码。
+
+完整复验遇到两个环境约束：默认 C 盘临时目录只剩约 0.67 GiB，使月度下载测试触发 1 GiB 安全余量保护；将临时目录放进当前 `.worktrees` 后，又使一项旧迁移测试触发“主仓库不得是工作树”的路径保护。两项保护均未放宽；改为工作树外的 D 盘临时目录后，相关 5 项测试通过。测试夹具使用受控网络/命令替身，没有真的执行旧链路迁移或重置。
+
+本机完整复验使用以下临时环境设置，仅作用于当前 PowerShell 进程及其子进程，不修改用户/系统全局设置：
+
+```powershell
+New-Item -ItemType Directory -Path D:\CodexTemp\ecommerce-tests-20260917 -Force | Out-Null
+$env:TEMP = 'D:\CodexTemp\ecommerce-tests-20260917'
+$env:TMP = $env:TEMP
+$env:PYTHONUTF8 = '1'
+python -m unittest discover -s tests -q
+```
+
+最终完整复验 472 项全部通过，耗时 169.690 秒；日志为 `tmp/graduation/replay-post-kafka-regression-final.log`。前两次受环境影响的日志也保留，分别为 `replay-post-kafka-regression.log` 和 `replay-post-kafka-regression-d-drive.log`，不覆盖失败证据。
+
+C 盘空间不足仍是环境风险，测试切换临时目录不等于解决磁盘容量问题。扩大湖仓运行或升级 Docker 前应先释放空间；本次没有自动清理用户文件、镜像或数据卷。
 
 独立代码复核未发现可复现的重要问题。另用实际子进程核验 Windows 文件锁：子进程持锁时另一进程被拒绝，强制结束该测试子进程后锁自动释放。该检查不等于实际 Kafka 故障重试、断电持久性或完整强杀回放已经验收。
