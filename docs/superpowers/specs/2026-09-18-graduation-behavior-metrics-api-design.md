@@ -44,7 +44,7 @@ lakehouse.analytics.real_behavior_detail_v1
   -> G3 页面 / G4 指标工具与知识库
 ```
 
-刷新入口固定为 `scripts/refresh_g2d_behavior_metrics.ps1`，验收入口固定为 `scripts/verify_g2d_behavior_metrics.ps1`。脚本只允许读取固定 Iceberg 表并写入固定 Doris 指标表，不接受任意 SQL、任意 catalog/schema 或任意目标表名。
+刷新入口固定为 `scripts/refresh_g2d_behavior_metrics.ps1`，验收入口固定为 `scripts/verify_g2d_behavior_metrics.ps1`。脚本只允许读取固定 Iceberg 表并写入固定 Doris 指标表，不接受任意 SQL、任意 catalog/schema 或任意目标表名。刷新先从 Iceberg 元数据取得一个正整数 Snapshot ID，随后所有事实查询固定使用 `FOR VERSION AS OF <snapshot_id>`；SQL 模板只允许这一处经过严格数字校验的占位符，从而避免多条查询跨越不同 Snapshot。
 
 每次刷新生成 `metric_run_id`，并绑定：
 
@@ -53,9 +53,10 @@ lakehouse.analytics.real_behavior_detail_v1
 - `data_scope=g2c-correctness-subset` 或 `stable-user-2pct-full`
 - Iceberg `source_snapshot_id`
 - 源数据起止日期和总行数
+- 四张指标表各自的行数与规范化 SHA-256
 - 计算时间、发布时间和发布状态
 
-`metric_run_id` 固定为 `behavior-v1-s<source_snapshot_id>`，Snapshot ID 只接受正整数。当前 1,002 条验收表只能发布为 `g2c-correctness-subset`；只有源总数精确等于 2,199,938 且完整范围对账通过时才能发布为 `stable-user-2pct-full`。候选指标全部装载并通过验证后，才最后写入 `PUBLISHED` 元数据。API 不读取没有发布记录的候选行，因此任一表装载失败都不会暴露半套结果。重复发布同一 `metric_run_id` 必须失败或返回已经发布的相同身份，不能静默叠加。
+`metric_run_id` 固定为 `behavior-v1-s<source_snapshot_id>`，Snapshot ID 只接受正整数。当前 1,002 条验收表只能发布为 `g2c-correctness-subset`；只有源总数精确等于 2,199,938 且完整范围对账通过时才能发布为 `stable-user-2pct-full`。候选指标全部装载并通过验证后，才最后写入 `PUBLISHED` 元数据。API 不读取没有发布记录的候选行，因此任一表装载失败都不会暴露半套结果。重复发布同一 `metric_run_id` 必须失败或返回已经发布的相同身份，不能静默叠加。未发布的部分候选允许使用新的 `attempt_id` 和 Stream Load label 对相同唯一键幂等补载；补载后仍须通过精确行数、复合键唯一性和聚合对账。若遗留了不属于当前确定性结果的额外行，自动发布必须失败，脚本不得通过删除数据掩盖问题。
 
 ## 4. 指标窗口与可加性
 
@@ -132,9 +133,9 @@ lakehouse.analytics.real_behavior_detail_v1
 4. `behavior_dimension_metrics`
 5. `behavior_quality_metrics`
 
-所有指标表都包含 `metric_run_id`、`dataset_id` 和 `metric_version`。发布表使用 `metric_run_id` 唯一键，指标表的唯一键包含运行身份和业务粒度。初始化 SQL 必须可重复执行，但不得删除已有发布批次。
+所有指标表都包含 `metric_run_id`、`dataset_id` 和 `metric_version`。发布表使用 `metric_run_id` 唯一键，并保存四张指标表各自的预期行数和规范化 SHA-256；指标表的唯一键包含运行身份和业务粒度。初始化 SQL 必须可重复执行，但不得删除已有发布批次。
 
-加载使用 Doris Stream Load 或等价的受控批量入口，label 包含 `metric_run_id` 和表名。每张表装载后核对行数；overview/funnel/quality 还需核对源总数、窗口范围及关键分子分母。只有全部核对通过才发布元数据。
+加载使用 Doris Stream Load 或等价的受控批量入口，label 包含 `metric_run_id`、表名和本次 `attempt_id`。每张表装载后按固定列顺序和唯一键顺序回读，使用统一空值、整数、布尔和小数格式计算 SHA-256，并与候选结果核对；overview/funnel/quality 还需核对源总数、窗口范围及关键分子分母。只有行数、摘要和业务对账全部通过才发布元数据。
 
 ## 7. 指标定义文件
 
@@ -163,18 +164,18 @@ lakehouse.analytics.real_behavior_detail_v1
 
 `window=day` 返回逐日序列；`window=full` 返回完整观察窗口。首版不接受任意 SQL、不接受任意表名，也不把自由文本转换为排序列。
 
-所有行为响应统一包含：
+所有行为响应统一包含。下例只说明字段类型与格式，不作为动态验收实测值：
 
 ```json
 {
   "meta": {
     "dataset_id": "rees46-multicategory",
     "metric_version": "behavior-v1",
-    "metric_run_id": "...",
-    "source_snapshot_id": "...",
+    "metric_run_id": "behavior-v1-s3854376992136224865",
+    "source_snapshot_id": "3854376992136224865",
     "window_start": "2019-10-01",
     "window_end": "2019-11-30",
-    "calculated_at": "...",
+    "calculated_at": "2026-09-18T00:00:00Z",
     "data_scope": "g2c-correctness-subset",
     "source_event_count": 1002,
     "warnings": ["correctness subset; not the full 2% user sample"]
