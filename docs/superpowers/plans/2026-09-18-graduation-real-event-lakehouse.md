@@ -299,7 +299,7 @@ git add README.md docs/graduation/data-readiness.md docs/graduation/real-event-l
 git commit -m "docs: record G2-C real lakehouse acceptance"
 ```
 
-- [ ] **Step 6: Push and verify backup**
+- [x] **Step 6: Push and verify backup**
 
 Push `codex/chapter-10-controlled-tools` using the current proxy only if needed, then compare `git rev-parse HEAD` with `git ls-remote origin refs/heads/codex/chapter-10-controlled-tools`. Do not merge `main`.
 
@@ -313,6 +313,7 @@ Push `codex/chapter-10-controlled-tools` using the current proxy only if needed,
 - 首轮聚焦验证为 G2-C 11 项、Java DataStream 30 项、真实数据 63 项；独立审查后补充 run-id 防碰撞、单次提交、精确 Job/Snapshot 与事件路由摘要门禁，G2-C 测试增至 12 项。
 - 安全加固后的最终仓库全量 Python 回归为 484 项通过，耗时 170.464 秒。
 - 正式与隔离验收作业均已取消，项目容器已停止但未删除；Iceberg 正式表、Snapshot、Docker 卷和 D 盘数据保留。
+- 首次直连 GitHub 因未继承系统代理而超时；仅对推送命令临时使用现有 `127.0.0.1:7890` 代理后成功。本地与远端分支均核对到 `9684c64104752f88f3c940839e4d6f46884885b8`，未合并 `main`。
 
 ## Self-Review
 
