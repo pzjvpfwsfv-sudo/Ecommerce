@@ -57,6 +57,7 @@ event_id = "real_" + sha256(identity.encode("utf-8")).hexdigest()
 - [x] Checkpoint 限定 `s3a://flink-state/checkpoints/graduation-g2b/<run-id>`；消费组、事务前缀与算子 UID 从同一已校验 run-id 派生，防止与旧作业混用。
 - [x] 先写拓扑测试，验证单并行度、Checkpoint 10 秒、60 秒超时、最大并发 1、事务模式与三个 sink 的精确 UID/节点集合；代码复核取消时保留外部 Checkpoint 及有限重启配置。真实恢复效果仍属任务 4 的动态验收。
 - [x] 组装 source -> parse -> keyBy/dedup -> watermark -> route -> 三个输出；消费者关闭自动建 Topic。部署前通过管理客户端核验 Topic 存在，不主动创建；运行期间输出 Topic 被删除的 broker 自动重建竞态不在此保证内。
+- [x] 动态验收发现默认序列化器会把 2019 年事件时间写入 Kafka `CreateTime`，触发 7 天保留清理。先增加失败回归测试，再让 sink 显式忽略事件时间，由 Kafka 赋当前写入时间；业务载荷和 Watermark 仍保留原始时间。
 - [x] 新入口通过 `flink run -c com.ecommerce.quality.real.RealDataQualityJob` 选择；不替换旧 Fat JAR 默认入口。
 
 ## 任务 4：证据、复核与备份
@@ -64,8 +65,8 @@ event_id = "real_" + sha256(identity.encode("utf-8")).hexdigest()
 文件：`docs/graduation/real-event-quality-runbook.md`、README 进度、本文检查项。
 
 - [x] 同一 Java 17 环境执行新旧 Maven 测试并打包。读取真实 JSONL 前 1,000 条，将回放元数据加入临时验证输入，以实际 Java parser 比对原始字段与事件 ID，标明离线验证。
-- [x] 独立复核跨语言 ID、超长输入、时间边界、状态恢复和隔离配置；两轮限定范围复核未发现具体重要缺陷，契约复核后补充字节/码点/截断边界并通过已有 29 项测试。收尾只读复核没有新增代码改动，不代表动态验收通过。
-- [ ] 资源条件满足后才启动必要依赖，用专属 Topic 完成 1,000 条 `read_committed` 对账、指定重复注入、Checkpoint 恢复；不满足则明确列为未完成，禁止把离线测试冒充动态验收。
+- [x] 独立复核跨语言 ID、超长输入、时间边界、状态恢复和隔离配置；契约复核后补充字节/码点/截断边界，动态排障后新增 Kafka 时间戳回归测试，最终 30 项测试通过。
+- [x] 使用专属 Topic 完成 1,000 条 `read_committed` 对账、指定重复注入和持久化 Checkpoint 恢复；恢复后新增记录无遗漏，恢复前后重复均被状态拦截。
 - [x] 更新运行命令和实际结果，检查改动边界与 `git diff --check`；真实数据、构建产物和临时报告保持忽略，主工作区用户修改不纳入。
 
 提交流程：完成复核后提交到当前开发分支，使用当前 Windows 代理推送，并以远端 SHA 对比确认备份。不合并 main；最终提交号及远端一致性由交付消息报告，避免在提交自身内容中预先宣称推送成功。
@@ -74,4 +75,4 @@ event_id = "real_" + sha256(identity.encode("utf-8")).hexdigest()
 
 契约 POJO 与 codec 属于任务 1，任务 2 只消费验证后的路由字段与完整 JSON；任务 3 使用相同算子接口，不重新实现契约。任务 4 的真实动态门禁不能被任务 1/2 的夹具测试替代。设计要求均有对应任务；仅文档、测试与实现增加，不修改旧链路。
 
-2026-09-18 已有 Java 17 Surefire 报告汇总 29 项，失败、错误、跳过均为 0；JAR 包含新入口，Manifest 默认入口仍为旧作业。真实 1,000 条离线核验通过，Python 真实数据回归 63 项通过。最终复跑时 Docker 引擎已停止，命令在连接引擎时退出，未启动 Maven；不能把该复跑记为成功。此时 C 盘约 0.88 GiB、D 盘约 74.90 GiB，不额外启动服务、不自动删除文件。动态事务和恢复验收继续保留未完成状态。
+2026-09-18 最终 Java 17 Surefire 报告汇总 30 项，失败、错误、跳过均为 0；JAR 包含新入口，Manifest 默认入口仍为旧作业。真实 1,000 条离线核验和 Python 真实数据回归 63 项通过。Docker 程序、WSL 数据盘与交换盘迁至 D 盘并恢复后，使用 `g2b-20260918b` 完成真实 Kafka/Flink 动态验收。首次 `g2b-20260918a` 暴露 Kafka 历史时间戳保留问题，仅作为失败证据，不计入通过结果。最终验收范围仍不包含 220 万条全量容量和湖仓落地。

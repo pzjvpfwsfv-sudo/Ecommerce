@@ -1,11 +1,11 @@
 package com.ecommerce.quality.real;
 
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.Properties;
 import java.util.concurrent.TimeUnit;
 import org.apache.flink.api.common.eventtime.WatermarkStrategy;
 import org.apache.flink.api.common.restartstrategy.RestartStrategies;
-import org.apache.flink.api.common.serialization.SimpleStringSchema;
 import org.apache.flink.api.common.time.Time;
 import org.apache.flink.connector.base.DeliveryGuarantee;
 import org.apache.flink.connector.kafka.sink.KafkaRecordSerializationSchema;
@@ -14,6 +14,7 @@ import org.apache.flink.connector.kafka.source.KafkaSource;
 import org.apache.flink.connector.kafka.source.enumerator.initializer.OffsetsInitializer;
 import org.apache.flink.kafka.shaded.org.apache.kafka.clients.admin.AdminClient;
 import org.apache.flink.kafka.shaded.org.apache.kafka.clients.consumer.OffsetResetStrategy;
+import org.apache.flink.kafka.shaded.org.apache.kafka.clients.producer.ProducerRecord;
 import org.apache.flink.runtime.state.hashmap.HashMapStateBackend;
 import org.apache.flink.streaming.api.CheckpointingMode;
 import org.apache.flink.streaming.api.environment.CheckpointConfig.ExternalizedCheckpointCleanup;
@@ -74,11 +75,15 @@ public final class RealDataQualityJob {
 
     private static KafkaSink<String> sink(RealJobConfig config, String topic, String kind) {
         return KafkaSink.<String>builder().setBootstrapServers(config.bootstrapServers())
-                .setRecordSerializer(KafkaRecordSerializationSchema.builder().setTopic(topic)
-                        .setValueSerializationSchema(new SimpleStringSchema()).build())
+                .setRecordSerializer(recordSerializer(topic))
                 .setDeliveryGuarantee(DeliveryGuarantee.EXACTLY_ONCE)
                 .setTransactionalIdPrefix(config.transactionPrefix(kind))
                 .setProperty("transaction.timeout.ms", "900000").build();
+    }
+
+    static KafkaRecordSerializationSchema<String> recordSerializer(String topic) {
+        return (element, context, ignoredEventTimestamp) -> new ProducerRecord<>(
+                topic, null, null, null, element.getBytes(StandardCharsets.UTF_8), null);
     }
 
     private static void checkTopics(RealJobConfig config) throws Exception {

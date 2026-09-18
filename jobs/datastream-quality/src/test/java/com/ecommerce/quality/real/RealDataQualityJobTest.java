@@ -1,6 +1,7 @@
 package com.ecommerce.quality.real;
 
 import static org.junit.jupiter.api.Assertions.*;
+import java.nio.charset.StandardCharsets;
 import java.util.HashSet;
 import java.util.List;
 import java.util.stream.Collectors;
@@ -30,5 +31,16 @@ class RealDataQualityJobTest {
         }
         assertEquals(expectedUids, nodes.stream().map(n -> n.getTransformationUID()).collect(Collectors.toSet()));
         assertEquals(expectedUids.size(), nodes.size());
+    }
+
+    @Test
+    void outputRecordDoesNotReuseHistoricalEventTimestamp() {
+        var config = RealJobConfig.fromArgs(RealJobConfigTest.args());
+        var serializer = RealDataQualityJob.recordSerializer(config.cleanTopic());
+        var record = serializer.serialize("{\"event_id\":\"real-test\"}", null, 1569898974000L);
+
+        assertEquals(config.cleanTopic(), record.topic());
+        assertEquals("{\"event_id\":\"real-test\"}", new String(record.value(), StandardCharsets.UTF_8));
+        assertNull(record.timestamp(), "Kafka must assign ingestion time instead of retaining 2019 event time");
     }
 }
