@@ -142,6 +142,8 @@ python -m generators.real_data sample-users --inputs data/rees46/months/2019-Oct
 
 G2-A 回放器现已实现，真实样本 400+600 条离线恢复与真实 Kafka 续传均通过。独立消费者核对 1,000 条消息的全部 14 个源字段、顺序、事件 ID 与 key，均一致；本轮无重复或缺失。其实际连接端口、Docker 排障记录、操作命令与重复发送边界见 [回放运行手册](replay-runbook.md)。本次仅验证 1,000 条，不是 220 万条全量验收；新 DataStream 事件格式和湖仓表尚未接入。
 
+G2-B 已实现独立 Java DataStream 真实事件入口，1,000 条真实样本的离线字段与 ID 核验通过；动态 Kafka 事务、Checkpoint 恢复和湖仓落地仍未验收。代码测试证据、Docker 停止与系统盘空间限制见 [真实事件质量运行手册](real-event-quality-runbook.md)，不能将离线通过等同于实际链路已接通。
+
 ## GitHub 备份边界
 
 远程仓库为 https://github.com/pzjvpfwsfv-sudo/Ecommerce ，当前开发分支为 `codex/chapter-10-controlled-tools`。代码、配置模板、测试、中文设计及验收文档可以随该分支提交备份；主工作区未提交的其他修改不包含在本次开发提交中。

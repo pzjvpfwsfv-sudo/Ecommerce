@@ -11,12 +11,15 @@
 - [G1 跨月完整文件与稳定用户采样](docs/superpowers/plans/2026-09-17-graduation-cross-month-data.md)
 - [数据准备命令、真实画像与剩余验收](docs/graduation/data-readiness.md)
 - [G2-A 固定速率与可恢复历史回放](docs/graduation/replay-runbook.md)
+- [G2-B Java 真实事件质量入口](docs/graduation/real-event-quality-runbook.md)
 
 已新增不依赖 Docker 的真实数据准备工具：`python -m generators.real_data --help`。它与旧模拟生成器隔离，不自动写 Kafka，不把历史前缀样本当作完整分析窗口。
 
 当前真实数据依据：已完整扫描 2019 年 10/11 月共 109,950,743 条源记录，按稳定用户抽样得到 2,199,938 条事件，覆盖 61 天；最终复跑及 449 项 Python 测试通过。下一步为真实历史回放与新链路适配，业务页面和 RAG 尚未完成。GitHub 备份使用 `codex/chapter-10-controlled-tools` 开发分支；真实数据、密钥和服务卷不包含在 Git 中。
 
 G2-A 已提供 `python -m generators.real_data.replay`：默认离线试跑，显式 Kafka 模式只允许真实数据专用 Topic，支持限速、确认后保存进度和 Ctrl+C 恢复。真实样本 400+600 条离线恢复与真实 Kafka 续传均通过，独立消费核对 1,000 条的业务字段、事件 ID、顺序与 key 全部一致。证据见运行手册，不等同于 220 万条全量回放或新 Flink/湖仓链路已完成。
+
+G2-B 新增独立 Java 清洗入口，严格保留真实字段和稳定 ID，支持带 Kafka 坐标的拒绝、有限时间去重及历史时间迟到分流。真实样本 1,000 条离线 Java 契约核对通过；新作业的 Kafka 事务和动态恢复尚未验收，当前系统盘余量不足，不将离线结果标记为完整链路完成。
 
 ## 项目目标
 
