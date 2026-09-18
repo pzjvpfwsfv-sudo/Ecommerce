@@ -12,14 +12,17 @@
 - [数据准备命令、真实画像与剩余验收](docs/graduation/data-readiness.md)
 - [G2-A 固定速率与可恢复历史回放](docs/graduation/replay-runbook.md)
 - [G2-B Java 真实事件质量入口](docs/graduation/real-event-quality-runbook.md)
+- [G2-C 真实事件统一落湖与 Trino 验收](docs/graduation/real-event-lakehouse-runbook.md)
 
 已新增不依赖 Docker 的真实数据准备工具：`python -m generators.real_data --help`。它与旧模拟生成器隔离，不自动写 Kafka，不把历史前缀样本当作完整分析窗口。
 
-当前真实数据依据：已完整扫描 2019 年 10/11 月共 109,950,743 条源记录，按稳定用户抽样得到 2,199,938 条事件，覆盖 61 天；最终复跑及 449 项 Python 测试通过。G2-A 历史回放和 G2-B Java 真实事件质量入口均已完成隔离动态验收，下一步为真实事件落湖与指标接入；业务页面和 RAG 尚未完成。GitHub 备份使用 `codex/chapter-10-controlled-tools` 开发分支；真实数据、密钥和服务卷不包含在 Git 中。
+当前真实数据依据：已完整扫描 2019 年 10/11 月共 109,950,743 条源记录，按稳定用户抽样得到 2,199,938 条事件，覆盖 61 天。G2-A 历史回放、G2-B Java 真实事件质量入口和 G2-C Iceberg 明细落湖均已完成隔离动态验收；正式表已由 Trino 核对 1,002 条真实事件，下一步进入 G2-D 分层指标与版本化 API，业务页面和 RAG 尚未完成。GitHub 备份使用 `codex/chapter-10-controlled-tools` 开发分支；真实数据、密钥和服务卷不包含在 Git 中。
 
 G2-A 已提供 `python -m generators.real_data.replay`：默认离线试跑，显式 Kafka 模式只允许真实数据专用 Topic，支持限速、确认后保存进度和 Ctrl+C 恢复。真实样本 400+600 条离线恢复与真实 Kafka 续传均通过，独立消费核对 1,000 条的业务字段、事件 ID、顺序与 key 全部一致。证据见运行手册，不等同于 220 万条全量回放或新 Flink/湖仓链路已完成。
 
 G2-B 新增独立 Java 清洗入口，严格保留真实字段和稳定 ID，支持带 Kafka 坐标的拒绝、有限时间去重及历史时间迟到分流。真实样本 1,000 条 `read_committed` 基线、重复注入和持久化 Checkpoint 恢复均已通过；恢复后新增记录无遗漏，恢复前后重复均被状态拦截。验收中还复现并修复了历史事件时间被写成 Kafka 存储时间、导致记录触发保留清理的问题。该结论不等于 220 万条容量、湖仓落地或永久去重已经完成。
+
+G2-C 使用两个严格 Kafka JSON Source 将 clean/late 统一为一套列，并由单一 Flink SQL writer 写入 `lakehouse.analytics.real_behavior_detail_v1`。正式表验收为 `总数=1002、clean=1001、late=1、不同 event_id=1002`，五类字段质量违规均为 0；17 个源字段逐事件对账 17,034 次零差异。该结论不等于 220 万条容量或长期 exactly-once 验收，完整证据与重跑边界见 G2-C 运行手册。
 
 ## 项目目标
 

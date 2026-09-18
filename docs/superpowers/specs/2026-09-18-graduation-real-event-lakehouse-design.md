@@ -25,7 +25,7 @@ DLQ 中包含解析失败和重复记录，不进入业务事实表。旧 `user_
 
 ## 3. 表与字段契约
 
-新表固定为 `lakehouse.analytics.real_behavior_detail_v1`，与旧八字段演示表隔离。验收可使用带安全后缀的临时表，不能删除或覆盖正式表。
+新表固定为 `lakehouse.analytics.real_behavior_detail_v1`，与旧八字段演示表隔离。验收可使用带安全后缀的临时表，不能删除或覆盖正式表。run-id 只接受小写字母、数字和连字符，禁止下划线，保证 run-id 转换成 SQL 表后缀时是一一映射。
 
 表中保留 G2-B 正常载荷的全部 17 个原始字段。`event_time`、`price` 和 `replayed_at` 继续保存原字符串，便于逐字段审计；额外生成以下查询字段：
 
@@ -36,7 +36,7 @@ DLQ 中包含解析失败和重复记录，不进入业务事实表。旧 `user_
 - `landing_topic,landing_partition,landing_offset,landing_timestamp`：从当前 clean/late Kafka 记录元数据取得，两路都必须存在。
 - `origin_topic,origin_partition,origin_offset,quality_job_version,quality_observed_at,watermark_ms,lateness_ms`：来自迟到信封；clean 不携带原输入坐标，因此这些列为 null，不能伪造。
 
-`event_id` 是跨层稳定身份和对账键，但首版表保持 append-only，不声明 Iceberg 主键或永久全局去重。G2-B 的有限 TTL 去重、Flink/Iceberg checkpoint 提交和表内 `COUNT(DISTINCT event_id)` 对账共同界定本轮保证；主动使用新消费组重放到同一正式表仍可能重复，部署脚本必须显式绑定 run-id、Topic 和表名。
+`event_id` 是跨层稳定身份和对账键，但首版表保持 append-only，不声明 Iceberg 主键或永久全局去重。G2-B 的有限 TTL 去重、Flink/Iceberg checkpoint 提交和表内 `COUNT(DISTINCT event_id)` 对账共同界定本轮保证。因为 `earliest-offset` 重提会从头追加，runner 必须同时拒绝已有同名作业历史和非空目标表；需要重新验收时只能使用新的 run-id 与隔离表，不能把正式表当作重放目标。
 
 ## 4. Flink SQL 落湖
 
@@ -54,7 +54,10 @@ Trino 查询必须至少验证：
 2. 总行数等于 `COUNT(DISTINCT event_id)`；若不等则验收失败，不用 `DISTINCT` 掩盖重复。
 3. 原始 `event_time`、`price`、来源文件、原始行号和事件 ID 与 Kafka 输入一致；派生时间、日期和十进制金额可逆且非 null。
 4. clean 行的迟到诊断为空；late 行保存原输入坐标、Watermark 和非负 `lateness_ms`。
-5. Iceberg 快照和 MinIO metadata 已生成，Trino 通过共享 Hive Metastore 读取同一张表，而不是查询复制结果。
+5. clean/late 落地 Topic 与 run-id 精确匹配，late 原始 Topic 也必须匹配同一次 G2-B 输入。
+6. 验证器绑定 runner 返回的精确 Flink Job ID；最新 Iceberg Snapshot 必须晚于该作业启动时间。
+7. Kafka 侧按 `event_id:quality_route` 排序计算的 SHA-256 必须与湖表聚合摘要一致，不能用相同数量的其他合法事件替代预期输入。
+8. Iceberg 快照和 MinIO metadata 已生成，Trino 通过共享 Hive Metastore 读取同一张表，而不是查询复制结果。
 
 动态验收使用真实跨月样本。基线可以读取 G2-B 已验证的正常输出；迟到分支必须通过调整两条不同真实事件的到达顺序触发，不编造商品、用户、金额或业务时间。测试注入与正式展示范围使用隔离 run-id、Topic、消费组和表名，并记录事件 ID。
 
@@ -80,4 +83,4 @@ Trino 查询必须至少验证：
 - 真实性清楚：迟到测试只改变真实记录到达顺序，不修改业务内容；DLQ 不伪装成事实。
 - 复杂度受控：一张新表、一个 SQL 作业、一个提交入口和一个对账入口，不引入新框架。
 - 口径可演进：G2-D 可直接从完整有效事实计算指标，G4 的知识库与 RAG 再引用最终版本化指标定义。
-- 当前状态：仅设计完成；SQL、脚本、测试和动态验收尚未实施。
+- 当前状态：设计与实现均已完成；1,002 条真实事件动态验收通过，2,199,938 条全量容量仍留待 G5。

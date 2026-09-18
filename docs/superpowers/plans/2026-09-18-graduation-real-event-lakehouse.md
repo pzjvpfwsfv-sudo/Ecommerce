@@ -34,7 +34,7 @@
 - Consumes: G2-B clean top-level 17-field JSON and late envelope JSON.
 - Produces: placeholders `__RUN_ID__`, `__CLEAN_TOPIC__`, `__LATE_TOPIC__`, `__TABLE_NAME__`; one target table and one `INSERT INTO`; Trino verification rows with fixed aliases.
 
-- [ ] **Step 1: Write failing artifact tests**
+- [x] **Step 1: Write failing artifact tests**
 
 Create `tests/test_g2c_real_event_lakehouse.py` with assertions that both templates exist and that the Flink template contains all 17 source fields, Kafka metadata, strict JSON options, `read_committed`, `UNION ALL`, one `INSERT INTO`, `PARTITIONED BY (event_date)`, no DLQ source, and exact placeholder names. Assert the Trino template checks total/routes/distinct IDs/derived columns/late diagnostics.
 
@@ -46,13 +46,13 @@ def test_flink_template_uses_one_sink_for_clean_and_late(self):
     self.assertNotIn("real_behavior_dlq", sql)
 ```
 
-- [ ] **Step 2: Run the test and confirm RED**
+- [x] **Step 2: Run the test and confirm RED**
 
 Run: `$env:TEMP='D:\EcommerceDev\temp'; $env:TMP=$env:TEMP; python -m unittest tests.test_g2c_real_event_lakehouse -v`
 
 Expected: FAIL because `16_real_behavior_to_iceberg.sql.template` and `17_trino_verify_real_behavior.sql.template` do not exist.
 
-- [ ] **Step 3: Implement the Flink SQL template**
+- [x] **Step 3: Implement the Flink SQL template**
 
 Define strict sources and a single normalized sink. Use UTC and deterministic helpers:
 
@@ -111,7 +111,7 @@ FROM real_behavior_normalized;
 
 Both Kafka sources use `scan.startup.mode='earliest-offset'`, `properties.isolation.level='read_committed'`, `json.fail-on-missing-field='true'`, and `json.ignore-parse-errors='false'`. The target stores original and typed fields and is partitioned by `event_date`.
 
-- [ ] **Step 4: Implement the Trino verification template**
+- [x] **Step 4: Implement the Trino verification template**
 
 Use fixed aliases so PowerShell can parse results without relying on column order from ad hoc queries:
 
@@ -139,13 +139,13 @@ SELECT count_if(event_ts IS NULL OR event_date IS NULL OR price_decimal IS NULL)
 FROM lakehouse.analytics.__TABLE_NAME__;
 ```
 
-- [ ] **Step 5: Run tests and confirm GREEN**
+- [x] **Step 5: Run tests and confirm GREEN**
 
 Run: `$env:TEMP='D:\EcommerceDev\temp'; $env:TMP=$env:TEMP; python -m unittest tests.test_g2c_real_event_lakehouse -v`
 
 Expected: SQL contract tests PASS.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```powershell
 git add tests/test_g2c_real_event_lakehouse.py jobs/sql/16_real_behavior_to_iceberg.sql.template jobs/sql/17_trino_verify_real_behavior.sql.template
@@ -162,7 +162,7 @@ git commit -m "feat: define G2-C real event lakehouse contract"
 - Consumes: `-RunId`, optional exact matching `-CleanTopic/-LateTopic`, and optional safe `-TableName`.
 - Produces: `Get-G2cDeployment`, `Render-G2cSql`, a D-drive rendered SQL file, and a submitted Flink SQL job named `graduation-g2c-<run-id>`.
 
-- [ ] **Step 1: Write failing PowerShell behavior tests**
+- [x] **Step 1: Write failing PowerShell behavior tests**
 
 From Python, dot-source the script with `-FunctionsOnly` and verify:
 
@@ -174,13 +174,13 @@ $d | ConvertTo-Json -Compress
 
 Expected derived names are `real_behavior_clean_v1_g2c-20260918a`, `real_behavior_late_v1_g2c-20260918a`, table `real_behavior_detail_v1_g2c_20260918a`, and group/job `graduation-g2c-g2c-20260918a`. Add rejection cases for path separators, quotes, old namespaces, topic/run mismatch, unsafe table names and unreplaced placeholders.
 
-- [ ] **Step 2: Run the targeted test and confirm RED**
+- [x] **Step 2: Run the targeted test and confirm RED**
 
 Run: `$env:TEMP='D:\EcommerceDev\temp'; $env:TMP=$env:TEMP; python -m unittest tests.test_g2c_real_event_lakehouse.G2cRunnerTests -v`
 
 Expected: FAIL because the runner and functions do not exist.
 
-- [ ] **Step 3: Implement validation and rendering**
+- [x] **Step 3: Implement validation and rendering**
 
 Create a function-only guard and use literal replacement, never `Invoke-Expression`:
 
@@ -198,19 +198,19 @@ function Render-G2cSql {
 if ($FunctionsOnly) { return }
 ```
 
-Validate run-id against `[a-z0-9][a-z0-9_-]{0,31}`; topics must exactly equal the derived clean/late names; table must be the formal name or the normalized run-specific name.
+Validate run-id against `[a-z0-9][a-z0-9-]{0,31}`; underscores are forbidden so normalized table suffixes cannot collide. Topics must exactly equal the derived clean/late names; table must be the formal name or the normalized run-specific name.
 
-- [ ] **Step 4: Implement minimal dependency startup and SQL submission**
+- [x] **Step 4: Implement minimal dependency startup and SQL submission**
 
 Check Docker, existing connector JARs and source Topic existence before rendering. Start only Kafka/Flink/MinIO/Hive Metastore, wait for ports, write rendered SQL under `tmp/graduation/g2c/<run-id>/`, submit through the existing SQL client and fail on nonzero exit or `[ERROR]`. Do not create source Topic or delete tables.
 
-- [ ] **Step 5: Run tests and confirm GREEN**
+- [x] **Step 5: Run tests and confirm GREEN**
 
 Run: `$env:TEMP='D:\EcommerceDev\temp'; $env:TMP=$env:TEMP; python -m unittest tests.test_g2c_real_event_lakehouse -v`
 
 Expected: artifact and runner tests PASS without starting Docker.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```powershell
 git add tests/test_g2c_real_event_lakehouse.py scripts/run_g2c_real_event_lakehouse.ps1
@@ -224,20 +224,20 @@ git commit -m "feat: add safe G2-C lakehouse runner"
 - Create: `scripts/verify_g2c_real_event_lakehouse.ps1`
 
 **Interfaces:**
-- Consumes: `-RunId`, `-ExpectedCleanCount`, `-ExpectedLateCount`, optional table name; the SQL template and an already submitted G2-C job.
+- Consumes: `-RunId`, exact `-JobId`, `-ExpectedCleanCount`, `-ExpectedLateCount`, Kafka-derived `-ExpectedEventRouteSha256`, optional table name; the SQL template and an already submitted G2-C job.
 - Produces: nonzero failure on timeout, duplicate IDs, bad routes, invalid derived fields or bad diagnostics; success JSON with table/counts/snapshot evidence.
 
-- [ ] **Step 1: Write failing verifier tests**
+- [x] **Step 1: Write failing verifier tests**
 
 Dot-source with `-FunctionsOnly`. Test `ConvertFrom-G2cCsvRow`, `Assert-G2cSummary`, `Assert-G2cQuality`, and render-time table validation using synthetic command output. Include negative cases for `total != clean + late`, `total != distinct`, unexpected route, nonzero quality violations and wrong expected counts.
 
-- [ ] **Step 2: Run the verifier test and confirm RED**
+- [x] **Step 2: Run the verifier test and confirm RED**
 
 Run: `$env:TEMP='D:\EcommerceDev\temp'; $env:TMP=$env:TEMP; python -m unittest tests.test_g2c_real_event_lakehouse.G2cVerifierTests -v`
 
 Expected: FAIL because verifier functions do not exist.
 
-- [ ] **Step 3: Implement Trino polling and fail-closed assertions**
+- [x] **Step 3: Implement Trino polling and fail-closed assertions**
 
 Start only Hive Metastore and Trino if needed, render `17_trino_verify_real_behavior.sql.template`, execute each statement using the Trino CLI with `CSV_HEADER_UNQUOTED`, and poll until expected rows are committed or timeout. Parse named columns and fail closed:
 
@@ -249,13 +249,13 @@ if ($Quality.Values | Where-Object { $_ -ne 0 }) { throw 'Lakehouse quality asse
 
 Query Iceberg metadata table `"<table>$snapshots"` and require at least one snapshot. Emit a compact JSON report under ignored `tmp/graduation/g2c/<run-id>/`.
 
-- [ ] **Step 4: Run tests and confirm GREEN**
+- [x] **Step 4: Run tests and confirm GREEN**
 
 Run: `$env:TEMP='D:\EcommerceDev\temp'; $env:TMP=$env:TEMP; python -m unittest tests.test_g2c_real_event_lakehouse -v`
 
 Expected: all G2-C offline tests PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```powershell
 git add tests/test_g2c_real_event_lakehouse.py scripts/verify_g2c_real_event_lakehouse.ps1
@@ -274,23 +274,23 @@ git commit -m "feat: verify G2-C Iceberg facts through Trino"
 - Consumes: verified G2-B real topics, runner and verifier.
 - Produces: real dynamic evidence, accurate runbook, updated project progress and explicit next stage G2-D.
 
-- [ ] **Step 1: Run focused regressions**
+- [x] **Step 1: Run focused regressions**
 
 Run G2-C Python tests, G2-B Java tests/package in the existing Docker Java 17 environment, and real-data Python tests. Record exact counts and elapsed times; do not rerun unrelated UI/Agent suites.
 
-- [ ] **Step 2: Produce isolated real clean and late events**
+- [x] **Step 2: Produce isolated real clean and late events**
 
 Use a fresh G2-B run-id and actual normalized events from the verified Oct/Nov sample. Replay a small chronological baseline, then send two different valid real events more than ten seconds apart in newest-then-oldest arrival order so the second routes to late. Confirm `read_committed` clean/late counts and capture event IDs; do not edit payload business fields.
 
-- [ ] **Step 3: Submit G2-C and verify through Trino**
+- [x] **Step 3: Submit G2-C and verify through Trino**
 
-Run `run_g2c_real_event_lakehouse.ps1` with that exact run-id, then call `verify_g2c_real_event_lakehouse.ps1` with observed clean/late counts. Require one running SQL job, completed checkpoint, Iceberg snapshot, exact route reconciliation, unique event IDs, zero quality violations and expected sample IDs returned by Trino.
+Run `run_g2c_real_event_lakehouse.ps1` with that exact run-id, then call `verify_g2c_real_event_lakehouse.ps1` with runner 返回的 Job ID、observed clean/late counts 和 Kafka `event_id:route` 摘要。Require one running SQL job, completed checkpoint, job 启动后的 Iceberg snapshot, exact route reconciliation, unique event IDs, zero quality violations and expected sample IDs returned by Trino.
 
-- [ ] **Step 4: Document only measured results**
+- [x] **Step 4: Document only measured results**
 
 Write commands, resource names, source hashes, event IDs, counts, job/checkpoint/snapshot identity, elapsed time and remaining capacity boundary. Update README from “下一步落湖” to “G2-C 已完成，下一步 G2-D 指标与 API” only if dynamic acceptance really passes.
 
-- [ ] **Step 5: Final verification and commit**
+- [x] **Step 5: Final verification and commit**
 
 Run focused tests again, `git diff --check`, inspect ignored/untracked files, and confirm no real data or runtime report is staged. Commit documentation and plan checkboxes:
 
@@ -302,6 +302,17 @@ git commit -m "docs: record G2-C real lakehouse acceptance"
 - [ ] **Step 6: Push and verify backup**
 
 Push `codex/chapter-10-controlled-tools` using the current proxy only if needed, then compare `git rev-parse HEAD` with `git ls-remote origin refs/heads/codex/chapter-10-controlled-tools`. Do not merge `main`.
+
+## Execution Record
+
+- 实现提交合并为一个可回滚单元 `95ec0b4 feat: add G2-C real event lakehouse pipeline`；没有为了匹配计划示例而拆分共享测试文件。
+- 独立审查后的身份与重放安全加固提交为 `332bdf3 fix: harden G2-C acceptance identity`。
+- 测试采用可执行 PowerShell 函数契约与真实 Flink/Trino 验收，而不是只检查 SQL 文本片段；所有关键失败分支均先看到 RED 再实现 GREEN。
+- 动态 run-id 为 `g2c-20260918a`。正式表结果为总数 1,002、clean 1,001、late 1、不同事件 ID 1,002，五类质量违规均为 0；逐事件 17 字段共比较 17,034 次，差异为 0。
+- 重跑时发现 Flink REST 历史终态作业会被旧逻辑误算为活动 writer；修复后同时覆盖“忽略终态历史”和“拒绝多个活动作业”。
+- 首轮聚焦验证为 G2-C 11 项、Java DataStream 30 项、真实数据 63 项；独立审查后补充 run-id 防碰撞、单次提交、精确 Job/Snapshot 与事件路由摘要门禁，G2-C 测试增至 12 项。
+- 安全加固后的最终仓库全量 Python 回归为 484 项通过，耗时 170.464 秒。
+- 正式与隔离验收作业均已取消，项目容器已停止但未删除；Iceberg 正式表、Snapshot、Docker 卷和 D 盘数据保留。
 
 ## Self-Review
 

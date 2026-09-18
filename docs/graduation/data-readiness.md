@@ -2,7 +2,7 @@
 
 ## 当前状态
 
-2026-09-17 已完成两个月完整源文件下载、全扫描与稳定用户样本核验：109,950,743 条源记录生成 2,199,938 条标准化事件，覆盖连续 61 天。**真实 Kafka/Flink 适配、业务指标验收、业务前端和 RAG 尚未完成。**此前的 1 万条/百万条前缀仅作为工具验证记录保留，不再充当正式分析窗口。
+2026-09-17 已完成两个月完整源文件下载、全扫描与稳定用户样本核验：109,950,743 条源记录生成 2,199,938 条标准化事件，覆盖连续 61 天。**G2-A 回放、G2-B Java DataStream 质量入口和 G2-C Iceberg 落湖已完成小规模真实动态验收；全量容量、业务指标、业务前端和 RAG 尚未完成。**此前的 1 万条/百万条前缀仅作为工具验证记录保留，不再充当正式分析窗口。
 
 来源登记：`configs/datasets/rees46-multicategory.json`。官方目录 https://data.rees46.com/ ，数据说明 https://www.kaggle.com/datasets/mkechinov/ecommerce-behavior-data-from-multi-category-store/data 。
 
@@ -143,6 +143,8 @@ python -m generators.real_data sample-users --inputs data/rees46/months/2019-Oct
 G2-A 回放器现已实现，真实样本 400+600 条离线恢复与真实 Kafka 续传均通过。独立消费者核对 1,000 条消息的全部 14 个源字段、顺序、事件 ID 与 key，均一致；本轮无重复或缺失。其实际连接端口、Docker 排障记录、操作命令与重复发送边界见 [回放运行手册](replay-runbook.md)。本次仅验证 1,000 条，不是 220 万条全量验收；湖仓表尚未接入。
 
 G2-B 已实现独立 Java DataStream 真实事件入口，并完成 1,000 条真实样本的 Kafka 事务输出、`read_committed` 字段对账、重复注入和持久化 Checkpoint 恢复。恢复后继续处理的新记录无遗漏，恢复前后重复均进入可追踪 DLQ；动态验收中发现并修复了历史事件时间触发 Kafka 保留清理的问题。代码、测试与运行证据见 [真实事件质量运行手册](real-event-quality-runbook.md)；当前仍不是 220 万条容量或湖仓落地验收。
+
+G2-C 已将同一真实链路的 `clean=1,001` 与 `late=1` 通过单一 Flink SQL writer 写入正式 Iceberg 表 `lakehouse.analytics.real_behavior_detail_v1`。Trino 核对总数和不同 `event_id` 均为 1,002，五类字段质量违规为 0；另完成 17 个源字段、共 17,034 次逐值比较且零差异。证据见 [真实事件湖仓运行手册](real-event-lakehouse-runbook.md)。本轮仍只是正确性验收，不把它描述为 220 万条全量容量或长期故障恢复验收；下一步为 G2-D 分层指标与版本化 API。
 
 ## GitHub 备份边界
 
