@@ -1,0 +1,247 @@
+-- result:source_identity
+WITH base AS (
+    SELECT event_date, event_id
+    FROM lakehouse.analytics.real_behavior_detail_v1
+        FOR VERSION AS OF __SNAPSHOT_ID__
+),
+snapshot_metadata AS (
+    SELECT snapshot_id, committed_at
+    FROM lakehouse.analytics."real_behavior_detail_v1$snapshots"
+    WHERE snapshot_id = __SNAPSHOT_ID__
+)
+SELECT
+    count(*) AS source_event_count,
+    min(base.event_date) AS window_start,
+    max(base.event_date) AS window_end,
+    count(DISTINCT base.event_id) AS distinct_event_count,
+    CAST(__SNAPSHOT_ID__ AS BIGINT) AS source_snapshot_id,
+    max(snapshot_metadata.committed_at) AS snapshot_committed_at
+FROM base
+LEFT JOIN snapshot_metadata ON true;
+
+-- result:overview
+WITH base AS (
+    SELECT event_date, event_type, user_id, user_session, product_id,
+           price_decimal, event_id
+    FROM lakehouse.analytics.real_behavior_detail_v1
+        FOR VERSION AS OF __SNAPSHOT_ID__
+),
+day_rows AS (
+    SELECT 'DAY' AS window_type, event_date AS window_start, event_date AS window_end,
+           count(*) AS event_count,
+           count_if(event_type = 'view') AS view_count,
+           count_if(event_type = 'cart') AS cart_count,
+           count_if(event_type = 'purchase') AS purchase_count,
+           count(DISTINCT user_id) FILTER (WHERE user_id IS NOT NULL) AS unique_user_count,
+           count(DISTINCT user_session) FILTER (WHERE user_session IS NOT NULL) AS session_count,
+           count(DISTINCT product_id) FILTER (WHERE product_id IS NOT NULL) AS product_count,
+           coalesce(sum(price_decimal) FILTER (WHERE event_type = 'purchase'), DECIMAL '0.00')
+               AS purchase_amount_proxy
+    FROM base GROUP BY event_date
+),
+full_row AS (
+    SELECT 'FULL' AS window_type, min(event_date) AS window_start, max(event_date) AS window_end,
+           count(*) AS event_count,
+           count_if(event_type = 'view') AS view_count,
+           count_if(event_type = 'cart') AS cart_count,
+           count_if(event_type = 'purchase') AS purchase_count,
+           count(DISTINCT user_id) FILTER (WHERE user_id IS NOT NULL) AS unique_user_count,
+           count(DISTINCT user_session) FILTER (WHERE user_session IS NOT NULL) AS session_count,
+           count(DISTINCT product_id) FILTER (WHERE product_id IS NOT NULL) AS product_count,
+           coalesce(sum(price_decimal) FILTER (WHERE event_type = 'purchase'), DECIMAL '0.00')
+               AS purchase_amount_proxy
+    FROM base
+)
+SELECT * FROM day_rows
+UNION ALL
+SELECT * FROM full_row
+ORDER BY window_type, window_start;
+
+-- result:funnel
+WITH base AS (
+    SELECT event_date, event_ts, event_type, user_session, source_file, source_row_number,
+           event_id
+    FROM lakehouse.analytics.real_behavior_detail_v1
+        FOR VERSION AS OF __SNAPSHOT_ID__
+),
+windowed AS (
+    SELECT 'DAY' AS window_type, event_date AS window_start, event_date AS window_end,
+           event_ts, event_type, user_session, source_file, source_row_number, event_id
+    FROM base
+    UNION ALL
+    SELECT 'FULL' AS window_type, min(event_date) OVER (), max(event_date) OVER (),
+           event_ts, event_type, user_session, source_file, source_row_number, event_id
+    FROM base
+),
+window_counts AS (
+    SELECT window_type, window_start, window_end,
+           count_if(user_session IS NULL) AS missing_session_event_count
+    FROM windowed
+    GROUP BY window_type, window_start, window_end
+),
+view_ranked AS (
+    SELECT *, row_number() OVER (
+        PARTITION BY window_type, window_start, user_session
+        ORDER BY event_ts, source_file, source_row_number, event_id
+    ) AS sequence_rank
+    FROM windowed
+    WHERE user_session IS NOT NULL AND event_type = 'view'
+),
+first_views AS (
+    SELECT * FROM view_ranked WHERE sequence_rank = 1
+),
+eligible_carts AS (
+    SELECT carts.*, row_number() OVER (
+        PARTITION BY views.window_type, views.window_start, views.user_session
+        ORDER BY carts.event_ts, carts.source_file, carts.source_row_number, carts.event_id
+    ) AS sequence_rank
+    FROM first_views views
+    JOIN windowed carts
+        ON carts.window_type = views.window_type
+       AND carts.window_start = views.window_start
+       AND carts.user_session = views.user_session
+       AND carts.event_type = 'cart'
+       AND ROW(carts.event_ts, carts.source_file, carts.source_row_number, carts.event_id)
+           >= ROW(views.event_ts, views.source_file, views.source_row_number, views.event_id)
+),
+first_carts AS (
+    SELECT * FROM eligible_carts WHERE sequence_rank = 1
+),
+eligible_purchases AS (
+    SELECT purchases.*, row_number() OVER (
+        PARTITION BY carts.window_type, carts.window_start, carts.user_session
+        ORDER BY purchases.event_ts, purchases.source_file, purchases.source_row_number, purchases.event_id
+    ) AS sequence_rank
+    FROM first_carts carts
+    JOIN windowed purchases
+        ON purchases.window_type = carts.window_type
+       AND purchases.window_start = carts.window_start
+       AND purchases.user_session = carts.user_session
+       AND purchases.event_type = 'purchase'
+       AND ROW(purchases.event_ts, purchases.source_file, purchases.source_row_number, purchases.event_id)
+           >= ROW(carts.event_ts, carts.source_file, carts.source_row_number, carts.event_id)
+),
+first_purchases AS (
+    SELECT * FROM eligible_purchases WHERE sequence_rank = 1
+),
+funnel_counts AS (
+    SELECT views.window_type, views.window_start, views.window_end,
+           count(*) AS view_sessions,
+           count(carts.user_session) AS view_to_cart_sessions,
+           count(purchases.user_session) AS completed_sessions
+    FROM first_views views
+    LEFT JOIN first_carts carts
+        ON carts.window_type = views.window_type
+       AND carts.window_start = views.window_start
+       AND carts.user_session = views.user_session
+    LEFT JOIN first_purchases purchases
+        ON purchases.window_type = views.window_type
+       AND purchases.window_start = views.window_start
+       AND purchases.user_session = views.user_session
+    GROUP BY views.window_type, views.window_start, views.window_end
+)
+SELECT counts.window_type, counts.window_start, counts.window_end,
+       counts.missing_session_event_count,
+       coalesce(funnel.view_sessions, 0) AS view_sessions,
+       coalesce(funnel.view_to_cart_sessions, 0) AS view_to_cart_sessions,
+       coalesce(funnel.completed_sessions, 0) AS completed_sessions
+FROM window_counts counts
+LEFT JOIN funnel_counts funnel
+    ON funnel.window_type = counts.window_type
+   AND funnel.window_start = counts.window_start
+ORDER BY counts.window_type, counts.window_start;
+
+-- result:dimension
+WITH base AS (
+    SELECT event_date, event_type, user_id, product_id, category_id, category_code, brand,
+           price_decimal
+    FROM lakehouse.analytics.real_behavior_detail_v1
+        FOR VERSION AS OF __SNAPSHOT_ID__
+),
+windowed AS (
+    SELECT 'DAY' AS window_type, event_date AS window_start, event_date AS window_end,
+           event_type, user_id, product_id, category_id, category_code, brand, price_decimal
+    FROM base
+    UNION ALL
+    SELECT 'FULL' AS window_type, min(event_date) OVER (), max(event_date) OVER (),
+           event_type, user_id, product_id, category_id, category_code, brand, price_decimal
+    FROM base
+),
+dimension_rows AS (
+    SELECT window_type, window_start, window_end, 'product' AS dimension_type,
+           coalesce(product_id, 'UNKNOWN') AS dimension_id, product_id AS dimension_name,
+           product_id IS NULL AS is_unknown, event_type, user_id, price_decimal
+    FROM windowed
+    UNION ALL
+    SELECT window_type, window_start, window_end, 'category' AS dimension_type,
+           coalesce(category_id, 'UNKNOWN') AS dimension_id, category_code AS dimension_name,
+           category_id IS NULL OR category_code IS NULL AS is_unknown, event_type, user_id, price_decimal
+    FROM windowed
+    UNION ALL
+    SELECT window_type, window_start, window_end, 'brand' AS dimension_type,
+           coalesce(brand, 'UNKNOWN') AS dimension_id, brand AS dimension_name,
+           brand IS NULL AS is_unknown, event_type, user_id, price_decimal
+    FROM windowed
+)
+SELECT window_type, window_start, window_end, dimension_type, dimension_id, dimension_name,
+       is_unknown,
+       count_if(event_type = 'view') AS view_count,
+       count_if(event_type = 'cart') AS cart_count,
+       count_if(event_type = 'purchase') AS purchase_count,
+       count(DISTINCT user_id) FILTER (WHERE user_id IS NOT NULL) AS unique_user_count,
+       coalesce(sum(price_decimal) FILTER (WHERE event_type = 'purchase'), DECIMAL '0.00')
+           AS purchase_amount_proxy
+FROM dimension_rows
+GROUP BY window_type, window_start, window_end, dimension_type, dimension_id, dimension_name,
+         is_unknown
+ORDER BY window_type, window_start, dimension_type, dimension_id;
+
+-- result:quality
+WITH base AS (
+    SELECT event_date, event_ts, event_time, event_type, user_id, user_session, product_id,
+           category_code, brand, price_decimal, event_id, quality_route
+    FROM lakehouse.analytics.real_behavior_detail_v1
+        FOR VERSION AS OF __SNAPSHOT_ID__
+),
+quality_counts AS (
+    SELECT min(event_date) AS window_start,
+           max(event_date) AS window_end,
+           count(*) AS source_event_count,
+           count_if(quality_route = 'clean') AS clean_event_count,
+           count_if(quality_route = 'late') AS late_event_count,
+           count(DISTINCT event_id) AS distinct_event_count,
+           count(*) - count(DISTINCT event_id) AS duplicate_event_count,
+           count_if(user_session IS NULL) AS missing_session_count,
+           count_if(category_code IS NULL) AS unknown_category_count,
+           count_if(brand IS NULL) AS unknown_brand_count,
+           count_if(event_type IS NULL OR event_type NOT IN ('view', 'cart', 'purchase'))
+               AS invalid_event_type_count,
+           count_if(
+               event_id IS NULL OR trim(event_id) = '' OR user_id IS NULL OR trim(user_id) = ''
+               OR product_id IS NULL OR trim(product_id) = ''
+           ) AS empty_key_id_count,
+           count_if(price_decimal IS NULL) AS invalid_price_count,
+           count_if(event_date IS NULL OR event_ts IS NULL OR event_time IS NULL)
+               AS invalid_derived_date_count,
+           count_if(event_type IN ('view', 'cart', 'purchase')) AS overview_event_count
+    FROM base
+)
+SELECT 'FULL' AS window_type, window_start, window_end, source_event_count,
+       clean_event_count, late_event_count,
+       CAST(clean_event_count AS DECIMAL(18,8)) / nullif(source_event_count, 0) AS clean_event_rate,
+       CAST(late_event_count AS DECIMAL(18,8)) / nullif(source_event_count, 0) AS late_event_rate,
+       distinct_event_count, duplicate_event_count, missing_session_count, unknown_category_count,
+       unknown_brand_count, invalid_event_type_count, empty_key_id_count, invalid_price_count,
+       invalid_derived_date_count, overview_event_count,
+       CASE
+           WHEN source_event_count = clean_event_count + late_event_count
+            AND source_event_count = distinct_event_count
+            AND source_event_count = overview_event_count
+            AND invalid_event_type_count = 0
+            AND empty_key_id_count = 0
+            AND invalid_price_count = 0
+            AND invalid_derived_date_count = 0
+           THEN 'RECONCILED'
+           ELSE 'UNRECONCILED'
+       END AS reconciliation_status
+FROM quality_counts;
