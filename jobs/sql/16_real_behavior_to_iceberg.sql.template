@@ -1,0 +1,248 @@
+SET 'pipeline.name' = 'graduation-g2c-__RUN_ID__';
+SET 'table.local-time-zone' = 'UTC';
+SET 'parallelism.default' = '1';
+SET 'execution.checkpointing.interval' = '10 s';
+SET 'execution.checkpointing.mode' = 'EXACTLY_ONCE';
+
+CREATE TABLE real_behavior_clean_source (
+    event_time STRING,
+    event_type STRING,
+    product_id STRING,
+    category_id STRING,
+    category_code STRING,
+    brand STRING,
+    price STRING,
+    user_id STRING,
+    user_session STRING,
+    schema_version INT,
+    event_id STRING,
+    dataset_id STRING,
+    source_file STRING,
+    source_row_number BIGINT,
+    replay_schema_version INT,
+    replay_id STRING,
+    replayed_at STRING,
+    landing_topic STRING METADATA FROM 'topic' VIRTUAL,
+    landing_partition INT METADATA FROM 'partition' VIRTUAL,
+    landing_offset BIGINT METADATA FROM 'offset' VIRTUAL,
+    landing_timestamp TIMESTAMP_LTZ(3) METADATA FROM 'timestamp' VIRTUAL
+) WITH (
+    'connector' = 'kafka',
+    'topic' = '__CLEAN_TOPIC__',
+    'properties.bootstrap.servers' = 'kafka:29092',
+    'properties.group.id' = 'graduation-g2c-__RUN_ID__',
+    'properties.isolation.level' = 'read_committed',
+    'properties.allow.auto.create.topics' = 'false',
+    'scan.startup.mode' = 'earliest-offset',
+    'format' = 'json',
+    'json.fail-on-missing-field' = 'true',
+    'json.ignore-parse-errors' = 'false'
+);
+
+CREATE TABLE real_behavior_late_source (
+    source_topic STRING,
+    source_partition INT,
+    source_offset BIGINT,
+    job_version STRING,
+    observed_at STRING,
+    reason_code STRING,
+    `event` ROW<
+        event_time STRING,
+        event_type STRING,
+        product_id STRING,
+        category_id STRING,
+        category_code STRING,
+        brand STRING,
+        price STRING,
+        user_id STRING,
+        user_session STRING,
+        schema_version INT,
+        event_id STRING,
+        dataset_id STRING,
+        source_file STRING,
+        source_row_number BIGINT,
+        replay_schema_version INT,
+        replay_id STRING,
+        replayed_at STRING
+    >,
+    `watermark` BIGINT,
+    lateness_ms BIGINT,
+    landing_topic STRING METADATA FROM 'topic' VIRTUAL,
+    landing_partition INT METADATA FROM 'partition' VIRTUAL,
+    landing_offset BIGINT METADATA FROM 'offset' VIRTUAL,
+    landing_timestamp TIMESTAMP_LTZ(3) METADATA FROM 'timestamp' VIRTUAL
+) WITH (
+    'connector' = 'kafka',
+    'topic' = '__LATE_TOPIC__',
+    'properties.bootstrap.servers' = 'kafka:29092',
+    'properties.group.id' = 'graduation-g2c-__RUN_ID__',
+    'properties.isolation.level' = 'read_committed',
+    'properties.allow.auto.create.topics' = 'false',
+    'scan.startup.mode' = 'earliest-offset',
+    'format' = 'json',
+    'json.fail-on-missing-field' = 'true',
+    'json.ignore-parse-errors' = 'false'
+);
+
+CREATE CATALOG lakehouse WITH (
+    'type' = 'iceberg',
+    'catalog-type' = 'hive',
+    'uri' = 'thrift://hive-metastore:9083',
+    'warehouse' = 's3a://warehouse/iceberg',
+    'property-version' = '1'
+);
+
+CREATE DATABASE IF NOT EXISTS lakehouse.analytics;
+
+CREATE TABLE IF NOT EXISTS lakehouse.analytics.__TABLE_NAME__ (
+    event_time STRING,
+    event_ts TIMESTAMP_LTZ(3),
+    event_date DATE,
+    event_type STRING,
+    product_id STRING,
+    category_id STRING,
+    category_code STRING,
+    brand STRING,
+    price STRING,
+    price_decimal DECIMAL(20, 2),
+    user_id STRING,
+    user_session STRING,
+    schema_version INT,
+    event_id STRING,
+    dataset_id STRING,
+    source_file STRING,
+    source_row_number BIGINT,
+    replay_schema_version INT,
+    replay_id STRING,
+    replayed_at STRING,
+    quality_route STRING,
+    landing_topic STRING,
+    landing_partition INT,
+    landing_offset BIGINT,
+    landing_timestamp TIMESTAMP_LTZ(3),
+    origin_topic STRING,
+    origin_partition INT,
+    origin_offset BIGINT,
+    quality_job_version STRING,
+    quality_observed_at STRING,
+    watermark_ms BIGINT,
+    lateness_ms BIGINT
+) PARTITIONED BY (event_date)
+WITH (
+    'format-version' = '2',
+    'write.format.default' = 'parquet'
+);
+
+CREATE TEMPORARY VIEW real_behavior_normalized AS
+SELECT
+    event_time,
+    TO_TIMESTAMP_LTZ(
+        UNIX_TIMESTAMP(REPLACE(SUBSTRING(event_time, 1, 19), 'T', ' '), 'yyyy-MM-dd HH:mm:ss') * 1000,
+        3
+    ) AS event_ts,
+    CAST(SUBSTRING(event_time, 1, 10) AS DATE) AS event_date,
+    event_type,
+    product_id,
+    category_id,
+    category_code,
+    brand,
+    price,
+    CAST(price AS DECIMAL(20, 2)) AS price_decimal,
+    user_id,
+    user_session,
+    schema_version,
+    event_id,
+    dataset_id,
+    source_file,
+    source_row_number,
+    replay_schema_version,
+    replay_id,
+    replayed_at,
+    'clean' AS quality_route,
+    landing_topic,
+    landing_partition,
+    landing_offset,
+    landing_timestamp,
+    CAST(NULL AS STRING) AS origin_topic,
+    CAST(NULL AS INT) AS origin_partition,
+    CAST(NULL AS BIGINT) AS origin_offset,
+    CAST(NULL AS STRING) AS quality_job_version,
+    CAST(NULL AS STRING) AS quality_observed_at,
+    CAST(NULL AS BIGINT) AS watermark_ms,
+    CAST(NULL AS BIGINT) AS lateness_ms
+FROM real_behavior_clean_source
+UNION ALL
+SELECT
+    `event`.event_time,
+    TO_TIMESTAMP_LTZ(
+        UNIX_TIMESTAMP(REPLACE(SUBSTRING(`event`.event_time, 1, 19), 'T', ' '), 'yyyy-MM-dd HH:mm:ss') * 1000,
+        3
+    ) AS event_ts,
+    CAST(SUBSTRING(`event`.event_time, 1, 10) AS DATE) AS event_date,
+    `event`.event_type,
+    `event`.product_id,
+    `event`.category_id,
+    `event`.category_code,
+    `event`.brand,
+    `event`.price,
+    CAST(`event`.price AS DECIMAL(20, 2)) AS price_decimal,
+    `event`.user_id,
+    `event`.user_session,
+    `event`.schema_version,
+    `event`.event_id,
+    `event`.dataset_id,
+    `event`.source_file,
+    `event`.source_row_number,
+    `event`.replay_schema_version,
+    `event`.replay_id,
+    `event`.replayed_at,
+    'late' AS quality_route,
+    landing_topic,
+    landing_partition,
+    landing_offset,
+    landing_timestamp,
+    source_topic AS origin_topic,
+    source_partition AS origin_partition,
+    source_offset AS origin_offset,
+    job_version AS quality_job_version,
+    observed_at AS quality_observed_at,
+    `watermark` AS watermark_ms,
+    lateness_ms
+FROM real_behavior_late_source
+WHERE reason_code = 'LATE_EVENT';
+
+INSERT INTO lakehouse.analytics.__TABLE_NAME__
+SELECT
+    event_time,
+    event_ts,
+    event_date,
+    event_type,
+    product_id,
+    category_id,
+    category_code,
+    brand,
+    price,
+    price_decimal,
+    user_id,
+    user_session,
+    schema_version,
+    event_id,
+    dataset_id,
+    source_file,
+    source_row_number,
+    replay_schema_version,
+    replay_id,
+    replayed_at,
+    quality_route,
+    landing_topic,
+    landing_partition,
+    landing_offset,
+    landing_timestamp,
+    origin_topic,
+    origin_partition,
+    origin_offset,
+    quality_job_version,
+    quality_observed_at,
+    watermark_ms,
+    lateness_ms
+FROM real_behavior_normalized;

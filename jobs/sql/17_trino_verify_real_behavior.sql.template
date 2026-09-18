@@ -1,0 +1,51 @@
+SELECT
+    COUNT(*) AS total_count,
+    count_if(quality_route = 'clean') AS clean_count,
+    count_if(quality_route = 'late') AS late_count,
+    COUNT(DISTINCT event_id) AS distinct_event_count,
+    count_if(quality_route IS NULL OR quality_route NOT IN ('clean', 'late')) AS invalid_route_count
+FROM lakehouse.analytics.__TABLE_NAME__;
+
+SELECT
+    count_if(
+        event_time IS NULL OR event_type IS NULL OR product_id IS NULL OR price IS NULL OR
+        user_id IS NULL OR schema_version IS NULL OR schema_version <> 1 OR
+        event_id IS NULL OR dataset_id IS NULL OR
+        source_file IS NULL OR source_row_number IS NULL OR source_row_number < 1 OR
+        replay_schema_version IS NULL OR replay_schema_version <> 1 OR
+        replay_id IS NULL OR replayed_at IS NULL OR
+        dataset_id <> 'rees46-multicategory-2019-2020' OR
+        source_file NOT IN ('2019-Oct.csv.gz', '2019-Nov.csv.gz') OR
+        event_type NOT IN ('view', 'cart', 'remove_from_cart', 'purchase') OR
+        NOT regexp_like(price, '^(?:0|[1-9][0-9]{0,17})\.[0-9]{2}$') OR
+        NOT regexp_like(event_id, '^real_[0-9a-f]{64}$')
+    ) AS invalid_original_count,
+    count_if(
+        event_ts IS NULL OR event_date IS NULL OR price_decimal IS NULL OR
+        event_date <> try_cast(substr(event_time, 1, 10) AS date) OR
+        price_decimal <> try_cast(price AS decimal(20, 2))
+    ) AS invalid_derived_count,
+    count_if(
+        landing_topic IS NULL OR landing_partition IS NULL OR landing_offset IS NULL OR
+        landing_timestamp IS NULL
+    ) AS invalid_landing_count,
+    count_if(
+        quality_route = 'clean' AND
+        (origin_topic IS NOT NULL OR origin_partition IS NOT NULL OR origin_offset IS NOT NULL OR
+         quality_job_version IS NOT NULL OR quality_observed_at IS NOT NULL OR
+         watermark_ms IS NOT NULL OR lateness_ms IS NOT NULL)
+    ) AS invalid_clean_diagnostic_count,
+    count_if(
+        quality_route = 'late' AND
+        (origin_topic IS NULL OR origin_partition IS NULL OR origin_offset IS NULL OR
+         quality_job_version IS NULL OR quality_job_version <> 'graduation-g2b-v1' OR
+         quality_observed_at IS NULL OR watermark_ms IS NULL OR lateness_ms IS NULL OR
+         lateness_ms < 0)
+    ) AS invalid_late_diagnostic_count
+FROM lakehouse.analytics.__TABLE_NAME__;
+
+SELECT
+    COUNT(*) AS snapshot_count,
+    max(snapshot_id) AS latest_snapshot_id,
+    max(committed_at) AS latest_snapshot_committed_at
+FROM lakehouse.analytics."__TABLE_NAME__$snapshots";
