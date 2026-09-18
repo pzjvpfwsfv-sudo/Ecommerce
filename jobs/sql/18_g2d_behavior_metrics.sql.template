@@ -241,7 +241,7 @@ SELECT 'FULL' AS window_type, window_start, window_end, source_event_count,
             AND empty_key_id_count = 0
             AND invalid_price_count = 0
             AND invalid_derived_date_count = 0
-           THEN 'RECONCILED'
-           ELSE 'UNRECONCILED'
+           THEN 'PASS'
+           ELSE 'FAIL'
        END AS reconciliation_status
 FROM quality_counts;

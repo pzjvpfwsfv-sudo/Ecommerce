@@ -130,6 +130,17 @@ class G2dArtifactContractTests(unittest.TestCase):
         self.assertIn("count(*) AS overview_event_count", quality_sql)
         self.assertIn("source_event_count = overview_event_count", quality_sql)
 
+    def test_quality_emits_exact_pass_status_contract(self):
+        """Protect the quality result consumed by Task 2 and later publication gates."""
+        quality_sql = TRINO_TEMPLATE.read_text(encoding="utf-8").split(
+            "-- result:quality\n", 1
+        )[1]
+        self.assertRegex(
+            quality_sql,
+            r"THEN\s+'PASS'\s+ELSE\s+'FAIL'\s+END AS reconciliation_status",
+        )
+        self.assertNotRegex(quality_sql, r"'(?:UN)?RECONCILED'")
+
 
 class G2dPowerShellContractTests(unittest.TestCase):
     def _run_powershell(self, command):
