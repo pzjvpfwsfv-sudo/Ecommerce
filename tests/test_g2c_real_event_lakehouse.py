@@ -35,6 +35,7 @@ $template = Get-Content -LiteralPath "jobs/sql/16_real_behavior_to_iceberg.sql.t
 $sql = Render-G2cSql -Template $template -Deployment $deployment
 Assert-G2cRenderedSql -Sql $sql -Deployment $deployment
 [ordered]@{
+    raw_topic = $deployment.RawTopic
     clean_topic = $deployment.CleanTopic
     late_topic = $deployment.LateTopic
     table_name = $deployment.TableName
@@ -46,6 +47,9 @@ Assert-G2cRenderedSql -Sql $sql -Deployment $deployment
         result = self.run_powershell(command)
         self.assertEqual(0, result.returncode, result.stderr or result.stdout)
         payload = json.loads(result.stdout.strip().splitlines()[-1])
+        self.assertEqual(
+            "real_behavior_events_v1_g2c-20260918a", payload["raw_topic"]
+        )
         self.assertEqual(
             "real_behavior_clean_v1_g2c-20260918a", payload["clean_topic"]
         )
@@ -73,6 +77,7 @@ function Test-Rejected([scriptblock]$Action) {
 [ordered]@{
     uppercase_run = Test-Rejected { Get-G2cDeployment -RunId "G2C-bad" }
     quoted_run = Test-Rejected { Get-G2cDeployment -RunId "g2c'bad" }
+    underscore_run = Test-Rejected { Get-G2cDeployment -RunId "g2c_bad" }
     long_run = Test-Rejected { Get-G2cDeployment -RunId ("a" * 33) }
     clean_mismatch = Test-Rejected {
         Get-G2cDeployment -RunId "g2c-safe" -CleanTopic "real_behavior_clean_v1_other"
@@ -104,20 +109,23 @@ $historyAndRunning = @(
     [pscustomobject]@{ jid = "old-canceled"; name = $pipeline; state = "CANCELED" },
     [pscustomobject]@{ jid = "current-running"; name = $pipeline; state = "RUNNING" }
 )
-$selected = Get-G2cSingleRunningJob -PipelineName $pipeline -Jobs $historyAndRunning
+$selected = Get-G2cSingleRunningJob -PipelineName $pipeline -JobId "current-running" -Jobs $historyAndRunning
 [ordered]@{
     selected_jid = $selected.jid
     no_running = Test-Rejected {
-        Get-G2cSingleRunningJob -PipelineName $pipeline -Jobs @($historyAndRunning[0])
+        Get-G2cSingleRunningJob -PipelineName $pipeline -JobId "old-canceled" -Jobs @($historyAndRunning[0])
+    }
+    wrong_job_id = Test-Rejected {
+        Get-G2cSingleRunningJob -PipelineName $pipeline -JobId "another-job" -Jobs $historyAndRunning
     }
     duplicate_active = Test-Rejected {
-        Get-G2cSingleRunningJob -PipelineName $pipeline -Jobs @(
+        Get-G2cSingleRunningJob -PipelineName $pipeline -JobId "current-running" -Jobs @(
             $historyAndRunning[1],
             [pscustomobject]@{ jid = "second-running"; name = $pipeline; state = "RUNNING" }
         )
     }
     non_running_active = Test-Rejected {
-        Get-G2cSingleRunningJob -PipelineName $pipeline -Jobs @(
+        Get-G2cSingleRunningJob -PipelineName $pipeline -JobId "restarting" -Jobs @(
             [pscustomobject]@{ jid = "restarting"; name = $pipeline; state = "RESTARTING" }
         )
     }
@@ -144,7 +152,9 @@ $validSummary = [pscustomobject]@{
     late_count = 2
     distinct_event_count = 12
     invalid_route_count = 0
+    event_route_sha256 = ("a" * 64)
 }
+$expectedDigest = "a" * 64
 $validQuality = [pscustomobject]@{
     invalid_original_count = 0
     invalid_derived_count = 0
@@ -154,26 +164,35 @@ $validQuality = [pscustomobject]@{
 }
 [ordered]@{
     valid_summary = -not (Test-Rejected {
-        Assert-G2cSummary -Summary $validSummary -ExpectedCleanCount 10 -ExpectedLateCount 2
+        Assert-G2cSummary -Summary $validSummary -ExpectedCleanCount 10 -ExpectedLateCount 2 `
+            -ExpectedEventRouteSha256 $expectedDigest
     })
     valid_quality = -not (Test-Rejected { Assert-G2cQuality -Quality $validQuality })
     route_sum = Test-Rejected {
         Assert-G2cSummary -Summary ([pscustomobject]@{
-            total_count=13; clean_count=10; late_count=2; distinct_event_count=13; invalid_route_count=0
-        }) -ExpectedCleanCount 10 -ExpectedLateCount 2
+            total_count=13; clean_count=10; late_count=2; distinct_event_count=13; invalid_route_count=0;
+            event_route_sha256=$expectedDigest
+        }) -ExpectedCleanCount 10 -ExpectedLateCount 2 -ExpectedEventRouteSha256 $expectedDigest
     }
     duplicate_id = Test-Rejected {
         Assert-G2cSummary -Summary ([pscustomobject]@{
-            total_count=12; clean_count=10; late_count=2; distinct_event_count=11; invalid_route_count=0
-        }) -ExpectedCleanCount 10 -ExpectedLateCount 2
+            total_count=12; clean_count=10; late_count=2; distinct_event_count=11; invalid_route_count=0;
+            event_route_sha256=$expectedDigest
+        }) -ExpectedCleanCount 10 -ExpectedLateCount 2 -ExpectedEventRouteSha256 $expectedDigest
     }
     invalid_route = Test-Rejected {
         Assert-G2cSummary -Summary ([pscustomobject]@{
-            total_count=12; clean_count=10; late_count=2; distinct_event_count=12; invalid_route_count=1
-        }) -ExpectedCleanCount 10 -ExpectedLateCount 2
+            total_count=12; clean_count=10; late_count=2; distinct_event_count=12; invalid_route_count=1;
+            event_route_sha256=$expectedDigest
+        }) -ExpectedCleanCount 10 -ExpectedLateCount 2 -ExpectedEventRouteSha256 $expectedDigest
     }
     wrong_expected = Test-Rejected {
-        Assert-G2cSummary -Summary $validSummary -ExpectedCleanCount 9 -ExpectedLateCount 2
+        Assert-G2cSummary -Summary $validSummary -ExpectedCleanCount 9 -ExpectedLateCount 2 `
+            -ExpectedEventRouteSha256 $expectedDigest
+    }
+    wrong_event_route_digest = Test-Rejected {
+        Assert-G2cSummary -Summary $validSummary -ExpectedCleanCount 10 -ExpectedLateCount 2 `
+            -ExpectedEventRouteSha256 ("b" * 64)
     }
     invalid_quality = Test-Rejected {
         Assert-G2cQuality -Quality ([pscustomobject]@{
@@ -196,22 +215,36 @@ function Test-Rejected([scriptblock]$Action) {
     try { & $Action | Out-Null; return $false } catch { return $true }
 }
 $template = Get-Content -LiteralPath "jobs/sql/17_trino_verify_real_behavior.sql.template" -Raw -Encoding UTF8
-$sql = Render-G2cTrinoSql -Template $template -TableName "real_behavior_detail_v1_g2c_safe"
+$deployment = [pscustomobject]@{
+    TableName = "real_behavior_detail_v1_g2c_safe"
+    CleanTopic = "real_behavior_clean_v1_g2c-safe"
+    LateTopic = "real_behavior_late_v1_g2c-safe"
+    RawTopic = "real_behavior_events_v1_g2c-safe"
+}
+$sql = Render-G2cTrinoSql -Template $template -Deployment $deployment
 $statements = @(Split-G2cSqlStatements -Sql $sql)
 $summary = ConvertFrom-G2cCsvResult -Lines @(
-    "total_count,clean_count,late_count,distinct_event_count,invalid_route_count",
-    "12,10,2,12,0"
+    "total_count,clean_count,late_count,distinct_event_count,invalid_route_count,event_route_sha256",
+    "12,10,2,12,0,aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 )
 [ordered]@{
     statement_count = $statements.Count
     total = [long]$summary.total_count
     unresolved = [bool]($sql -match "__[A-Z0-9_]+__")
     snapshot_query = [bool]($sql -match 'real_behavior_detail_v1_g2c_safe\$snapshots')
+    event_route_digest = [bool]($sql -match 'event_route_sha256')
+    exact_topics = [bool](
+        $sql.Contains("'real_behavior_clean_v1_g2c-safe'") -and
+        $sql.Contains("'real_behavior_late_v1_g2c-safe'") -and
+        $sql.Contains("'real_behavior_events_v1_g2c-safe'")
+    )
     unsafe_table = Test-Rejected {
-        Render-G2cTrinoSql -Template $template -TableName 'real_behavior_detail_v1"; DROP TABLE x; --'
+        $bad = $deployment.PSObject.Copy()
+        $bad.TableName = 'real_behavior_detail_v1"; DROP TABLE x; --'
+        Render-G2cTrinoSql -Template $template -Deployment $bad
     }
     unresolved_template = Test-Rejected {
-        Render-G2cTrinoSql -Template ($template + "`n__UNKNOWN__") -TableName "real_behavior_detail_v1_g2c_safe"
+        Render-G2cTrinoSql -Template ($template + "`n__UNKNOWN__") -Deployment $deployment
     }
     no_row = Test-Rejected { ConvertFrom-G2cCsvResult -Lines @("total_count") }
     multiple_rows = Test-Rejected {
@@ -226,6 +259,8 @@ $summary = ConvertFrom-G2cCsvResult -Lines @(
         self.assertEqual(12, payload["total"])
         self.assertFalse(payload["unresolved"])
         self.assertTrue(payload["snapshot_query"])
+        self.assertTrue(payload["event_route_digest"])
+        self.assertTrue(payload["exact_topics"])
         self.assertTrue(payload["unsafe_table"])
         self.assertTrue(payload["unresolved_template"])
         self.assertTrue(payload["no_row"])
@@ -244,23 +279,32 @@ $completed = [pscustomobject]@{
         completed = [pscustomobject]@{ id = 7; status = "COMPLETED"; latest_ack_timestamp = 1789700000000 }
     }
 }
+$notBefore = [DateTimeOffset]::Parse("2026-09-18T11:59:00Z").ToUnixTimeMilliseconds()
 [ordered]@{
     snapshot_present = -not (Test-Rejected {
         Assert-G2cSnapshot -Snapshot ([pscustomobject]@{
             snapshot_count = 1
             latest_snapshot_id = 918273645
             latest_snapshot_committed_at = "2026-09-18 12:00:00.000 UTC"
-        })
+        }) -NotBeforeEpochMs $notBefore
     })
     snapshot_missing = Test-Rejected {
-        Assert-G2cSnapshot -Snapshot ([pscustomobject]@{ snapshot_count = 0 })
+        Assert-G2cSnapshot -Snapshot ([pscustomobject]@{ snapshot_count = 0 }) `
+            -NotBeforeEpochMs $notBefore
     }
     snapshot_identity_missing = Test-Rejected {
         Assert-G2cSnapshot -Snapshot ([pscustomobject]@{
             snapshot_count = 1
             latest_snapshot_id = $null
             latest_snapshot_committed_at = $null
-        })
+        }) -NotBeforeEpochMs $notBefore
+    }
+    snapshot_stale = Test-Rejected {
+        Assert-G2cSnapshot -Snapshot ([pscustomobject]@{
+            snapshot_count = 1
+            latest_snapshot_id = 918273645
+            latest_snapshot_committed_at = "2026-09-18 11:58:59.000 UTC"
+        }) -NotBeforeEpochMs $notBefore
     }
     checkpoint_completed = -not (Test-Rejected {
         Get-G2cCheckpointEvidence -Checkpoints $completed
@@ -286,6 +330,38 @@ $completed = [pscustomobject]@{
 
 
 class G2cRunnerSafetyTests(PowerShellTestCase):
+    def test_submission_rejects_prior_job_history_or_nonempty_target(self):
+        command = r'''
+$ErrorActionPreference = "Stop"
+. (Resolve-Path "scripts/run_g2c_real_event_lakehouse.ps1") -FunctionsOnly
+function Test-Rejected([scriptblock]$Action) {
+    try { & $Action | Out-Null; return $false } catch { return $true }
+}
+$pipeline = "graduation-g2c-g2c-once"
+[ordered]@{
+    fresh_empty = -not (Test-Rejected {
+        Assert-G2cSubmissionSafety -PipelineName $pipeline -Jobs @() -TargetRowCount 0
+    })
+    terminal_history = Test-Rejected {
+        Assert-G2cSubmissionSafety -PipelineName $pipeline -Jobs @(
+            [pscustomobject]@{ jid = "old"; name = $pipeline; state = "CANCELED" }
+        ) -TargetRowCount 0
+    }
+    active_job = Test-Rejected {
+        Assert-G2cSubmissionSafety -PipelineName $pipeline -Jobs @(
+            [pscustomobject]@{ jid = "current"; name = $pipeline; state = "RUNNING" }
+        ) -TargetRowCount 0
+    }
+    nonempty_target = Test-Rejected {
+        Assert-G2cSubmissionSafety -PipelineName $pipeline -Jobs @() -TargetRowCount 1
+    }
+} | ConvertTo-Json -Compress
+'''
+        result = self.run_powershell(command)
+        self.assertEqual(0, result.returncode, result.stderr or result.stdout)
+        payload = json.loads(result.stdout.strip().splitlines()[-1])
+        self.assertTrue(all(payload.values()), payload)
+
     def test_running_job_lookup_ignores_terminal_history(self):
         command = r'''
 $ErrorActionPreference = "Stop"

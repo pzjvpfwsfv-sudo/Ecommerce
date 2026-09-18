@@ -14,7 +14,7 @@ Set-StrictMode -Version Latest
 function Assert-G2cRunId {
     param([Parameter(Mandatory = $true)][string]$Value)
 
-    if ($Value -cnotmatch "^[a-z0-9][a-z0-9_-]{0,31}$") {
+    if ($Value -cnotmatch "^[a-z0-9][a-z0-9-]{0,31}$") {
         throw "G2-C run-id is invalid."
     }
     return $Value
@@ -29,6 +29,7 @@ function Get-G2cDeployment {
     )
 
     $safeRunId = Assert-G2cRunId -Value $RunId
+    $expectedRaw = "real_behavior_events_v1_$safeRunId"
     $expectedClean = "real_behavior_clean_v1_$safeRunId"
     $expectedLate = "real_behavior_late_v1_$safeRunId"
     $expectedTable = "real_behavior_detail_v1_$($safeRunId.Replace('-', '_'))"
@@ -46,6 +47,7 @@ function Get-G2cDeployment {
     $identity = "graduation-g2c-$safeRunId"
     return [pscustomobject][ordered]@{
         RunId = $safeRunId
+        RawTopic = $expectedRaw
         CleanTopic = $CleanTopic
         LateTopic = $LateTopic
         TableName = $TableName
@@ -223,6 +225,52 @@ function Wait-G2cHiveMetastore {
     throw "Timed out waiting for Hive Metastore from the Flink SQL client."
 }
 
+function Wait-G2cTrinoReady {
+    param(
+        [int]$TimeoutSeconds = 120,
+        [string]$BaseUrl = "http://localhost:8088"
+    )
+
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    do {
+        try {
+            $info = Invoke-RestMethod -Method Get -Uri "$BaseUrl/v1/info" -TimeoutSec 10
+            if (-not [string]::IsNullOrWhiteSpace([string]$info.nodeVersion.version)) { return }
+        } catch {
+        }
+        Start-Sleep -Seconds 2
+    } while ((Get-Date) -lt $deadline)
+    throw "Timed out waiting for Trino readiness."
+}
+
+function Invoke-G2cTrinoScalar {
+    param([Parameter(Mandatory = $true)][string]$Sql)
+
+    $lines = @(& docker exec ecom-trino trino --server http://localhost:8080 `
+        --catalog lakehouse --schema analytics --output-format TSV --execute $Sql 2>$null)
+    if ($LASTEXITCODE -ne 0) { throw "G2-C Trino safety query failed." }
+    $content = @($lines | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    if ($content.Count -ne 1 -or [string]$content[0] -cnotmatch "^[0-9]+$") {
+        throw "G2-C Trino safety query returned an invalid scalar."
+    }
+    return [long]$content[0]
+}
+
+function Get-G2cTargetRowCount {
+    param([Parameter(Mandatory = $true)][string]$TableName)
+
+    if ($TableName -cne "real_behavior_detail_v1" -and
+            $TableName -cnotmatch "^real_behavior_detail_v1_[a-z0-9][a-z0-9_]{0,31}$") {
+        throw "Table name is outside the G2-C namespace."
+    }
+    $existsSql = "SELECT count(*) FROM lakehouse.information_schema.tables " +
+        "WHERE table_schema = 'analytics' AND table_name = '$TableName'"
+    $exists = Invoke-G2cTrinoScalar -Sql $existsSql
+    if ($exists -eq 0) { return 0L }
+    if ($exists -ne 1) { throw "G2-C target table identity is ambiguous." }
+    return Invoke-G2cTrinoScalar -Sql "SELECT count(*) FROM lakehouse.analytics.$TableName"
+}
+
 function Get-G2cFlinkJobs {
     param([string]$FlinkRestUrl = "http://localhost:8081")
 
@@ -240,14 +288,20 @@ function Get-G2cActivePipelineJobs {
     return @($Jobs | Where-Object { $_.name -ceq $PipelineName -and $_.state -in $activeStates })
 }
 
-function Assert-G2cNoActiveJob {
+function Assert-G2cSubmissionSafety {
     param(
         [Parameter(Mandatory = $true)][string]$PipelineName,
-        [object[]]$Jobs = @()
+        [object[]]$Jobs = @(),
+        [Parameter(Mandatory = $true)][long]$TargetRowCount
     )
 
-    $active = @(Get-G2cActivePipelineJobs -PipelineName $PipelineName -Jobs $Jobs)
-    if ($active.Count -gt 0) { throw "An active G2-C job already uses pipeline name $PipelineName." }
+    $history = @($Jobs | Where-Object { $_.name -ceq $PipelineName })
+    if ($history.Count -gt 0) {
+        throw "G2-C run-id has already been submitted; use a fresh run-id."
+    }
+    if ($TargetRowCount -ne 0) {
+        throw "G2-C target table is not empty; refusing replay into an existing fact table."
+    }
 }
 
 function Wait-G2cJobRunning {
@@ -302,6 +356,7 @@ if ($PlanOnly) {
     [ordered]@{
         status = "planned"
         run_id = $deployment.RunId
+        raw_topic = $deployment.RawTopic
         clean_topic = $deployment.CleanTopic
         late_topic = $deployment.LateTopic
         table_name = $deployment.TableName
@@ -324,13 +379,16 @@ try {
     Invoke-G2cChecked -Command {
         docker compose --env-file $envFile -f $composeFile --profile flink --profile lakehouse up -d `
             kafka-controller kafka-broker flink-jobmanager flink-taskmanager flink-sql-client `
-            minio minio-init metastore-postgres hive-metastore
+            minio minio-init metastore-postgres hive-metastore trino
     } -FailureMessage "Failed to start the G2-C Kafka/Flink/lakehouse services." | Out-Null
 
     Wait-G2cHiveMetastore
+    Wait-G2cTrinoReady
     Wait-G2cSourceTopics -Deployment $deployment
     $jobs = @(Get-G2cFlinkJobs)
-    Assert-G2cNoActiveJob -PipelineName $deployment.PipelineName -Jobs $jobs
+    $targetRowCount = Get-G2cTargetRowCount -TableName $deployment.TableName
+    Assert-G2cSubmissionSafety -PipelineName $deployment.PipelineName -Jobs $jobs `
+        -TargetRowCount $targetRowCount
 
     $hostSqlPath = Write-G2cSqlFile -RepositoryRoot $repositoryRoot -Deployment $deployment -Sql $sql
     $containerSqlPath = "/workspace/tmp/graduation/g2c/$($deployment.RunId)/lakehouse.sql"
@@ -347,6 +405,7 @@ try {
         run_id = $deployment.RunId
         job_id = [string]$job.jid
         pipeline_name = $deployment.PipelineName
+        raw_topic = $deployment.RawTopic
         clean_topic = $deployment.CleanTopic
         late_topic = $deployment.LateTopic
         table_name = $deployment.TableName

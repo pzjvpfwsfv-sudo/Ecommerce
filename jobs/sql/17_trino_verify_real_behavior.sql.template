@@ -3,7 +3,10 @@ SELECT
     count_if(quality_route = 'clean') AS clean_count,
     count_if(quality_route = 'late') AS late_count,
     COUNT(DISTINCT event_id) AS distinct_event_count,
-    count_if(quality_route IS NULL OR quality_route NOT IN ('clean', 'late')) AS invalid_route_count
+    count_if(quality_route IS NULL OR quality_route NOT IN ('clean', 'late')) AS invalid_route_count,
+    lower(to_hex(sha256(to_utf8(array_join(
+        array_agg(event_id || ':' || quality_route ORDER BY event_id), chr(10)
+    ))))) AS event_route_sha256
 FROM lakehouse.analytics.__TABLE_NAME__;
 
 SELECT
@@ -22,12 +25,15 @@ SELECT
     ) AS invalid_original_count,
     count_if(
         event_ts IS NULL OR event_date IS NULL OR price_decimal IS NULL OR
+        event_ts <> try(from_iso8601_timestamp(event_time)) OR
         event_date <> try_cast(substr(event_time, 1, 10) AS date) OR
         price_decimal <> try_cast(price AS decimal(20, 2))
     ) AS invalid_derived_count,
     count_if(
         landing_topic IS NULL OR landing_partition IS NULL OR landing_offset IS NULL OR
-        landing_timestamp IS NULL
+        landing_timestamp IS NULL OR
+        (quality_route = 'clean' AND landing_topic <> '__CLEAN_TOPIC__') OR
+        (quality_route = 'late' AND landing_topic <> '__LATE_TOPIC__')
     ) AS invalid_landing_count,
     count_if(
         quality_route = 'clean' AND
@@ -37,7 +43,8 @@ SELECT
     ) AS invalid_clean_diagnostic_count,
     count_if(
         quality_route = 'late' AND
-        (origin_topic IS NULL OR origin_partition IS NULL OR origin_offset IS NULL OR
+        (origin_topic IS NULL OR origin_topic <> '__RAW_TOPIC__' OR
+         origin_partition IS NULL OR origin_offset IS NULL OR
          quality_job_version IS NULL OR quality_job_version <> 'graduation-g2b-v1' OR
          quality_observed_at IS NULL OR watermark_ms IS NULL OR lateness_ms IS NULL OR
          lateness_ms < 0)

@@ -3,6 +3,8 @@ param(
     [string]$RunId = "",
     [long]$ExpectedCleanCount = -1,
     [long]$ExpectedLateCount = -1,
+    [string]$ExpectedEventRouteSha256 = "",
+    [string]$JobId = "",
     [string]$TableName = "",
     [ValidateRange(10, 600)][int]$TimeoutSeconds = 120,
     [switch]$FunctionsOnly
@@ -24,11 +26,23 @@ function Assert-G2cTableName {
 function Render-G2cTrinoSql {
     param(
         [Parameter(Mandatory = $true)][string]$Template,
-        [Parameter(Mandatory = $true)][string]$TableName
+        [Parameter(Mandatory = $true)]$Deployment
     )
 
-    $safeTable = Assert-G2cTableName -Value $TableName
+    $safeTable = Assert-G2cTableName -Value ([string]$Deployment.TableName)
+    foreach ($topic in @(
+        [string]$Deployment.CleanTopic,
+        [string]$Deployment.LateTopic,
+        [string]$Deployment.RawTopic
+    )) {
+        if ($topic -cnotmatch "^real_behavior_(?:clean|late|events)_v1_[a-z0-9][a-z0-9-]{0,31}$") {
+            throw "Topic name is outside the G2-C namespace."
+        }
+    }
     $rendered = $Template.Replace("__TABLE_NAME__", $safeTable)
+    $rendered = $rendered.Replace("__CLEAN_TOPIC__", [string]$Deployment.CleanTopic)
+    $rendered = $rendered.Replace("__LATE_TOPIC__", [string]$Deployment.LateTopic)
+    $rendered = $rendered.Replace("__RAW_TOPIC__", [string]$Deployment.RawTopic)
     if ($rendered -cmatch "__[A-Z0-9_]+__") { throw "Unresolved G2-C Trino SQL placeholder." }
     return $rendered
 }
@@ -55,7 +69,8 @@ function Assert-G2cSummary {
     param(
         [Parameter(Mandatory = $true)]$Summary,
         [Parameter(Mandatory = $true)][long]$ExpectedCleanCount,
-        [Parameter(Mandatory = $true)][long]$ExpectedLateCount
+        [Parameter(Mandatory = $true)][long]$ExpectedLateCount,
+        [Parameter(Mandatory = $true)][string]$ExpectedEventRouteSha256
     )
 
     if ($ExpectedCleanCount -lt 0 -or $ExpectedLateCount -lt 0) {
@@ -73,6 +88,10 @@ function Assert-G2cSummary {
     if ($invalidRoutes -ne 0) { throw "Invalid G2-C quality_route detected." }
     if ($clean -ne $ExpectedCleanCount -or $late -ne $ExpectedLateCount) {
         throw "G2-C route counts do not match the expected Kafka evidence."
+    }
+    if ($ExpectedEventRouteSha256 -cnotmatch "^[0-9a-f]{64}$" -or
+            [string]$Summary.event_route_sha256 -cne $ExpectedEventRouteSha256) {
+        throw "G2-C event/route digest does not match the expected Kafka evidence."
     }
 }
 
@@ -93,7 +112,10 @@ function Assert-G2cQuality {
 }
 
 function Assert-G2cSnapshot {
-    param([Parameter(Mandatory = $true)]$Snapshot)
+    param(
+        [Parameter(Mandatory = $true)]$Snapshot,
+        [Parameter(Mandatory = $true)][long]$NotBeforeEpochMs
+    )
 
     if ([long]$Snapshot.snapshot_count -lt 1) {
         throw "G2-C Iceberg table has no committed snapshot."
@@ -103,6 +125,19 @@ function Assert-G2cSnapshot {
     if ($null -eq $id -or $null -eq $id.Value -or
             $null -eq $committedAt -or [string]::IsNullOrWhiteSpace([string]$committedAt.Value)) {
         throw "G2-C latest Iceberg snapshot identity is missing."
+    }
+    try {
+        $committedText = ([string]$committedAt.Value) -replace " UTC$", " +00:00"
+        $committed = [DateTimeOffset]::Parse(
+            $committedText,
+            [Globalization.CultureInfo]::InvariantCulture,
+            [Globalization.DateTimeStyles]::AssumeUniversal
+        )
+    } catch {
+        throw "G2-C latest Iceberg snapshot time is invalid."
+    }
+    if ($committed.ToUnixTimeMilliseconds() -lt $NotBeforeEpochMs) {
+        throw "G2-C latest Iceberg snapshot predates the requested Flink job."
     }
 }
 
@@ -126,6 +161,7 @@ function Get-G2cCheckpointEvidence {
 function Get-G2cSingleRunningJob {
     param(
         [Parameter(Mandatory = $true)][string]$PipelineName,
+        [Parameter(Mandatory = $true)][string]$JobId,
         [object[]]$Jobs = @()
     )
 
@@ -133,6 +169,9 @@ function Get-G2cSingleRunningJob {
     $active = @($Jobs | Where-Object { $_.name -ceq $PipelineName -and $_.state -in $activeStates })
     if ($active.Count -ne 1 -or [string]$active[0].state -cne "RUNNING") {
         throw "G2-C verification requires exactly one RUNNING job named $PipelineName."
+    }
+    if ([string]$active[0].jid -cne $JobId) {
+        throw "G2-C running job does not match the requested job ID."
     }
     return $active[0]
 }
@@ -176,6 +215,7 @@ function Wait-G2cExpectedSummary {
         [Parameter(Mandatory = $true)][string]$EnvFile,
         [Parameter(Mandatory = $true)][long]$ExpectedCleanCount,
         [Parameter(Mandatory = $true)][long]$ExpectedLateCount,
+        [Parameter(Mandatory = $true)][string]$ExpectedEventRouteSha256,
         [int]$TimeoutSeconds = 120
     )
 
@@ -193,7 +233,8 @@ function Wait-G2cExpectedSummary {
             }
             if ($clean -eq $ExpectedCleanCount -and $late -eq $ExpectedLateCount) {
                 Assert-G2cSummary -Summary $summary -ExpectedCleanCount $ExpectedCleanCount `
-                    -ExpectedLateCount $ExpectedLateCount
+                    -ExpectedLateCount $ExpectedLateCount `
+                    -ExpectedEventRouteSha256 $ExpectedEventRouteSha256
                 return $summary
             }
         } catch {
@@ -248,6 +289,8 @@ $requestedRunId = $RunId
 $requestedTableName = $TableName
 $requestedCleanCount = $ExpectedCleanCount
 $requestedLateCount = $ExpectedLateCount
+$requestedEventRouteSha256 = $ExpectedEventRouteSha256
+$requestedJobId = $JobId
 $requestedTimeout = $TimeoutSeconds
 $repositoryRoot = Split-Path -Parent $PSScriptRoot
 
@@ -255,6 +298,12 @@ $repositoryRoot = Split-Path -Parent $PSScriptRoot
 $deployment = Get-G2cDeployment -RunId $requestedRunId -TableName $requestedTableName
 if ($requestedCleanCount -lt 0 -or $requestedLateCount -lt 0) {
     throw "Expected G2-C route counts must be supplied."
+}
+if ($requestedEventRouteSha256 -cnotmatch "^[0-9a-f]{64}$") {
+    throw "Expected G2-C event/route digest must be a lowercase SHA-256 value."
+}
+if ($requestedJobId -cnotmatch "^[0-9a-f]{32}$") {
+    throw "G2-C job ID must be a lowercase 32-character Flink ID."
 }
 
 $composeFile = Join-Path $repositoryRoot "infra/docker-compose.yml"
@@ -267,30 +316,36 @@ Invoke-G2cChecked -Command {
 } -FailureMessage "Failed to start Hive Metastore and Trino for G2-C verification." | Out-Null
 Wait-G2cTrinoReady -TimeoutSeconds $requestedTimeout
 
-$job = Get-G2cSingleRunningJob -PipelineName $deployment.PipelineName -Jobs @(Get-G2cFlinkJobs)
-$jobId = [string]$job.jid
-$checkpoint = Wait-G2cCheckpointEvidence -JobId $jobId -TimeoutSeconds $requestedTimeout
+$job = Get-G2cSingleRunningJob -PipelineName $deployment.PipelineName -JobId $requestedJobId `
+    -Jobs @(Get-G2cFlinkJobs)
+$checkpoint = Wait-G2cCheckpointEvidence -JobId $requestedJobId -TimeoutSeconds $requestedTimeout
 
 $templatePath = Join-Path $repositoryRoot "jobs/sql/17_trino_verify_real_behavior.sql.template"
 $template = Get-Content -LiteralPath $templatePath -Raw -Encoding UTF8
-$verificationSql = Render-G2cTrinoSql -Template $template -TableName $deployment.TableName
+$verificationSql = Render-G2cTrinoSql -Template $template -Deployment $deployment
 $statements = @(Split-G2cSqlStatements -Sql $verificationSql)
 $summary = Wait-G2cExpectedSummary -Sql $statements[0] -ComposeFile $composeFile -EnvFile $envFile `
     -ExpectedCleanCount $requestedCleanCount -ExpectedLateCount $requestedLateCount `
+    -ExpectedEventRouteSha256 $requestedEventRouteSha256 `
     -TimeoutSeconds $requestedTimeout
 $quality = Invoke-G2cTrinoStatement -Sql $statements[1] -ComposeFile $composeFile -EnvFile $envFile
 Assert-G2cQuality -Quality $quality
 $snapshot = Invoke-G2cTrinoStatement -Sql $statements[2] -ComposeFile $composeFile -EnvFile $envFile
-Assert-G2cSnapshot -Snapshot $snapshot
+Assert-G2cSnapshot -Snapshot $snapshot -NotBeforeEpochMs ([long]$job.'start-time')
 
 $report = [ordered]@{
     status = "PASS"
     verified_at = [DateTimeOffset]::UtcNow.ToString("o")
     run_id = $deployment.RunId
     pipeline_name = $deployment.PipelineName
-    job_id = $jobId
+    job_id = $requestedJobId
+    job_started_at_epoch_ms = [long]$job.'start-time'
     table_name = $deployment.TableName
-    expected = [ordered]@{ clean = $requestedCleanCount; late = $requestedLateCount }
+    expected = [ordered]@{
+        clean = $requestedCleanCount
+        late = $requestedLateCount
+        event_route_sha256 = $requestedEventRouteSha256
+    }
     summary = $summary
     quality = $quality
     checkpoint = $checkpoint
