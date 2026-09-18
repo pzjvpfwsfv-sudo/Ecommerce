@@ -116,6 +116,18 @@ class G2dArtifactContractTests(unittest.TestCase):
         self.assertIn("reconciliation_status", sql)
         self.assertIn('"real_behavior_detail_v1$snapshots"', sql)
 
+    def test_quality_preserves_valid_removals_in_total_reconciliation(self):
+        """Protect valid remove-from-cart facts from forcing an unreconciled publication."""
+        quality_sql = TRINO_TEMPLATE.read_text(encoding="utf-8").split(
+            "-- result:quality\n", 1
+        )[1]
+        self.assertIn(
+            "event_type NOT IN ('view', 'cart', 'remove_from_cart', 'purchase')",
+            quality_sql,
+        )
+        self.assertIn("count(*) AS overview_event_count", quality_sql)
+        self.assertIn("source_event_count = overview_event_count", quality_sql)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -214,7 +214,7 @@ quality_counts AS (
            count_if(user_session IS NULL) AS missing_session_count,
            count_if(category_code IS NULL) AS unknown_category_count,
            count_if(brand IS NULL) AS unknown_brand_count,
-           count_if(event_type IS NULL OR event_type NOT IN ('view', 'cart', 'purchase'))
+           count_if(event_type IS NULL OR event_type NOT IN ('view', 'cart', 'remove_from_cart', 'purchase'))
                AS invalid_event_type_count,
            count_if(
                event_id IS NULL OR trim(event_id) = '' OR user_id IS NULL OR trim(user_id) = ''
@@ -223,7 +223,7 @@ quality_counts AS (
            count_if(price_decimal IS NULL) AS invalid_price_count,
            count_if(event_date IS NULL OR event_ts IS NULL OR event_time IS NULL)
                AS invalid_derived_date_count,
-           count_if(event_type IN ('view', 'cart', 'purchase')) AS overview_event_count
+           count(*) AS overview_event_count
     FROM base
 )
 SELECT 'FULL' AS window_type, window_start, window_end, source_event_count,
