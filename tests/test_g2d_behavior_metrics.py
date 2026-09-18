@@ -529,5 +529,373 @@ try {
         self.assertTrue(payload["escaped_absent"])
 
 
+class G2dRefreshSafetyTests(unittest.TestCase):
+    def _run_powershell(self, command):
+        executable = shutil.which("pwsh") or shutil.which("powershell")
+        if executable is None:
+            self.skipTest("PowerShell is required for G2-D refresh coverage")
+        return subprocess.run(
+            [executable, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=20,
+            check=False,
+        )
+
+    def _payload(self, command):
+        result = self._run_powershell(command)
+        self.assertEqual(0, result.returncode, result.stderr or result.stdout)
+        return json.loads(result.stdout.strip().splitlines()[-1])
+
+    def test_refresh_plan_is_fixed_publication_last_and_plan_only_is_offline(self):
+        payload = self._payload(
+            r'''
+$ErrorActionPreference = 'Stop'
+. (Resolve-Path './scripts/refresh_g2d_behavior_metrics.ps1') -FunctionsOnly
+function Test-Rejected([scriptblock]$Action) {
+    try { & $Action | Out-Null; return $false } catch { return $true }
+}
+$plan = Get-G2dRefreshPlan -MetricRunId 'behavior-v1-s3854376992136224865'
+[ordered]@{
+    tables = @($plan | ForEach-Object { $_.Name })
+    targets = @($plan | ForEach-Object { $_.Target })
+    publication_last = $plan[-1].Name -ceq 'publication'
+    plan_only = Invoke-G2dRefresh -DataScope g2c-correctness-subset -PlanOnly
+    unsafe_run_id = Test-Rejected {
+        Get-G2dRefreshPlan -MetricRunId "behavior-v1-s1'; DROP TABLE analytics.x; --"
+    }
+    zero_run_id = Test-Rejected { Get-G2dRefreshPlan -MetricRunId 'behavior-v1-s0' }
+} | ConvertTo-Json -Depth 8 -Compress
+'''
+        )
+        self.assertEqual(
+            ["overview", "funnel", "dimension", "quality", "publication"],
+            payload["tables"],
+        )
+        self.assertEqual(
+            [
+                "behavior_overview_metrics",
+                "behavior_funnel_metrics",
+                "behavior_dimension_metrics",
+                "behavior_quality_metrics",
+                "behavior_metric_publications",
+            ],
+            payload["targets"],
+        )
+        self.assertTrue(payload["publication_last"])
+        self.assertEqual("planned", payload["plan_only"]["status"])
+        self.assertEqual("g2c-correctness-subset", payload["plan_only"]["data_scope"])
+        self.assertTrue(payload["unsafe_run_id"])
+        self.assertTrue(payload["zero_run_id"])
+
+    def test_trino_result_set_requires_exactly_five_fixed_names(self):
+        payload = self._payload(
+            r'''
+$ErrorActionPreference = 'Stop'
+. (Resolve-Path './scripts/refresh_g2d_behavior_metrics.ps1') -FunctionsOnly
+function Test-Rejected([scriptblock]$Action) {
+    try { & $Action | Out-Null; return $false } catch { return $true }
+}
+$valid = [ordered]@{
+    source_identity = @([pscustomobject]@{ source_snapshot_id = '9' })
+    overview = @([pscustomobject]@{ value = '1' })
+    funnel = @([pscustomobject]@{ value = '1' })
+    dimension = @([pscustomobject]@{ value = '1' })
+    quality = @([pscustomobject]@{ value = '1' })
+}
+$missing = [ordered]@{
+    source_identity = $valid.source_identity; overview = $valid.overview
+    funnel = $valid.funnel; dimension = $valid.dimension
+}
+$extra = [ordered]@{}
+foreach ($entry in $valid.GetEnumerator()) { $extra[$entry.Key] = $entry.Value }
+$extra['other'] = @([pscustomobject]@{ value = '1' })
+$wrong = [ordered]@{
+    source_identity = $valid.source_identity; overview = $valid.overview
+    funnel = $valid.funnel; dimension = $valid.dimension; other = $valid.quality
+}
+[ordered]@{
+    valid = -not (Test-Rejected { Assert-G2dTrinoResultSet -Results $valid })
+    four_results = Test-Rejected { Assert-G2dTrinoResultSet -Results $missing }
+    six_results = Test-Rejected { Assert-G2dTrinoResultSet -Results $extra }
+    wrong_name = Test-Rejected { Assert-G2dTrinoResultSet -Results $wrong }
+} | ConvertTo-Json -Compress
+'''
+        )
+        self.assertTrue(all(payload.values()), payload)
+
+    def test_stream_load_accepts_only_exact_success_and_exact_counts(self):
+        payload = self._payload(
+            r'''
+$ErrorActionPreference = 'Stop'
+. (Resolve-Path './scripts/refresh_g2d_behavior_metrics.ps1') -FunctionsOnly
+function Test-Rejected([scriptblock]$Action) {
+    try { & $Action | Out-Null; return $false } catch { return $true }
+}
+$success = [pscustomobject]@{
+    Status = 'Success'; NumberLoadedRows = 2; NumberFilteredRows = 0
+}
+[ordered]@{
+    exact = -not (Test-Rejected {
+        Assert-G2dStreamLoadResponse -Response $success -ExpectedRows 2 `
+            -TableName behavior_overview_metrics
+    })
+    publish_timeout = Test-Rejected {
+        Assert-G2dStreamLoadResponse -Response ([pscustomobject]@{
+            Status='Publish Timeout'; NumberLoadedRows=2; NumberFilteredRows=0
+        }) -ExpectedRows 2 -TableName behavior_overview_metrics
+    }
+    lowercase_success = Test-Rejected {
+        Assert-G2dStreamLoadResponse -Response ([pscustomobject]@{
+            Status='success'; NumberLoadedRows=2; NumberFilteredRows=0
+        }) -ExpectedRows 2 -TableName behavior_overview_metrics
+    }
+    wrong_loaded = Test-Rejected {
+        Assert-G2dStreamLoadResponse -Response ([pscustomobject]@{
+            Status='Success'; NumberLoadedRows=1; NumberFilteredRows=0
+        }) -ExpectedRows 2 -TableName behavior_overview_metrics
+    }
+    filtered = Test-Rejected {
+        Assert-G2dStreamLoadResponse -Response ([pscustomobject]@{
+            Status='Success'; NumberLoadedRows=2; NumberFilteredRows=1
+        }) -ExpectedRows 2 -TableName behavior_overview_metrics
+    }
+} | ConvertTo-Json -Compress
+'''
+        )
+        self.assertTrue(all(payload.values()), payload)
+
+    def test_candidate_verification_rejects_missing_changed_or_stale_rows(self):
+        payload = self._payload(
+            r'''
+$ErrorActionPreference = 'Stop'
+. (Resolve-Path './scripts/refresh_g2d_behavior_metrics.ps1') -FunctionsOnly
+function Test-Rejected([scriptblock]$Action) {
+    try { & $Action | Out-Null; return $false } catch { return $true }
+}
+$row = [pscustomobject]@{
+    metric_run_id='behavior-v1-s9'; dataset_id='rees46-multicategory'
+    metric_version='behavior-v1'; window_type='FULL'; window_start='2024-01-01'
+    window_end='2024-01-01'; event_count='1002'; view_count='700'; cart_count='200'
+    purchase_count='100'; unique_user_count='500'; session_count='600'
+    product_count='300'; purchase_amount_proxy='1000.00'
+}
+$same = ($row | ConvertTo-Json | ConvertFrom-Json)
+$changed = ($row | ConvertTo-Json | ConvertFrom-Json); $changed.view_count = '699'
+$extra = ($row | ConvertTo-Json | ConvertFrom-Json); $extra.window_type = 'DAY'
+[ordered]@{
+    exact = -not (Test-Rejected {
+        Assert-G2dStoredCandidate -Name overview -CandidateRows @($row) -StoredRows @($same)
+    })
+    missing = Test-Rejected {
+        Assert-G2dStoredCandidate -Name overview -CandidateRows @($row) -StoredRows @()
+    }
+    changed = Test-Rejected {
+        Assert-G2dStoredCandidate -Name overview -CandidateRows @($row) -StoredRows @($changed)
+    }
+    stale_extra = Test-Rejected {
+        Assert-G2dStoredCandidate -Name overview -CandidateRows @($row) `
+            -StoredRows @($same, $extra)
+    }
+} | ConvertTo-Json -Compress
+'''
+        )
+        self.assertTrue(all(payload.values()), payload)
+
+    def test_doris_batch_parser_decodes_escaped_cells_and_nulls(self):
+        payload = self._payload(
+            r'''
+$ErrorActionPreference = 'Stop'
+. (Resolve-Path './scripts/refresh_g2d_behavior_metrics.ps1') -FunctionsOnly
+$rows = @(ConvertFrom-G2dMysqlBatch -Lines @(
+    "name`tnote",
+    ('alpha\tbeta' + "`t" + 'NULL'),
+    ('path\\leaf' + "`t" + 'plain')
+))
+[ordered]@{
+    count = $rows.Count
+    decoded_tab = $rows[0].name -ceq "alpha`tbeta"
+    null_value = $null -eq $rows[0].note
+    decoded_backslash = $rows[1].name -ceq 'path\leaf'
+    plain = $rows[1].note
+} | ConvertTo-Json -Compress
+'''
+        )
+        self.assertEqual(2, payload["count"])
+        self.assertTrue(payload["decoded_tab"])
+        self.assertTrue(payload["null_value"])
+        self.assertTrue(payload["decoded_backslash"])
+        self.assertEqual("plain", payload["plain"])
+
+    def test_existing_publication_requires_exact_identity_counts_hashes_and_status(self):
+        payload = self._payload(
+            r'''
+$ErrorActionPreference = 'Stop'
+. (Resolve-Path './scripts/refresh_g2d_behavior_metrics.ps1') -FunctionsOnly
+function Test-Rejected([scriptblock]$Action) {
+    try { & $Action | Out-Null; return $false } catch { return $true }
+}
+$identity = [pscustomobject]@{
+    MetricRunId='behavior-v1-s9'; DatasetId='rees46-multicategory'
+    MetricVersion='behavior-v1'; DataScope='g2c-correctness-subset'
+    SourceSnapshotId=9; SourceEventCount=1002
+}
+$source = [pscustomobject]@{
+    window_start='2024-01-01'; window_end='2024-01-02'
+}
+$evidence = [ordered]@{
+    overview=[pscustomobject]@{ RowCount=3; Sha256=('a' * 64) }
+    funnel=[pscustomobject]@{ RowCount=3; Sha256=('b' * 64) }
+    dimension=[pscustomobject]@{ RowCount=30; Sha256=('c' * 64) }
+    quality=[pscustomobject]@{ RowCount=1; Sha256=('d' * 64) }
+}
+$publication = [pscustomobject]@{
+    metric_run_id='behavior-v1-s9'; dataset_id='rees46-multicategory'
+    metric_version='behavior-v1'; data_scope='g2c-correctness-subset'
+    source_snapshot_id='9'; source_event_count='1002'; window_start='2024-01-01'
+    window_end='2024-01-02'; calculated_at='2026-09-18T00:00:00.000Z'
+    published_at='2026-09-18T00:00:01.000Z'; overview_row_count='3'
+    overview_sha256=('a' * 64); funnel_row_count='3'; funnel_sha256=('b' * 64)
+    dimension_row_count='30'; dimension_sha256=('c' * 64); quality_row_count='1'
+    quality_sha256=('d' * 64); status='PUBLISHED'
+}
+$wrongScope = ($publication | ConvertTo-Json | ConvertFrom-Json)
+$wrongScope.data_scope = 'stable-user-2pct-full'
+$wrongHash = ($publication | ConvertTo-Json | ConvertFrom-Json)
+$wrongHash.quality_sha256 = 'e' * 64
+$wrongStatus = ($publication | ConvertTo-Json | ConvertFrom-Json)
+$wrongStatus.status = 'PASS'
+$emptyDigest = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855'
+$zeroEvidence = [ordered]@{}
+foreach ($entry in $evidence.GetEnumerator()) { $zeroEvidence[$entry.Key] = $entry.Value }
+$zeroEvidence.quality = [pscustomobject]@{ RowCount=0; Sha256=$emptyDigest }
+$zeroPublication = ($publication | ConvertTo-Json | ConvertFrom-Json)
+$zeroPublication.quality_row_count = '0'; $zeroPublication.quality_sha256 = $emptyDigest
+$storedIdentity = [pscustomobject]@{
+    metric_run_id='behavior-v1-s9'; dataset_id='rees46-multicategory'; metric_version='behavior-v1'
+}
+$wrongStoredIdentity = ($storedIdentity | ConvertTo-Json | ConvertFrom-Json)
+$wrongStoredIdentity.dataset_id = 'other-dataset'
+$exact = Assert-G2dExistingPublication -Identity $identity -SourceIdentity $source `
+    -Publication $publication -StoredEvidence $evidence
+$insertSql = New-G2dPublicationInsertSql -Publication $publication
+[ordered]@{
+    exact_status = $exact.status
+    fixed_insert_target = $insertSql.StartsWith(
+        'INSERT INTO analytics.behavior_metric_publications ('
+    )
+    exact_published_literal = $insertSql.Contains("'PUBLISHED'")
+    valid_stored_identity = -not (Test-Rejected {
+        Assert-G2dStoredIdentity -Identity $identity -Rows @($storedIdentity) -Name overview
+    })
+    mismatched_stored_identity = Test-Rejected {
+        Assert-G2dStoredIdentity -Identity $identity -Rows @($wrongStoredIdentity) -Name overview
+    }
+    empty_metric_table = Test-Rejected {
+        Assert-G2dExistingPublication -Identity $identity -SourceIdentity $source `
+            -Publication $zeroPublication -StoredEvidence $zeroEvidence
+    }
+    mismatched_identity = Test-Rejected {
+        Assert-G2dExistingPublication -Identity $identity -SourceIdentity $source `
+            -Publication $wrongScope -StoredEvidence $evidence
+    }
+    mismatched_digest = Test-Rejected {
+        Assert-G2dExistingPublication -Identity $identity -SourceIdentity $source `
+            -Publication $wrongHash -StoredEvidence $evidence
+    }
+    wrong_status = Test-Rejected {
+        Assert-G2dExistingPublication -Identity $identity -SourceIdentity $source `
+            -Publication $wrongStatus -StoredEvidence $evidence
+    }
+} | ConvertTo-Json -Compress
+'''
+        )
+        self.assertEqual("already_published", payload["exact_status"])
+        self.assertTrue(payload["fixed_insert_target"])
+        self.assertTrue(payload["exact_published_literal"])
+        self.assertTrue(payload["valid_stored_identity"])
+        self.assertTrue(payload["mismatched_stored_identity"])
+        self.assertTrue(payload["empty_metric_table"])
+        self.assertTrue(payload["mismatched_identity"])
+        self.assertTrue(payload["mismatched_digest"])
+        self.assertTrue(payload["wrong_status"])
+
+    def test_unpublished_partial_candidates_continue_with_fresh_attempt_identity(self):
+        payload = self._payload(
+            r'''
+$ErrorActionPreference = 'Stop'
+. (Resolve-Path './scripts/refresh_g2d_behavior_metrics.ps1') -FunctionsOnly
+$first = New-G2dAttemptId
+$second = New-G2dAttemptId
+$state = Get-G2dUnpublishedCandidateState -Counts ([ordered]@{
+    overview=3; funnel=0; dimension=12; quality=1
+}) -AttemptId $first
+[ordered]@{
+    first = $first
+    second = $second
+    distinct = $first -cne $second
+    continued = $state.status -ceq 'continue'
+    preserved_counts = $state.counts.overview -eq 3 -and $state.counts.dimension -eq 12
+} | ConvertTo-Json -Depth 5 -Compress
+'''
+        )
+        self.assertRegex(payload["first"], r"^[0-9a-f]{32}$")
+        self.assertRegex(payload["second"], r"^[0-9a-f]{32}$")
+        self.assertTrue(payload["distinct"])
+        self.assertTrue(payload["continued"])
+        self.assertTrue(payload["preserved_counts"])
+
+    def test_publication_action_is_not_called_until_all_four_checks_pass(self):
+        payload = self._payload(
+            r'''
+$ErrorActionPreference = 'Stop'
+. (Resolve-Path './scripts/refresh_g2d_behavior_metrics.ps1') -FunctionsOnly
+function Test-Rejected([scriptblock]$Action) {
+    try { & $Action | Out-Null; return $false } catch { return $true }
+}
+$script:checks = [Collections.Generic.List[string]]::new()
+$script:published = 0
+$failed = Test-Rejected {
+    Invoke-G2dPublicationSequence `
+        -VerifyAction {
+            param($Name)
+            $script:checks.Add($Name)
+            if ($Name -ceq 'quality') { throw 'quality mismatch' }
+            [pscustomobject]@{ RowCount=1; Sha256=('a' * 64) }
+        } `
+        -PublishAction { $script:published++; [pscustomobject]@{ status='PUBLISHED' } }
+}
+$beforeSuccess = @($script:checks)
+$script:checks.Clear()
+$succeeded = Invoke-G2dPublicationSequence `
+    -VerifyAction {
+        param($Name)
+        $script:checks.Add($Name)
+        [pscustomobject]@{ RowCount=1; Sha256=('a' * 64) }
+    } `
+    -PublishAction { $script:published++; [pscustomobject]@{ status='PUBLISHED' } }
+[ordered]@{
+    failed = $failed
+    failed_checks = $beforeSuccess
+    not_published_on_failure = $script:published -eq 1
+    success_checks = @($script:checks)
+    success_status = $succeeded.status
+} | ConvertTo-Json -Depth 5 -Compress
+'''
+        )
+        self.assertTrue(payload["failed"])
+        self.assertEqual(
+            ["overview", "funnel", "dimension", "quality"], payload["failed_checks"]
+        )
+        self.assertTrue(payload["not_published_on_failure"])
+        self.assertEqual(
+            ["overview", "funnel", "dimension", "quality"], payload["success_checks"]
+        )
+        self.assertEqual("PUBLISHED", payload["success_status"])
+
+
 if __name__ == "__main__":
     unittest.main()
