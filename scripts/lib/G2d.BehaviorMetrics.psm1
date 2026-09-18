@@ -411,6 +411,9 @@ function Assert-G2dMetricBundle {
     if ($Overview.Count -eq 0 -or $Funnel.Count -eq 0 -or $Dimension.Count -eq 0 -or $Quality.Count -eq 0) {
         throw 'Every G2-D metric family must contain rows.'
     }
+    if ($Quality.Count -ne 1 -or [string]$Quality[0].window_type -cne 'FULL') {
+        throw 'Quality must contain exactly one FULL row.'
+    }
 
     $identitySourceCount = ConvertTo-G2dInt64 $Identity.SourceEventCount 'Identity.SourceEventCount'
     $identitySnapshot = ConvertTo-G2dInt64 $Identity.SourceSnapshotId 'Identity.SourceSnapshotId' -Positive
@@ -441,8 +444,12 @@ function Assert-G2dMetricBundle {
         'session_count', 'product_count'
     )
     foreach ($row in $Overview) {
+        $counts = @{}
         foreach ($column in $overviewIntegerColumns) {
-            $null = ConvertTo-G2dInt64 (Get-G2dPropertyValue $row $column) "overview.$column"
+            $counts[$column] = ConvertTo-G2dInt64 (Get-G2dPropertyValue $row $column) "overview.$column"
+        }
+        if ($counts.view_count + $counts.cart_count + $counts.purchase_count -gt $counts.event_count) {
+            throw 'Event type totals exceed the row event total.'
         }
         Assert-G2dAmount (Get-G2dPropertyValue $row 'purchase_amount_proxy') 'overview.purchase_amount_proxy'
     }
@@ -600,8 +607,10 @@ function Get-G2dCanonicalDigest {
         })
     }
 
-    $orderedRows = @($canonicalRows | Sort-Object -Property @{ Expression = 'SortKey'; Ascending = $true })
-    $payload = (@($orderedRows | ForEach-Object { $_.Json }) -join "`n")
+    $sortKeys = [string[]]@($canonicalRows | ForEach-Object { $_.SortKey })
+    $jsonRows = [string[]]@($canonicalRows | ForEach-Object { $_.Json })
+    [Array]::Sort($sortKeys, $jsonRows, [StringComparer]::Ordinal)
+    $payload = ($jsonRows -join "`n")
     $bytes = [Text.UTF8Encoding]::new($false).GetBytes($payload)
     $sha = [Security.Cryptography.SHA256]::Create()
     try {
@@ -627,6 +636,78 @@ function ConvertTo-G2dCsvCell {
     return $text
 }
 
+function Resolve-G2dPhysicalExistingPath {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    $fullPath = [IO.Path]::GetFullPath($Path)
+    if (-not [IO.File]::Exists($fullPath) -and -not [IO.Directory]::Exists($fullPath)) {
+        throw 'G2-D physical path does not exist.'
+    }
+
+    $pathRoot = [IO.Path]::GetPathRoot($fullPath)
+    $current = $pathRoot
+    $relativePath = $fullPath.Substring($pathRoot.Length)
+    $separators = [char[]]@([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+    $segments = $relativePath.Split($separators, [StringSplitOptions]::RemoveEmptyEntries)
+    foreach ($segment in $segments) {
+        $candidate = Join-Path $current $segment
+        $item = Get-Item -LiteralPath $candidate -Force -ErrorAction Stop
+        $isReparsePoint = ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0
+        if (-not $isReparsePoint) {
+            $current = $candidate
+            continue
+        }
+
+        $targetItem = $null
+        if ($null -ne $item.PSObject.Methods['ResolveLinkTarget']) {
+            $targetItem = $item.ResolveLinkTarget($true)
+        }
+        if ($null -eq $targetItem) {
+            $targetProperty = $item.PSObject.Properties['Target']
+            $targets = if ($null -eq $targetProperty) { @() } else { @($targetProperty.Value) }
+            if ($targets.Count -ne 1 -or [string]::IsNullOrWhiteSpace([string]$targets[0])) {
+                throw 'G2-D cannot resolve an output path reparse point.'
+            }
+            $targetPath = [string]$targets[0]
+            if (-not [IO.Path]::IsPathRooted($targetPath)) {
+                $targetPath = Join-Path (Split-Path $candidate -Parent) $targetPath
+            }
+            $targetItem = Get-Item -LiteralPath ([IO.Path]::GetFullPath($targetPath)) -Force -ErrorAction Stop
+        }
+        $current = $targetItem.FullName
+    }
+    return [IO.Path]::GetFullPath($current)
+}
+
+function Test-G2dPhysicalPathContained {
+    param(
+        [Parameter(Mandatory = $true)][string]$OutputDirectory,
+        [Parameter(Mandatory = $true)][string]$OutputPath
+    )
+
+    $physicalRoot = Resolve-G2dPhysicalExistingPath $OutputDirectory
+    $fullOutputPath = [IO.Path]::GetFullPath($OutputPath)
+    if ([IO.File]::Exists($fullOutputPath) -or [IO.Directory]::Exists($fullOutputPath)) {
+        $physicalOutput = Resolve-G2dPhysicalExistingPath $fullOutputPath
+    } else {
+        $parent = [IO.Path]::GetDirectoryName($fullOutputPath)
+        if ([string]::IsNullOrEmpty($parent)) { return $false }
+        $physicalParent = Resolve-G2dPhysicalExistingPath $parent
+        $physicalOutput = Join-Path $physicalParent ([IO.Path]::GetFileName($fullOutputPath))
+    }
+
+    $comparison = if ([IO.Path]::DirectorySeparatorChar -eq '\') {
+        [StringComparison]::OrdinalIgnoreCase
+    } else {
+        [StringComparison]::Ordinal
+    }
+    $rootPrefix = $physicalRoot.TrimEnd(
+        [IO.Path]::DirectorySeparatorChar,
+        [IO.Path]::AltDirectorySeparatorChar
+    ) + [IO.Path]::DirectorySeparatorChar
+    return $physicalOutput.StartsWith($rootPrefix, $comparison)
+}
+
 function Export-G2dCandidateCsv {
     [CmdletBinding()]
     param(
@@ -643,12 +724,8 @@ function Export-G2dCandidateCsv {
     if ($Rows.Count -eq 0) { throw 'G2-D candidate export requires rows.' }
     if (-not [IO.Directory]::Exists($OutputDirectory)) { throw 'G2-D output directory does not exist.' }
 
-    $root = [IO.Path]::GetFullPath($OutputDirectory).TrimEnd(
-        [IO.Path]::DirectorySeparatorChar,
-        [IO.Path]::AltDirectorySeparatorChar
-    ) + [IO.Path]::DirectorySeparatorChar
     $path = [IO.Path]::GetFullPath($OutputPath)
-    if (-not $path.StartsWith($root, [StringComparison]::OrdinalIgnoreCase)) {
+    if (-not (Test-G2dPhysicalPathContained -OutputDirectory $OutputDirectory -OutputPath $path)) {
         throw 'G2-D candidate path must remain under the output directory.'
     }
 

@@ -321,32 +321,44 @@ $quality = @([pscustomobject]@{
 $validGap = $true
 try { Test-Bundle $overview $funnel $dimension $quality | Out-Null } catch { $validGap = $false }
 $above = Copy-Rows $overview; ($above | Where-Object window_type -ceq 'FULL').purchase_count = '103'
+$dayAbove = Copy-Rows $overview; $dayAbove[0].purchase_count = '51'
 $dayMismatch = Copy-Rows $overview; $dayMismatch[0].event_count = '499'
 $duplicateIds = Copy-Rows $quality; $duplicateIds[0].distinct_event_count = '1001'
 $duplicateCount = Copy-Rows $quality; $duplicateCount[0].duplicate_event_count = '1'
 $badFunnel = Copy-Rows $funnel; ($badFunnel | Where-Object window_type -ceq 'FULL').completed_sessions = '201'
+$badDayFunnel = Copy-Rows $funnel; $badDayFunnel[0].completed_sessions = '101'
 $badStatus = Copy-Rows $quality; $badStatus[0].reconciliation_status = 'RECONCILED'
 $invalidType = Copy-Rows $quality; $invalidType[0].invalid_event_type_count = '1'
+$extraDayQuality = @(Copy-Rows $quality)
+$dayQuality = Copy-Rows $quality
+$dayQuality[0].window_type = 'DAY'; $dayQuality[0].window_end = '2024-01-01'
+$extraDayQuality += @($dayQuality)
 [ordered]@{
     valid_removal_gap = $validGap
     sum_above_total = Test-Rejected { Test-Bundle $above $funnel $dimension $quality }
+    day_sum_above_total = Test-Rejected { Test-Bundle $dayAbove $funnel $dimension $quality }
     day_total_mismatch = Test-Rejected { Test-Bundle $dayMismatch $funnel $dimension $quality }
     duplicate_ids = Test-Rejected { Test-Bundle $overview $funnel $dimension $duplicateIds }
     duplicate_count = Test-Rejected { Test-Bundle $overview $funnel $dimension $duplicateCount }
     funnel_order = Test-Rejected { Test-Bundle $overview $badFunnel $dimension $quality }
+    day_funnel_order = Test-Rejected { Test-Bundle $overview $badDayFunnel $dimension $quality }
     status_not_pass = Test-Rejected { Test-Bundle $overview $funnel $dimension $badStatus }
     invalid_event_type = Test-Rejected { Test-Bundle $overview $funnel $dimension $invalidType }
+    extra_day_quality = Test-Rejected { Test-Bundle $overview $funnel $dimension $extraDayQuality }
 } | ConvertTo-Json -Compress
 '''
         )
         self.assertTrue(payload["valid_removal_gap"])
         self.assertTrue(payload["sum_above_total"])
+        self.assertTrue(payload["day_sum_above_total"])
         self.assertTrue(payload["day_total_mismatch"])
         self.assertTrue(payload["duplicate_ids"])
         self.assertTrue(payload["duplicate_count"])
         self.assertTrue(payload["funnel_order"])
+        self.assertTrue(payload["day_funnel_order"])
         self.assertTrue(payload["status_not_pass"])
         self.assertTrue(payload["invalid_event_type"])
+        self.assertTrue(payload["extra_day_quality"])
 
     def test_bundle_rejects_invalid_shapes_windows_values_and_keys(self):
         payload = self._payload(
@@ -404,10 +416,15 @@ $digest1 = Get-G2dCanonicalDigest -Rows @($b, $a) -Columns $columns -UniqueKeyCo
 $digest2 = Get-G2dCanonicalDigest -Rows @($a, $b) -Columns $columns -UniqueKeyColumns $keys
 $changed = [pscustomobject]@{ dimension_id='b'; window_start='2024-01-02'; is_unknown='1'; event_count=3; purchase_amount_proxy='3.50'; calculated_at='2024-01-02T00:00:00Z'; optional_value=$null }
 $digest3 = Get-G2dCanonicalDigest -Rows @($a, $changed) -Columns $columns -UniqueKeyColumns $keys
+$upper = [pscustomobject]@{ dimension_id='A'; window_start='2024-01-03'; is_unknown=$false; event_count='4'; purchase_amount_proxy='4.50'; calculated_at='2024-01-03T00:00:00Z'; optional_value=$null }
+$caseForward = Get-G2dCanonicalDigest -Rows @($a, $upper) -Columns $columns -UniqueKeyColumns $keys
+$caseReverse = Get-G2dCanonicalDigest -Rows @($upper, $a) -Columns $columns -UniqueKeyColumns $keys
 [ordered]@{
     first = $digest1
     reordered = $digest2
     changed = $digest3
+    case_forward = $caseForward
+    case_reverse = $caseReverse
     duplicate_key = Test-Rejected { Get-G2dCanonicalDigest -Rows @($a, $a) -Columns $columns -UniqueKeyColumns $keys }
 } | ConvertTo-Json -Compress
 '''
@@ -415,6 +432,7 @@ $digest3 = Get-G2dCanonicalDigest -Rows @($a, $changed) -Columns $columns -Uniqu
         self.assertRegex(payload["first"], r"^[0-9a-f]{64}$")
         self.assertEqual(payload["first"], payload["reordered"])
         self.assertNotEqual(payload["first"], payload["changed"])
+        self.assertEqual(payload["case_forward"], payload["case_reverse"])
         self.assertTrue(payload["duplicate_key"])
 
     def test_candidate_export_uses_fixed_columns_utf8_no_bom_and_safe_paths(self):
@@ -458,6 +476,57 @@ try {
         self.assertFalse(payload["has_bom"])
         self.assertTrue(payload["outside_rejected"])
         self.assertTrue(payload["publication_rejected"])
+
+    def test_candidate_export_rejects_physical_link_escape_when_supported(self):
+        payload = self._payload(
+            r'''
+$ErrorActionPreference = 'Stop'
+Import-Module ./scripts/lib/G2d.BehaviorMetrics.psm1 -Force
+function Test-Rejected([scriptblock]$Action) {
+    try { & $Action | Out-Null; return $false } catch { return $true }
+}
+$identity = Get-G2dMetricIdentity -SnapshotId 9 -DataScope g2c-correctness-subset -SourceEventCount 1002
+$base = Join-Path ([IO.Path]::GetTempPath()) ('g2d-link-' + [guid]::NewGuid().ToString('N'))
+$root = Join-Path $base 'root'
+$outside = Join-Path $base 'outside'
+$link = Join-Path $root 'linked'
+$null = New-Item -ItemType Directory -Path $root
+$null = New-Item -ItemType Directory -Path $outside
+$marker = Join-Path $outside 'marker.txt'
+[IO.File]::WriteAllText($marker, 'safe', [Text.UTF8Encoding]::new($false))
+$linkCreated = $false
+try {
+    try {
+        $linkType = if ([IO.Path]::DirectorySeparatorChar -eq '\') { 'Junction' } else { 'SymbolicLink' }
+        $null = New-Item -ItemType $linkType -Path $link -Target $outside -ErrorAction Stop
+        $linkCreated = $true
+    } catch {
+        $linkCreated = $false
+    }
+    $row = [pscustomobject]@{ window_type='FULL'; window_start='2024-01-01'; window_end='2024-01-01'; dimension_type='product'; dimension_id='p1'; dimension_name='p1'; is_unknown=$false; view_count='1'; cart_count='0'; purchase_count='0'; unique_user_count='1'; purchase_amount_proxy='0.00' }
+    $lexicalOutside = Join-Path $outside 'lexical.csv'
+    $lexicalRejected = Test-Rejected { Export-G2dCandidateCsv -Target dimension -Rows @($row) -Identity $identity -OutputDirectory $root -OutputPath $lexicalOutside }
+    $linkResult = 'unsupported'
+    if ($linkCreated) {
+        $linkedOutput = Join-Path $link 'escaped.csv'
+        $linkResult = if (Test-Rejected { Export-G2dCandidateCsv -Target dimension -Rows @($row) -Identity $identity -OutputDirectory $root -OutputPath $linkedOutput }) { 'rejected' } else { 'accepted' }
+    }
+    [ordered]@{
+        lexical_rejected = $lexicalRejected
+        link_result = $linkResult
+        marker_unchanged = (Test-Path -LiteralPath $marker) -and ([IO.File]::ReadAllText($marker) -ceq 'safe')
+        escaped_absent = -not (Test-Path -LiteralPath (Join-Path $outside 'escaped.csv'))
+    } | ConvertTo-Json -Compress
+} finally {
+    if ($linkCreated -and (Test-Path -LiteralPath $link)) { Remove-Item -LiteralPath $link -Force }
+    if (Test-Path -LiteralPath $base) { Remove-Item -LiteralPath $base -Recurse -Force }
+}
+'''
+        )
+        self.assertTrue(payload["lexical_rejected"])
+        self.assertIn(payload["link_result"], {"rejected", "unsupported"})
+        self.assertTrue(payload["marker_unchanged"])
+        self.assertTrue(payload["escaped_absent"])
 
 
 if __name__ == "__main__":
