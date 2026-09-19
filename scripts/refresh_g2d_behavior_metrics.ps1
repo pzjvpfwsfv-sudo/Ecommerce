@@ -901,6 +901,24 @@ function Publish-G2dMetadata {
     return Assert-G2dPublicationReadback -Expected $Publication -Actual $after[0]
 }
 
+function Assert-G2dReportFilePath {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$RunDirectory,
+        [Parameter(Mandatory = $true)][string]$ReportPath
+    )
+
+    $runPath = [IO.Path]::GetFullPath($RunDirectory)
+    $reportFile = [IO.Path]::GetFullPath($ReportPath)
+    $expectedFile = [IO.Path]::GetFullPath((Join-Path $runPath 'refresh-report.json'))
+    $comparison = Get-G2dPathComparison
+    if (-not $reportFile.Equals($expectedFile, $comparison)) {
+        throw 'G2-D report path is not the fixed refresh-report.json path.'
+    }
+    return Assert-G2dPhysicalContainment -RootPath $runPath -CandidatePath $reportFile `
+        -Description 'report file'
+}
+
 function Write-G2dRefreshReport {
     param(
         [Parameter(Mandatory = $true)][string]$OutputDirectory,
@@ -908,13 +926,14 @@ function Write-G2dRefreshReport {
     )
 
     $metricRunId = [string]$Report.metric_run_id
+    $json = $Report | ConvertTo-Json -Depth 12
     $paths = Assert-G2dFixedOutputPath -MetricRunId $metricRunId -RequireRunDirectory
     $comparison = Get-G2dPathComparison
     if (-not [IO.Path]::GetFullPath($OutputDirectory).Equals($paths.RunDirectory, $comparison)) {
         throw 'G2-D report output directory is not the fixed run directory.'
     }
     $path = Join-Path $paths.RunDirectory 'refresh-report.json'
-    $json = $Report | ConvertTo-Json -Depth 12
+    $null = Assert-G2dReportFilePath -RunDirectory $paths.RunDirectory -ReportPath $path
     [IO.File]::WriteAllText($path, ($json + "`n"), [Text.UTF8Encoding]::new($false))
     return $path
 }

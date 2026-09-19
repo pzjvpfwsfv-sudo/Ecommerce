@@ -812,6 +812,70 @@ try {
         self.assertTrue(payload["marker_unchanged"])
         self.assertTrue(payload["escaped_report_absent"])
 
+    def test_report_write_rejects_final_file_link_without_touching_outside(self):
+        payload = self._payload(
+            r'''
+$ErrorActionPreference = 'Stop'
+. (Resolve-Path './scripts/refresh_g2d_behavior_metrics.ps1') -FunctionsOnly
+function Test-Rejected([scriptblock]$Action) {
+    try { & $Action | Out-Null; return $false } catch { return $true }
+}
+$base = Join-Path ([IO.Path]::GetTempPath()) ('g2d-report-link-' + [guid]::NewGuid().ToString('N'))
+$project = Join-Path $base 'project'
+$outputRoot = Join-Path $project 'tmp/graduation/g2d'
+$run = Join-Path $outputRoot 'behavior-v1-s9'
+$outside = Join-Path $base 'outside'
+$marker = Join-Path $outside 'marker.txt'
+$reportLink = Join-Path $run 'refresh-report.json'
+$null = New-Item -ItemType Directory -Path $run
+$null = New-Item -ItemType Directory -Path $outside
+[IO.File]::WriteAllText($marker, 'safe', [Text.UTF8Encoding]::new($false))
+$script:G2dProjectRoot = $project
+$script:G2dOutputRoot = $outputRoot
+$deterministicSafe = -not (Test-Rejected {
+    Assert-G2dReportFilePath -RunDirectory $run `
+        -ReportPath (Join-Path $run 'refresh-report.json')
+})
+$deterministicEscape = Test-Rejected {
+    Assert-G2dReportFilePath -RunDirectory $run -ReportPath $marker
+}
+$linkCreated = $false
+try {
+    try {
+        $null = New-Item -ItemType SymbolicLink -Path $reportLink -Target $marker -ErrorAction Stop
+        $linkCreated = $true
+    } catch {
+        $linkCreated = $false
+    }
+    $linkResult = 'unsupported'
+    if ($linkCreated) {
+        $linkResult = if (Test-Rejected {
+            Write-G2dRefreshReport -OutputDirectory $run `
+                -Report ([ordered]@{ metric_run_id='behavior-v1-s9'; status='FAILED' })
+        }) { 'rejected' } else { 'accepted' }
+    }
+    [ordered]@{
+        deterministic_safe = $deterministicSafe
+        deterministic_escape = $deterministicEscape
+        link_result = $linkResult
+        link_preserved = -not $linkCreated -or (Test-Path -LiteralPath $reportLink)
+        marker_unchanged = (Test-Path -LiteralPath $marker) -and
+            ([IO.File]::ReadAllText($marker) -ceq 'safe')
+    } | ConvertTo-Json -Compress
+} finally {
+    if ($linkCreated -and (Test-Path -LiteralPath $reportLink)) {
+        Remove-Item -LiteralPath $reportLink -Force
+    }
+    if (Test-Path -LiteralPath $base) { Remove-Item -LiteralPath $base -Recurse -Force }
+}
+'''
+        )
+        self.assertTrue(payload["deterministic_safe"])
+        self.assertTrue(payload["deterministic_escape"])
+        self.assertIn(payload["link_result"], {"rejected", "unsupported"})
+        self.assertTrue(payload["link_preserved"])
+        self.assertTrue(payload["marker_unchanged"])
+
     def test_existing_publication_requires_exact_identity_counts_hashes_and_status(self):
         payload = self._payload(
             r'''
