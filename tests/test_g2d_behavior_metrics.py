@@ -96,6 +96,23 @@ class G2dArtifactContractTests(unittest.TestCase):
         )
         self.assertIn("purchase_amount_proxy DECIMAL(38,2)", sql)
 
+    def test_doris_unique_keys_are_ordered_schema_prefixes(self):
+        """Protect schema initialization from Doris UNIQUE KEY prefix rejection."""
+        sql = DORIS_SCHEMA.read_text(encoding="utf-8")
+        tables = re.findall(
+            r"CREATE TABLE IF NOT EXISTS ([a-z_]+) \((.*?)\)\s*"
+            r"UNIQUE KEY\((.*?)\)",
+            sql,
+            flags=re.DOTALL,
+        )
+
+        self.assertEqual(5, len(tables))
+        for table_name, body, key_text in tables:
+            with self.subTest(table=table_name):
+                columns = re.findall(r"(?m)^    ([a-z_]+)\s+", body)
+                key_columns = [column.strip() for column in key_text.split(",")]
+                self.assertEqual(key_columns, columns[: len(key_columns)])
+
     def test_trino_template_has_five_fixed_results_and_no_dynamic_source(self):
         """Protect every result family from current-table reads or caller-controlled SQL."""
         sql = TRINO_TEMPLATE.read_text(encoding="utf-8")
@@ -271,6 +288,20 @@ $rows = @(ConvertFrom-G2dCsv -CsvText "id,name`n1,`"alpha,beta`"")
         self.assertTrue(payload["header_only"])
         self.assertTrue(payload["malformed_quote"])
         self.assertTrue(payload["inconsistent_columns"])
+
+    def test_timestamp_normalizer_accepts_trino_utc_csv_rendering(self):
+        payload = self._payload(
+            r'''
+$ErrorActionPreference = 'Stop'
+Import-Module ./scripts/lib/G2d.BehaviorMetrics.psm1 -Force
+$module = Get-Module G2d.BehaviorMetrics
+$normalized = & $module {
+    ConvertTo-G2dTimestampText '2026-09-18 07:50:17.775 UTC' 'snapshot_committed_at'
+}
+[ordered]@{ normalized = $normalized } | ConvertTo-Json -Compress
+'''
+        )
+        self.assertEqual("2026-09-18T07:50:17.775Z", payload["normalized"])
 
     def test_bundle_accepts_removal_gap_and_rejects_core_reconciliation_failures(self):
         payload = self._payload(
@@ -591,6 +622,45 @@ $plan = Get-G2dRefreshPlan -MetricRunId 'behavior-v1-s3854376992136224865'
         self.assertTrue(payload["unsafe_run_id"])
         self.assertTrue(payload["zero_run_id"])
 
+    def test_trino_host_readiness_and_container_cli_use_their_actual_ports(self):
+        payload = self._payload(
+            r'''
+$ErrorActionPreference = 'Stop'
+. (Resolve-Path './scripts/refresh_g2d_behavior_metrics.ps1') -FunctionsOnly
+$endpoints = Get-G2dTrinoEndpoints
+[ordered]@{
+    host_health = $endpoints.HostHealthBaseUrl
+    container_cli = $endpoints.ContainerCliBaseUrl
+} | ConvertTo-Json -Compress
+'''
+        )
+        self.assertEqual("http://localhost:8088", payload["host_health"])
+        self.assertEqual("http://localhost:8080", payload["container_cli"])
+
+    def test_trino_cli_uses_dumb_terminal_without_weakening_csv_validation(self):
+        payload = self._payload(
+            r'''
+$ErrorActionPreference = 'Stop'
+. (Resolve-Path './scripts/refresh_g2d_behavior_metrics.ps1') -FunctionsOnly
+function global:docker {
+    $script:dockerArgs = @($args)
+    $global:LASTEXITCODE = 0
+    @('ready', '1')
+}
+$rows = @(Invoke-G2dTrinoStatement -Name preflight_table -Sql 'SELECT 1 AS ready;')
+$environmentIndex = [Array]::IndexOf($script:dockerArgs, '-e')
+[ordered]@{
+    row_count = $rows.Count
+    ready = $rows[0].ready
+    dumb_terminal = $environmentIndex -ge 0 -and
+        $script:dockerArgs[$environmentIndex + 1] -ceq 'TERM=dumb'
+} | ConvertTo-Json -Compress
+'''
+        )
+        self.assertEqual(1, payload["row_count"])
+        self.assertEqual("1", payload["ready"])
+        self.assertTrue(payload["dumb_terminal"])
+
     def test_trino_result_set_requires_exactly_five_fixed_names(self):
         payload = self._payload(
             r'''
@@ -667,6 +737,47 @@ $success = [pscustomobject]@{
 '''
         )
         self.assertTrue(all(payload.values()), payload)
+
+    def test_stream_load_sends_the_required_100_continue_header(self):
+        payload = self._payload(
+            r'''
+$ErrorActionPreference = 'Stop'
+. (Resolve-Path './scripts/refresh_g2d_behavior_metrics.ps1') -FunctionsOnly
+$base = Join-Path ([IO.Path]::GetTempPath()) ('g2d-stream-load-' + [guid]::NewGuid().ToString('N'))
+$project = Join-Path $base 'project'
+$outputRoot = Join-Path $project 'tmp/graduation/g2d'
+$runId = 'behavior-v1-s9'
+$runDirectory = Join-Path $outputRoot $runId
+$candidate = Join-Path $runDirectory 'overview.csv'
+$null = New-Item -ItemType Directory -Path $runDirectory
+[IO.File]::WriteAllText($candidate, "metric_run_id`n$runId`n", [Text.UTF8Encoding]::new($false))
+$script:G2dProjectRoot = $project
+$script:G2dOutputRoot = $outputRoot
+function global:curl.exe {
+    $script:curlArgs = @($args)
+    $global:LASTEXITCODE = 0
+    '{"Status":"Success","NumberLoadedRows":1,"NumberFilteredRows":0}'
+}
+try {
+    $response = Invoke-G2dStreamLoad -Name overview -MetricRunId $runId `
+        -AttemptId ('a' * 32) -CandidatePath $candidate
+    $expectHeader = @($script:curlArgs | Where-Object { $_ -ceq 'Expect:100-continue' })
+    [ordered]@{
+        status = $response.Status
+        expect_header_count = $expectHeader.Count
+        target_url = $script:curlArgs[-1]
+    } | ConvertTo-Json -Compress
+} finally {
+    if (Test-Path -LiteralPath $base) { Remove-Item -LiteralPath $base -Recurse -Force }
+}
+'''
+        )
+        self.assertEqual("Success", payload["status"])
+        self.assertEqual(1, payload["expect_header_count"])
+        self.assertEqual(
+            "http://localhost:8040/api/analytics/behavior_overview_metrics/_stream_load",
+            payload["target_url"],
+        )
 
     def test_candidate_verification_rejects_missing_changed_or_stale_rows(self):
         payload = self._payload(
@@ -1041,6 +1152,98 @@ $succeeded = Invoke-G2dPublicationSequence `
             ["overview", "funnel", "dimension", "quality"], payload["success_checks"]
         )
         self.assertEqual("PUBLISHED", payload["success_status"])
+
+
+class G2dVerifierTests(unittest.TestCase):
+    def _run_powershell(self, command):
+        executable = shutil.which("pwsh") or shutil.which("powershell")
+        if executable is None:
+            self.skipTest("PowerShell is required for G2-D verifier coverage")
+        return subprocess.run(
+            [executable, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=20,
+            check=False,
+        )
+
+    def _payload(self, command):
+        result = self._run_powershell(command)
+        self.assertEqual(0, result.returncode, result.stderr or result.stdout)
+        return json.loads(result.stdout.strip().splitlines()[-1])
+
+    def test_verification_evidence_accepts_the_reviewed_1002_row_contract(self):
+        payload = self._payload(
+            r'''
+$ErrorActionPreference = 'Stop'
+. (Resolve-Path './scripts/verify_g2d_behavior_metrics.ps1') -FunctionsOnly
+$evidence = Assert-G2dVerificationEvidence `
+    -ExpectedRunId 'behavior-v1-s3854376992136224865' `
+    -ExpectedSnapshotId 3854376992136224865 `
+    -SourceTotal 1002 -DayTotal 1002 -FullTotal 1002 `
+    -CleanCount 1001 -LateCount 1 -DistinctEventCount 1002 `
+    -ApiRunId 'behavior-v1-s3854376992136224865' `
+    -ApiSourceTotal 1002
+[ordered]@{
+    status = $evidence.Status
+    run_id = $evidence.metric_run_id
+    source_total = $evidence.source_event_count
+} | ConvertTo-Json -Compress
+'''
+        )
+        self.assertEqual("PASS", payload["status"])
+        self.assertEqual(
+            "behavior-v1-s3854376992136224865", payload["run_id"]
+        )
+        self.assertEqual(1002, payload["source_total"])
+
+    def test_verification_evidence_rejects_every_required_identity_and_safety_gap(self):
+        payload = self._payload(
+            r'''
+$ErrorActionPreference = 'Stop'
+. (Resolve-Path './scripts/verify_g2d_behavior_metrics.ps1') -FunctionsOnly
+function Test-Rejected([hashtable]$Overrides) {
+    $arguments = @{
+        ExpectedRunId = 'behavior-v1-s3854376992136224865'
+        ExpectedSnapshotId = 3854376992136224865
+        SourceTotal = 1002
+        DayTotal = 1002
+        FullTotal = 1002
+        CleanCount = 1001
+        LateCount = 1
+        DistinctEventCount = 1002
+        ApiRunId = 'behavior-v1-s3854376992136224865'
+        ApiSourceTotal = 1002
+    }
+    foreach ($entry in $Overrides.GetEnumerator()) { $arguments[$entry.Key] = $entry.Value }
+    try { Assert-G2dVerificationEvidence @arguments | Out-Null; return $false } catch { return $true }
+}
+$tables = @('overview', 'funnel', 'dimension', 'quality')
+$missingTablesRejected = $true
+foreach ($missing in $tables) {
+    $validated = @($tables | Where-Object { $_ -cne $missing })
+    if (-not (Test-Rejected @{ ValidatedMetricTables = $validated })) {
+        $missingTablesRejected = $false
+    }
+}
+[ordered]@{
+    wrong_run = Test-Rejected @{ ExpectedRunId = 'behavior-v1-s9' }
+    wrong_snapshot = Test-Rejected @{ ExpectedSnapshotId = 9 }
+    day_full_mismatch = Test-Rejected @{ DayTotal = 1001 }
+    clean_late_mismatch = Test-Rejected @{ LateCount = 2 }
+    duplicate_ids = Test-Rejected @{ DistinctEventCount = 1001 }
+    api_doris_identity = Test-Rejected @{ ApiRunId = 'behavior-v1-s9' }
+    missing_subset_warning = Test-Rejected @{ ApiWarnings = @() }
+    missing_proxy_limitation = Test-Rejected @{ ProxyLimitations = @() }
+    definitions_permit_gmv = Test-Rejected @{ ProxyForbiddenClaims = @('销售额', '收入') }
+    every_metric_table_required = $missingTablesRejected
+} | ConvertTo-Json -Compress
+'''
+        )
+        self.assertTrue(all(payload.values()), payload)
 
 
 if __name__ == "__main__":

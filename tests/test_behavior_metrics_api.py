@@ -410,6 +410,21 @@ class BehaviorModelsAndCatalogTests(unittest.TestCase):
         self.assertTrue(settings.behavior_metric_definitions_path.is_absolute())
         self.assertEqual(expected, settings.behavior_metric_definitions_path)
 
+    def test_config_import_supports_the_shallow_container_mount_layout(self):
+        source = ROOT / "services" / "api" / "app" / "config.py"
+        shallow_path = Path("D:/app/app/config.py")
+        namespace = {"__file__": str(shallow_path), "__name__": __name__}
+
+        exec(
+            compile(source.read_text(encoding="utf-8-sig"), str(shallow_path), "exec"),
+            namespace,
+        )
+
+        self.assertEqual(
+            Path("D:/app/configs/metrics/behavior-v1.json"),
+            namespace["_DEFAULT_BEHAVIOR_METRIC_DEFINITIONS_PATH"],
+        )
+
     def test_settings_accept_environment_catalog_path_and_reject_empty_path(self):
         configured = load_settings(
             {"BEHAVIOR_METRIC_DEFINITIONS_PATH": "/app/configs/metrics/behavior-v1.json"}

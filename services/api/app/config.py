@@ -6,9 +6,15 @@ from os import environ as os_environ
 from pathlib import Path
 
 
+_CONFIG_PATH = Path(__file__).resolve()
 _DEFAULT_BEHAVIOR_METRIC_DEFINITIONS_PATH = (
-    Path(__file__).resolve().parents[3] / "configs" / "metrics" / "behavior-v1.json"
+    _CONFIG_PATH.parent.parent / "configs" / "metrics" / "behavior-v1.json"
 )
+for _parent in _CONFIG_PATH.parents:
+    _candidate = _parent / "configs" / "metrics" / "behavior-v1.json"
+    if _candidate.is_file():
+        _DEFAULT_BEHAVIOR_METRIC_DEFINITIONS_PATH = _candidate
+        break
 
 
 @dataclass(frozen=True)

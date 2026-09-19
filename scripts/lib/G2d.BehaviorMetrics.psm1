@@ -90,11 +90,22 @@ function ConvertTo-G2dTimestampText {
 
     $text = [Convert]::ToString($Value, [Globalization.CultureInfo]::InvariantCulture)
     $parsed = [datetimeoffset]::MinValue
-    if (-not [datetimeoffset]::TryParse(
+    $parsedOk = [datetimeoffset]::TryParseExact(
+        $text,
+        "yyyy-MM-dd HH:mm:ss.fff 'UTC'",
+        [Globalization.CultureInfo]::InvariantCulture,
+        [Globalization.DateTimeStyles]::AssumeUniversal,
+        [ref]$parsed
+    )
+    if (-not $parsedOk) {
+        $parsedOk = [datetimeoffset]::TryParse(
             $text,
             [Globalization.CultureInfo]::InvariantCulture,
             [Globalization.DateTimeStyles]::AssumeUniversal,
-            [ref]$parsed)) {
+            [ref]$parsed
+        )
+    }
+    if (-not $parsedOk) {
         throw "$Name must be an ISO-8601 timestamp."
     }
     return $parsed.ToUniversalTime().ToString(

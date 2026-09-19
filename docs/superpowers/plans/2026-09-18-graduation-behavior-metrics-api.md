@@ -706,7 +706,7 @@ git commit -m "feat: serve published G2-D behavior metrics"
 - Consumes: the formal 1,002-row Iceberg table, a published Doris run, and running API.
 - Produces: ignored `verification.json`, exact Trino/Doris/API reconciliation, measured runbook evidence, and the next-stage marker G2-E.
 
-- [ ] **Step 1: Write failing verifier-function tests**
+- [x] **Step 1: Write failing verifier-function tests**
 
 Dot-source with `-FunctionsOnly` and test:
 
@@ -723,7 +723,7 @@ $evidence.Status
 
 Add negative cases for wrong run/Snapshot, DAY/FULL mismatch, clean+late mismatch, duplicate IDs, API/Doris identity mismatch, missing subset warning, missing proxy limitation, definitions that permit GMV wording, and any unvalidated metric table.
 
-- [ ] **Step 2: Run verifier tests and confirm RED**
+- [x] **Step 2: Run verifier tests and confirm RED**
 
 ```powershell
 python -m unittest tests.test_g2d_behavior_metrics.G2dVerifierTests -v
@@ -731,7 +731,7 @@ python -m unittest tests.test_g2d_behavior_metrics.G2dVerifierTests -v
 
 Expected: FAIL because the verifier does not exist.
 
-- [ ] **Step 3: Implement fail-closed three-layer verification**
+- [x] **Step 3: Implement fail-closed three-layer verification**
 
 The verifier must check dependency readiness without deleting or recreating services, then:
 
@@ -743,7 +743,7 @@ The verifier must check dependency readiness without deleting or recreating serv
 6. Require the definition endpoint to preserve proxy limitations and forbidden claims.
 7. Write a compact report only after every assertion passes.
 
-- [ ] **Step 4: Run verifier tests and confirm GREEN**
+- [x] **Step 4: Run verifier tests and confirm GREEN**
 
 ```powershell
 python -m unittest tests.test_g2d_behavior_metrics.G2dVerifierTests -v
@@ -752,7 +752,7 @@ python -m unittest tests.test_g2d_behavior_metrics tests.test_behavior_metrics_a
 
 Expected: all G2-D tests PASS offline.
 
-- [ ] **Step 5: Run the real refresh and dynamic verification**
+- [x] **Step 5: Run the real refresh and dynamic verification**
 
 Start only the already-defined lakehouse, Doris and API dependencies. First make the migrated Docker CLI visible to this PowerShell process and start services that do not have the persisted-schema resume issue:
 
@@ -779,7 +779,7 @@ Run:
 
 Expected final verifier JSON includes `"status":"PASS"`, the measured Snapshot/run identity, source/overview total 1,002, clean 1,001, late 1, and all six API contracts.
 
-- [ ] **Step 6: Run complete regressions**
+- [x] **Step 6: Run complete regressions**
 
 Ensure the migrated Docker CLI is visible only in this process, then run:
 
@@ -790,21 +790,29 @@ python -m unittest discover -s tests -q
 
 Expected: all tests PASS with an exact count recorded in the runbook. Run `git diff --check` and confirm `tmp/`, `data/`, Maven `target/`, secrets and verification output are not staged.
 
-- [ ] **Step 7: Document only measured results**
+- [x] **Step 7: Document only measured results**
 
 The runbook must record commands, source table, data scope, metric run, Snapshot, row counts per metric family, funnel counts, amount-proxy caveat, API responses, elapsed time, failures encountered, and the explicit 1,002-row capacity boundary. README and data-readiness move the next step to G2-E only after dynamic verification passes.
 
-- [ ] **Step 8: Commit, review, push, and verify backup**
+- [x] **Step 8: Commit locally and hand off independent review/push**
 
 ```powershell
-git add scripts/verify_g2d_behavior_metrics.ps1 tests/test_g2d_behavior_metrics.py docs/graduation/behavior-metrics-api-runbook.md README.md docs/graduation/data-readiness.md docs/superpowers/plans/2026-09-18-graduation-behavior-metrics-api.md
+git add scripts/verify_g2d_behavior_metrics.ps1 scripts/refresh_g2d_behavior_metrics.ps1 scripts/lib/G2d.BehaviorMetrics.psm1 infra/compose/doris/init/02_create_behavior_metrics.sql services/api/app/config.py tests/test_g2d_behavior_metrics.py tests/test_behavior_metrics_api.py docs/graduation/behavior-metrics-api-runbook.md README.md docs/graduation/data-readiness.md docs/superpowers/plans/2026-09-18-graduation-behavior-metrics-api.md
 git commit -m "docs: record G2-D behavior metrics acceptance"
-git push origin codex/chapter-10-controlled-tools
-git rev-parse HEAD
-git ls-remote origin refs/heads/codex/chapter-10-controlled-tools
 ```
 
-Request an independent code review before the final push. Local and remote hashes must match exactly; do not merge `main`.
+The Task 6 owner stops after the local commit. The controller owns the required broad independent whole-branch review, final verification, push, and local/remote hash comparison; do not merge `main`.
+
+## Task 6 Acceptance Record (2026-09-19)
+
+- Dynamic status: `PASS` for Snapshot `881836466779140976` and run `behavior-v1-s881836466779140976` at scope `g2c-correctness-subset`.
+- Reconciliation: source/DAY/FULL `1,002`; distinct events `1,002`; clean `1,001`; late `1`; ordered FULL funnel `275 -> 11 -> 5`.
+- Doris evidence: overview/funnel/dimension/quality rows `2/2/1,780/1`; all four recomputed SHA-256 values match the PUBLISHED row.
+- API evidence: all six contracts returned HTTP 200 with the published identity and required correctness-subset warning; the definition catalog retained the amount-proxy limitation and forbidden claims.
+- Timing: successful refresh `34,791 ms`; verifier `11,900 ms` internally and `12,557 ms` wall time.
+- Regression: the eight focused acceptance-fix tests passed in `5.368 s`; `python -m unittest discover -s tests -q` passed `552` tests in `302.152 s`.
+- Boundary: the 1,002-row subset is correctness-only, explicitly not capacity evidence or the full 2% user sample. G2-E is next.
+- Detailed commands, failures, recovery actions, values and digests are recorded in `docs/graduation/behavior-metrics-api-runbook.md`.
 
 ## Self-Review
 

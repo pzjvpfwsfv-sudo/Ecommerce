@@ -29,10 +29,10 @@ PROPERTIES ("replication_allocation" = "tag.location.default: 1");
 
 CREATE TABLE IF NOT EXISTS behavior_overview_metrics (
     metric_run_id VARCHAR(96) NOT NULL,
-    dataset_id VARCHAR(64) NOT NULL,
-    metric_version VARCHAR(32) NOT NULL,
     window_type VARCHAR(8) NOT NULL,
     window_start DATE NOT NULL,
+    dataset_id VARCHAR(64) NOT NULL,
+    metric_version VARCHAR(32) NOT NULL,
     window_end DATE NOT NULL,
     event_count BIGINT NOT NULL,
     view_count BIGINT NOT NULL,
@@ -49,10 +49,10 @@ PROPERTIES ("replication_allocation" = "tag.location.default: 1");
 
 CREATE TABLE IF NOT EXISTS behavior_funnel_metrics (
     metric_run_id VARCHAR(96) NOT NULL,
-    dataset_id VARCHAR(64) NOT NULL,
-    metric_version VARCHAR(32) NOT NULL,
     window_type VARCHAR(8) NOT NULL,
     window_start DATE NOT NULL,
+    dataset_id VARCHAR(64) NOT NULL,
+    metric_version VARCHAR(32) NOT NULL,
     window_end DATE NOT NULL,
     missing_session_event_count BIGINT NOT NULL,
     view_sessions BIGINT NOT NULL,
@@ -65,13 +65,13 @@ PROPERTIES ("replication_allocation" = "tag.location.default: 1");
 
 CREATE TABLE IF NOT EXISTS behavior_dimension_metrics (
     metric_run_id VARCHAR(96) NOT NULL,
-    dataset_id VARCHAR(64) NOT NULL,
-    metric_version VARCHAR(32) NOT NULL,
     window_type VARCHAR(8) NOT NULL,
     window_start DATE NOT NULL,
-    window_end DATE NOT NULL,
     dimension_type VARCHAR(16) NOT NULL,
     dimension_id VARCHAR(256) NOT NULL,
+    dataset_id VARCHAR(64) NOT NULL,
+    metric_version VARCHAR(32) NOT NULL,
+    window_end DATE NOT NULL,
     dimension_name VARCHAR(512) NULL,
     is_unknown BOOLEAN NOT NULL,
     view_count BIGINT NOT NULL,
@@ -86,10 +86,10 @@ PROPERTIES ("replication_allocation" = "tag.location.default: 1");
 
 CREATE TABLE IF NOT EXISTS behavior_quality_metrics (
     metric_run_id VARCHAR(96) NOT NULL,
-    dataset_id VARCHAR(64) NOT NULL,
-    metric_version VARCHAR(32) NOT NULL,
     window_type VARCHAR(8) NOT NULL,
     window_start DATE NOT NULL,
+    dataset_id VARCHAR(64) NOT NULL,
+    metric_version VARCHAR(32) NOT NULL,
     window_end DATE NOT NULL,
     source_event_count BIGINT NOT NULL,
     clean_event_count BIGINT NOT NULL,

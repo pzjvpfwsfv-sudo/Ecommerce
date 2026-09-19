@@ -15,8 +15,7 @@ $script:G2dDdlPath = Join-Path $script:G2dProjectRoot 'infra/compose/doris/init/
 $script:G2dOutputRoot = Join-Path $script:G2dProjectRoot 'tmp/graduation/g2d'
 $script:G2dTrinoContainer = 'ecom-trino'
 $script:G2dDorisContainer = 'ecom-doris-fe'
-$script:G2dTrinoBaseUrl = 'http://localhost:8080'
-$script:G2dDorisHttpUrl = 'http://localhost:8030'
+$script:G2dDorisStreamLoadUrl = 'http://localhost:8040'
 $script:G2dSetupHelp = 'Start the existing services with .\scripts\bootstrap_chapter_10_5.ps1 and see docs\chapter-10-5-engineering-hardening-runbook.md.'
 
 Import-Module (Join-Path $PSScriptRoot 'lib/G2d.BehaviorMetrics.psm1') -Force
@@ -321,6 +320,16 @@ function Enable-G2dDockerCli {
     return $command.Source
 }
 
+function Get-G2dTrinoEndpoints {
+    [CmdletBinding()]
+    param()
+
+    return [pscustomobject][ordered]@{
+        HostHealthBaseUrl = 'http://localhost:8088'
+        ContainerCliBaseUrl = 'http://localhost:8080'
+    }
+}
+
 function Invoke-G2dDorisSql {
     [CmdletBinding()]
     param(
@@ -405,8 +414,9 @@ function Invoke-G2dTrinoStatement {
     if (@('preflight_table', 'latest_snapshot', 'source_identity', 'overview', 'funnel', 'dimension', 'quality') -cnotcontains $Name) {
         throw 'G2-D Trino statement name is unknown.'
     }
-    $output = @(& docker exec $script:G2dTrinoContainer trino `
-        --server $script:G2dTrinoBaseUrl --catalog lakehouse --schema analytics `
+    $trinoEndpoints = Get-G2dTrinoEndpoints
+    $output = @(& docker exec -e TERM=dumb $script:G2dTrinoContainer trino `
+        --server $trinoEndpoints.ContainerCliBaseUrl --catalog lakehouse --schema analytics `
         --output-format CSV_HEADER_UNQUOTED --execute $Sql 2>&1)
     if ($LASTEXITCODE -ne 0) {
         throw "Trino statement '$Name' failed. $script:G2dSetupHelp Output: $($output -join ' ')"
@@ -424,7 +434,9 @@ function Assert-G2dDependencies {
         throw "Docker Engine is unavailable. $script:G2dSetupHelp"
     }
     try {
-        $null = Invoke-RestMethod -Method Get -Uri "$script:G2dTrinoBaseUrl/v1/info" -TimeoutSec 10
+        $trinoEndpoints = Get-G2dTrinoEndpoints
+        $null = Invoke-RestMethod -Method Get `
+            -Uri "$($trinoEndpoints.HostHealthBaseUrl)/v1/info" -TimeoutSec 10
     } catch {
         throw "Trino /v1/info is unavailable. $script:G2dSetupHelp"
     }
@@ -768,10 +780,11 @@ function Invoke-G2dStreamLoad {
     if ($label -notmatch '^[a-z0-9_-]+$') { throw 'G2-D Stream Load label is unsafe.' }
     $arguments = @(
         '--silent', '--show-error', '--location-trusted', '--user', 'root:', '--request', 'PUT',
-        '--header', "label:$label", '--header', 'format:csv', '--header', 'column_separator:,',
+        '--header', 'Expect:100-continue', '--header', "label:$label", '--header', 'format:csv',
+        '--header', 'column_separator:,',
         '--header', 'skip_lines:1', '--header', 'strict_mode:true',
         '--header', ('columns:' + ($spec.Columns -join ',')), '--upload-file', $fullPath,
-        "$script:G2dDorisHttpUrl/api/analytics/$($spec.Table)/_stream_load"
+        "$script:G2dDorisStreamLoadUrl/api/analytics/$($spec.Table)/_stream_load"
     )
     $output = @(& curl.exe @arguments 2>&1)
     if ($LASTEXITCODE -ne 0) { throw "G2-D Stream Load request failed for $($spec.Table)." }
