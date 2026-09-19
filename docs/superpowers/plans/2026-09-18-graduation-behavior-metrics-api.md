@@ -808,8 +808,8 @@ The Task 6 owner stops after the local commit. The controller owns the required 
 - Dynamic status: `PASS` for Snapshot `881836466779140976` and run `behavior-v1-s881836466779140976` at scope `g2c-correctness-subset`.
 - Reconciliation: source/DAY/FULL `1,002`; distinct events `1,002`; clean `1,001`; late `1`; ordered FULL funnel `275 -> 11 -> 5`.
 - Doris evidence: overview/funnel/dimension/quality rows `2/2/1,780/1`; all four recomputed SHA-256 values match the PUBLISHED row.
-- API evidence: all six contracts returned HTTP 200 with the published identity and required correctness-subset warning; the definition catalog retained the amount-proxy limitation and forbidden claims.
-- Timing: successful refresh `34,791 ms`; verifier `11,900 ms` internally and `12,557 ms` wall time.
+- API evidence: all six contracts returned HTTP 200 with the published identity and required correctness-subset warning; definitions used `GET /api/v1/metrics/definitions?domain=behavior&version=behavior-v1`, and the catalog retained the amount-proxy limitation and forbidden claims.
+- Timing: successful refresh `34,791 ms`; Fix Round 1 verifier rerun `22,824 ms` internally and `23,401 ms` wall time.
 - Regression: the eight focused acceptance-fix tests passed in `5.368 s`; `python -m unittest discover -s tests -q` passed `552` tests in `302.152 s`.
 - Boundary: the 1,002-row subset is correctness-only, explicitly not capacity evidence or the full 2% user sample. G2-E is next.
 - Detailed commands, failures, recovery actions, values and digests are recorded in `docs/graduation/behavior-metrics-api-runbook.md`.

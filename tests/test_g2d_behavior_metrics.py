@@ -1186,7 +1186,16 @@ $evidence = Assert-G2dVerificationEvidence `
     -SourceTotal 1002 -DayTotal 1002 -FullTotal 1002 `
     -CleanCount 1001 -LateCount 1 -DistinctEventCount 1002 `
     -ApiRunId 'behavior-v1-s3854376992136224865' `
-    -ApiSourceTotal 1002
+    -ApiSourceTotal 1002 `
+    -ValidatedMetricTables @('overview', 'funnel', 'dimension', 'quality') `
+    -ApiContracts @(
+        'GET /api/v1/behavior/publication',
+        'GET /api/v1/behavior/overview?window=full',
+        'GET /api/v1/behavior/funnel?window=full',
+        'GET /api/v1/behavior/rankings?dimension=product&window=full&sort_by=purchases&limit=20',
+        'GET /api/v1/behavior/quality',
+        'GET /api/v1/metrics/definitions?domain=behavior&version=behavior-v1'
+    )
 [ordered]@{
     status = $evidence.Status
     run_id = $evidence.metric_run_id
@@ -1205,7 +1214,7 @@ $evidence = Assert-G2dVerificationEvidence `
             r'''
 $ErrorActionPreference = 'Stop'
 . (Resolve-Path './scripts/verify_g2d_behavior_metrics.ps1') -FunctionsOnly
-function Test-Rejected([hashtable]$Overrides) {
+function Test-Rejected([hashtable]$Overrides, [string[]]$Omitted = @()) {
     $arguments = @{
         ExpectedRunId = 'behavior-v1-s3854376992136224865'
         ExpectedSnapshotId = 3854376992136224865
@@ -1217,8 +1226,18 @@ function Test-Rejected([hashtable]$Overrides) {
         DistinctEventCount = 1002
         ApiRunId = 'behavior-v1-s3854376992136224865'
         ApiSourceTotal = 1002
+        ValidatedMetricTables = @('overview', 'funnel', 'dimension', 'quality')
+        ApiContracts = @(
+            'GET /api/v1/behavior/publication',
+            'GET /api/v1/behavior/overview?window=full',
+            'GET /api/v1/behavior/funnel?window=full',
+            'GET /api/v1/behavior/rankings?dimension=product&window=full&sort_by=purchases&limit=20',
+            'GET /api/v1/behavior/quality',
+            'GET /api/v1/metrics/definitions?domain=behavior&version=behavior-v1'
+        )
     }
     foreach ($entry in $Overrides.GetEnumerator()) { $arguments[$entry.Key] = $entry.Value }
+    foreach ($name in $Omitted) { $arguments.Remove($name) }
     try { Assert-G2dVerificationEvidence @arguments | Out-Null; return $false } catch { return $true }
 }
 $tables = @('overview', 'funnel', 'dimension', 'quality')
@@ -1227,6 +1246,21 @@ foreach ($missing in $tables) {
     $validated = @($tables | Where-Object { $_ -cne $missing })
     if (-not (Test-Rejected @{ ValidatedMetricTables = $validated })) {
         $missingTablesRejected = $false
+    }
+}
+$apiContracts = @(
+    'GET /api/v1/behavior/publication',
+    'GET /api/v1/behavior/overview?window=full',
+    'GET /api/v1/behavior/funnel?window=full',
+    'GET /api/v1/behavior/rankings?dimension=product&window=full&sort_by=purchases&limit=20',
+    'GET /api/v1/behavior/quality',
+    'GET /api/v1/metrics/definitions?domain=behavior&version=behavior-v1'
+)
+$missingApiContractsRejected = $true
+foreach ($missing in $apiContracts) {
+    $validated = @($apiContracts | Where-Object { $_ -cne $missing })
+    if (-not (Test-Rejected @{ ApiContracts = $validated })) {
+        $missingApiContractsRejected = $false
     }
 }
 [ordered]@{
@@ -1239,7 +1273,20 @@ foreach ($missing in $tables) {
     missing_subset_warning = Test-Rejected @{ ApiWarnings = @() }
     missing_proxy_limitation = Test-Rejected @{ ProxyLimitations = @() }
     definitions_permit_gmv = Test-Rejected @{ ProxyForbiddenClaims = @('销售额', '收入') }
+    metric_evidence_is_mandatory = Test-Rejected @{} @('ValidatedMetricTables')
+    api_evidence_is_mandatory = Test-Rejected @{} @('ApiContracts')
     every_metric_table_required = $missingTablesRejected
+    every_api_contract_required = $missingApiContractsRejected
+    old_definitions_path_rejected = Test-Rejected @{
+        ApiContracts = @(
+            'GET /api/v1/behavior/publication',
+            'GET /api/v1/behavior/overview?window=full',
+            'GET /api/v1/behavior/funnel?window=full',
+            'GET /api/v1/behavior/rankings?dimension=product&window=full&sort_by=purchases&limit=20',
+            'GET /api/v1/behavior/quality',
+            'GET /api/v1/behavior/definitions'
+        )
+    }
 } | ConvertTo-Json -Compress
 '''
         )

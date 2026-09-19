@@ -688,7 +688,7 @@ class BehaviorMetricsServiceTests(unittest.TestCase):
         with self.assertRaises(BehaviorMetricsUnavailableError):
             self.service.get_quality()
 
-    def test_definitions_use_validated_catalog_without_querying_doris(self):
+    def test_definitions_use_validated_behavior_version_catalog_without_querying_doris(self):
         response = self.service.get_definitions()
 
         self.assertEqual("behavior", response.domain)
@@ -740,7 +740,10 @@ class BehaviorMetricsRouteTests(unittest.TestCase):
                 },
             ),
             "quality": self.client.get("/api/v1/behavior/quality"),
-            "definitions": self.client.get("/api/v1/behavior/definitions"),
+            "definitions": self.client.get(
+                "/api/v1/metrics/definitions",
+                params={"domain": "behavior", "version": "behavior-v1"},
+            ),
         }
 
         self.assertTrue(all(response.status_code == 200 for response in responses.values()))
@@ -756,6 +759,37 @@ class BehaviorMetricsRouteTests(unittest.TestCase):
         self.service.get_rankings.assert_called_once_with("brand", "full", "purchases", 20)
         self.service.get_publication.assert_called_once_with()
         self.service.get_quality.assert_called_once_with()
+        self.service.get_definitions.assert_called_once_with()
+
+    def test_definitions_require_the_exact_public_route_and_query_contract(self):
+        response = self.client.get(
+            "/api/v1/metrics/definitions",
+            params={"domain": "behavior", "version": "behavior-v1"},
+        )
+
+        self.assertEqual(200, response.status_code)
+        self.assertEqual("behavior", response.json()["domain"])
+        self.assertEqual("behavior-v1", response.json()["metric_version"])
+        self.assertEqual(25, len(response.json()["definitions"]))
+
+        invalid_queries = (
+            {},
+            {"domain": "behavior"},
+            {"version": "behavior-v1"},
+            {"domain": "other", "version": "behavior-v1"},
+            {"domain": "behavior", "version": "behavior-v2"},
+        )
+        for params in invalid_queries:
+            with self.subTest(params=params):
+                invalid = self.client.get(
+                    "/api/v1/metrics/definitions", params=params
+                )
+                self.assertEqual(422, invalid.status_code)
+
+        self.assertEqual(
+            404,
+            self.client.get("/api/v1/behavior/definitions").status_code,
+        )
         self.service.get_definitions.assert_called_once_with()
 
     def test_empty_rankings_are_a_successful_empty_list(self):

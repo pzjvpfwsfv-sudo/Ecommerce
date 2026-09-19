@@ -124,9 +124,12 @@ def create_app(
     def get_behavior_quality() -> QualityResponse:
         return behavior_response("behavior_quality", behavior_service.get_quality)
 
-    @app.get("/api/v1/behavior/definitions", response_model=MetricDefinitionsResponse)
-    def get_behavior_definitions() -> MetricDefinitionsResponse:
-        return behavior_response("behavior_definitions", behavior_service.get_definitions)
+    @app.get("/api/v1/metrics/definitions", response_model=MetricDefinitionsResponse)
+    def get_metric_definitions(
+        domain: Literal["behavior"],
+        version: Literal["behavior-v1"],
+    ) -> MetricDefinitionsResponse:
+        return behavior_response("metric_definitions", behavior_service.get_definitions)
 
     @app.post("/analysis/realtime", response_model=AnalysisResponse)
     def analyze_realtime(request: AnalysisRequest) -> AnalysisResponse:

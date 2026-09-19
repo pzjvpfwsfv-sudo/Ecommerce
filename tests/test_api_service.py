@@ -56,9 +56,10 @@ class ApiServiceArtifactsTest(unittest.TestCase):
             "/api/v1/behavior/funnel",
             "/api/v1/behavior/rankings",
             "/api/v1/behavior/quality",
-            "/api/v1/behavior/definitions",
         ):
             self.assertIn(route, text)
+        self.assertIn("/api/v1/metrics/definitions", text)
+        self.assertNotIn("/api/v1/behavior/definitions", text)
         self.assertIn("build_analysis_service", text)
         self.assertIn("build_tool_analysis_service", text)
         self.assertIn("build_behavior_metrics_service", text)

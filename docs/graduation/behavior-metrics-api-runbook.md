@@ -76,12 +76,14 @@ Trino 源总数和不同 `event_id` 均为 1,002。Doris `DAY` 和 `FULL` 总数
 | `/api/v1/behavior/funnel?window=full` | 1 行；`275 -> 11 -> 5` |
 | `/api/v1/behavior/rankings?dimension=product&window=full&sort_by=purchases&limit=20` | 20 行；首条 `dimension_id=1004857`、`purchase_count=3` |
 | `/api/v1/behavior/quality` | `clean=1001`、`late=1`、`distinct=1002`、`PASS` |
-| `/api/v1/behavior/definitions` | 25 个唯一定义；唯一 `purchase_amount_proxy` 定义保留限制和禁止声明 |
+| `/api/v1/metrics/definitions?domain=behavior&version=behavior-v1` | 25 个唯一定义；唯一 `purchase_amount_proxy` 定义保留限制和禁止声明 |
+
+definitions 公共契约实测：精确 query 返回 HTTP 200；缺少 `domain`、缺少 `version`、两者均缺少、错误 `domain` 和错误 `version` 均由 FastAPI 返回 HTTP 422；误用的 `/api/v1/behavior/definitions` 路径已移除并返回 HTTP 404。
 
 ## 耗时与回归
 
 - 成功 refresh 外层实测耗时 `34,791 ms`。
-- verifier 报告内部耗时 `11,900 ms`，外层实测耗时 `12,557 ms`。
+- Fix Round 1 verifier 复验报告内部耗时 `22,824 ms`，外层实测耗时 `23,401 ms`。
 - verifier 输出位于被 Git 忽略的 `tmp/graduation/g2d/behavior-v1-s881836466779140976/verification.json`。
 - 验收故障对应的八项聚焦回归全部通过，耗时 `5.368 s`；G2-D/API 离线组合回归通过 `67` 项，耗时 `21.909 s`。
 - 最终完整回归 `python -m unittest discover -s tests -q` 通过 `552` 项，耗时 `302.152 s`。
@@ -96,6 +98,8 @@ Trino 源总数和不同 `event_id` 均为 1,002。Doris `DAY` 和 `FULL` 总数
 - Doris 首次 DDL 拒绝四张指标表的 `UNIQUE KEY` 非前缀列顺序；仅重排列声明，没有改变 key、显式 Stream Load 列或 API 投影。
 - Trino 实测 Snapshot 时间为 `2026-09-18 07:50:17.775 UTC`，共享模块新增该确定格式的标准化覆盖，输出 `2026-09-18T07:50:17.775Z`。
 - Doris Stream Load 先报 `There is no 100-continue header`，加入必需的 `Expect:100-continue`后，FE 又重定向到 Windows 主机无法访问的 `172.21.80.3:8040`。直连已发布的 `localhost:8040` BE 端点成功。诊断请求导入的 2 条 overview 行作为未发布候选保留；最终 refresh 检测到 `overview=2, funnel=0, dimension=0, quality=0`，以新 attempt ID 重载并通过四表摘要校验后才发布。
+
+Fix Round 1 只重启了挂载源码但未开启 reload 的 `ecom-api`，未重跑 refresh，未重启其他依赖，也未修改或删除卷、表、候选与发布数据。复验仍绑定 Snapshot `881836466779140976` 和 run `behavior-v1-s881836466779140976`，六个精确公共契约均为 HTTP 200。
 
 ## 重跑边界
 

@@ -17,7 +17,14 @@ $script:G2dApiBaseUrl = 'http://localhost:8000'
 $script:G2dSubsetWarning = 'correctness subset; not the full 2% user sample'
 $script:G2dProxyLimitation = 'No quantity, currency, discount, refund, cancellation, or payment state.'
 $script:G2dMetricTables = @('overview', 'funnel', 'dimension', 'quality')
-$script:G2dApiContracts = @('publication', 'overview', 'funnel', 'rankings', 'quality', 'definitions')
+$script:G2dApiContracts = @(
+    'GET /api/v1/behavior/publication',
+    'GET /api/v1/behavior/overview?window=full',
+    'GET /api/v1/behavior/funnel?window=full',
+    'GET /api/v1/behavior/rankings?dimension=product&window=full&sort_by=purchases&limit=20',
+    'GET /api/v1/behavior/quality',
+    'GET /api/v1/metrics/definitions?domain=behavior&version=behavior-v1'
+)
 
 function Assert-G2dVerificationEvidence {
     [CmdletBinding()]
@@ -42,12 +49,10 @@ function Assert-G2dVerificationEvidence {
             'No quantity, currency, discount, refund, cancellation, or payment state.'
         ),
         [AllowEmptyCollection()][string[]]$ProxyForbiddenClaims = @('GMV', '销售额', '收入'),
-        [AllowEmptyCollection()][string[]]$ValidatedMetricTables = @(
-            'overview', 'funnel', 'dimension', 'quality'
-        ),
-        [AllowEmptyCollection()][string[]]$ApiContracts = @(
-            'publication', 'overview', 'funnel', 'rankings', 'quality', 'definitions'
-        )
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()][string[]]$ValidatedMetricTables,
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()][string[]]$ApiContracts
     )
 
     $identity = Get-G2dMetricIdentity -SnapshotId $ExpectedSnapshotId `
@@ -266,18 +271,18 @@ LIMIT 1;
     }
 
     $apiSpecs = @(
-        [pscustomobject]@{ Name = 'publication'; Path = '/api/v1/behavior/publication' },
-        [pscustomobject]@{ Name = 'overview'; Path = '/api/v1/behavior/overview?window=full' },
-        [pscustomobject]@{ Name = 'funnel'; Path = '/api/v1/behavior/funnel?window=full' },
-        [pscustomobject]@{ Name = 'rankings'; Path = '/api/v1/behavior/rankings?dimension=product&window=full&sort_by=purchases&limit=20' },
-        [pscustomobject]@{ Name = 'quality'; Path = '/api/v1/behavior/quality' },
-        [pscustomobject]@{ Name = 'definitions'; Path = '/api/v1/behavior/definitions' }
+        [pscustomobject]@{ Name = 'publication'; Method = 'GET'; Path = '/api/v1/behavior/publication' },
+        [pscustomobject]@{ Name = 'overview'; Method = 'GET'; Path = '/api/v1/behavior/overview?window=full' },
+        [pscustomobject]@{ Name = 'funnel'; Method = 'GET'; Path = '/api/v1/behavior/funnel?window=full' },
+        [pscustomobject]@{ Name = 'rankings'; Method = 'GET'; Path = '/api/v1/behavior/rankings?dimension=product&window=full&sort_by=purchases&limit=20' },
+        [pscustomobject]@{ Name = 'quality'; Method = 'GET'; Path = '/api/v1/behavior/quality' },
+        [pscustomobject]@{ Name = 'definitions'; Method = 'GET'; Path = '/api/v1/metrics/definitions?domain=behavior&version=behavior-v1' }
     )
     $apiPayloads = [ordered]@{}
     $apiEvidence = [Collections.Generic.List[object]]::new()
     foreach ($spec in $apiSpecs) {
         try {
-            $response = Invoke-WebRequest -UseBasicParsing -Method Get `
+            $response = Invoke-WebRequest -UseBasicParsing -Method $spec.Method `
                 -Uri ($script:G2dApiBaseUrl + $spec.Path) -TimeoutSec 15
             $payload = $response.Content | ConvertFrom-Json
         } catch {
@@ -289,6 +294,7 @@ LIMIT 1;
         $apiPayloads[$spec.Name] = $payload
         $apiEvidence.Add([pscustomobject][ordered]@{
             name = $spec.Name
+            method = $spec.Method
             path = $spec.Path
             status_code = [int]$response.StatusCode
         })
@@ -410,7 +416,9 @@ LIMIT 1;
         -ProxyLimitations @($proxyDefinition.limitations) `
         -ProxyForbiddenClaims @($proxyDefinition.forbidden_claims) `
         -ValidatedMetricTables @($metricEvidence.Keys) `
-        -ApiContracts @($apiPayloads.Keys)
+        -ApiContracts @(
+            $apiEvidence | ForEach-Object { "$($_.method) $($_.path)" }
+        )
 
     $stopwatch.Stop()
     $report = [pscustomobject][ordered]@{
