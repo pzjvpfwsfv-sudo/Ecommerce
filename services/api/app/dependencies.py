@@ -2,8 +2,11 @@ from datetime import UTC, datetime
 
 from app.analysis_service import AnalysisService
 from app.analyzers import OpenAICompatibleAnalyzer, RuleBasedAnalyzer
+from app.behavior_repository import BehaviorMetricsRepository
+from app.behavior_service import BehaviorMetricsService
 from app.config import ApiSettings
 from app.flink_quality_repository import FlinkQualityRepository
+from app.metric_definitions import MetricDefinitionCatalog
 from app.readiness_service import ReadinessService
 from app.repository import RealtimeMetricsRepository
 from app.tool_analysis_service import ToolAnalysisService
@@ -38,6 +41,12 @@ def build_analysis_service(
         timeout_seconds=settings.trino_request_timeout_seconds,
     )
     return AnalysisService(realtime_repository, historical, primary, fallback)
+
+
+def build_behavior_metrics_service(settings: ApiSettings) -> BehaviorMetricsService:
+    catalog = MetricDefinitionCatalog.load(settings.behavior_metric_definitions_path)
+    repository = BehaviorMetricsRepository.from_settings(settings)
+    return BehaviorMetricsService(repository, catalog)
 
 
 def build_tool_analysis_service(

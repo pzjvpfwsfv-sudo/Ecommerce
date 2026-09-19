@@ -50,8 +50,18 @@ class ApiServiceArtifactsTest(unittest.TestCase):
         self.assertIn('@app.get("/metrics/{metric_name}")', text)
         self.assertIn('@app.post("/analysis/realtime"', text)
         self.assertIn('@app.post("/analysis/tools"', text)
+        for route in (
+            "/api/v1/behavior/publication",
+            "/api/v1/behavior/overview",
+            "/api/v1/behavior/funnel",
+            "/api/v1/behavior/rankings",
+            "/api/v1/behavior/quality",
+            "/api/v1/behavior/definitions",
+        ):
+            self.assertIn(route, text)
         self.assertIn("build_analysis_service", text)
         self.assertIn("build_tool_analysis_service", text)
+        self.assertIn("build_behavior_metrics_service", text)
         self.assertIn("create_app", text)
 
 
@@ -63,7 +73,8 @@ class ApiServiceRuntimeTest(unittest.TestCase):
                 ApiSettings(flink_checkpoint_max_age_seconds=value)
 
     def test_health_endpoint_returns_expected_payload(self):
-        client = TestClient(create_app(repository=Mock()))
+        behavior_service = Mock()
+        client = TestClient(create_app(repository=Mock(), behavior_service=behavior_service))
 
         response = client.get("/health")
 
@@ -72,6 +83,7 @@ class ApiServiceRuntimeTest(unittest.TestCase):
             {"status": "ok", "service": "realtime-metrics-api"},
             response.json(),
         )
+        behavior_service.assert_not_called()
 
     def test_ready_endpoint_returns_fixed_dependency_payload(self):
         doris = Mock()
