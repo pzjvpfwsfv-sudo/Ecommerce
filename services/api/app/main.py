@@ -44,8 +44,8 @@ def create_app(
     analysis_service: AnalysisService | Any | None = None,
     tool_analysis_service: ToolAnalysisService | Any | None = None,
     readiness_service: ReadinessService | Any | None = None,
-    behavior_service: BehaviorMetricsService | Any | None = None,
     settings: ApiSettings | None = None,
+    behavior_service: BehaviorMetricsService | Any | None = None,
 ) -> FastAPI:
     settings = settings or load_settings()
     if repository is None:

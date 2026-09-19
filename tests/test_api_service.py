@@ -72,6 +72,43 @@ class ApiServiceRuntimeTest(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 ApiSettings(flink_checkpoint_max_age_seconds=value)
 
+    def test_legacy_five_positional_arguments_keep_settings_in_fifth_position(self):
+        repository = Mock()
+        analysis_service = Mock()
+        analysis_service.analyze.return_value = {
+            "summary": "unused",
+            "insights": [],
+            "risks": [],
+            "actions": [],
+            "evidence": {},
+            "warnings": [],
+            "analyzer": "rule_based",
+            "generated_at": "2026-09-19T00:00:00Z",
+        }
+        tool_analysis_service = Mock()
+        readiness_service = Mock()
+        settings = ApiSettings(ai_max_question_length=3)
+        behavior_service = Mock()
+
+        with patch(
+            "app.main.build_behavior_metrics_service", return_value=behavior_service
+        ) as build_behavior_service:
+            client = TestClient(
+                create_app(
+                    repository,
+                    analysis_service,
+                    tool_analysis_service,
+                    readiness_service,
+                    settings,
+                )
+            )
+            response = client.post("/analysis/realtime", json={"question": "1234"})
+
+        self.assertEqual(422, response.status_code)
+        analysis_service.analyze.assert_not_called()
+        build_behavior_service.assert_called_once_with(settings)
+        behavior_service.assert_not_called()
+
     def test_health_endpoint_returns_expected_payload(self):
         behavior_service = Mock()
         client = TestClient(create_app(repository=Mock(), behavior_service=behavior_service))
