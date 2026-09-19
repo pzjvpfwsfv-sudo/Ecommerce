@@ -437,6 +437,19 @@ function Assert-G2dDependencies {
     }
 }
 
+function Get-G2dLatestSnapshotSql {
+    [CmdletBinding()]
+    param()
+
+    return @'
+SELECT snapshot_id AS source_snapshot_id
+FROM lakehouse.analytics."real_behavior_detail_v1$snapshots"
+WHERE snapshot_id > 0
+ORDER BY committed_at DESC, snapshot_id DESC
+LIMIT 1;
+'@
+}
+
 function Get-G2dLatestSnapshotId {
     [CmdletBinding()]
     param()
@@ -449,10 +462,9 @@ WHERE table_schema = 'analytics' AND table_name = 'real_behavior_detail_v1';
     if ($tableRows.Count -ne 1 -or [string]$tableRows[0].table_name -cne 'real_behavior_detail_v1') {
         throw "The fixed G2-C source table is unavailable. $script:G2dSetupHelp"
     }
-    $snapshotRows = @(Invoke-G2dTrinoStatement -Name latest_snapshot -Sql @'
-SELECT max(snapshot_id) AS source_snapshot_id
-FROM lakehouse.analytics."real_behavior_detail_v1$snapshots";
-'@)
+    $snapshotRows = @(
+        Invoke-G2dTrinoStatement -Name latest_snapshot -Sql (Get-G2dLatestSnapshotSql)
+    )
     if ($snapshotRows.Count -ne 1 -or [string]$snapshotRows[0].source_snapshot_id -notmatch '^[1-9][0-9]*$') {
         throw 'The fixed G2-C source table has no positive Snapshot ID.'
     }
@@ -595,6 +607,141 @@ function Get-G2dCandidateCounts {
     return $counts
 }
 
+function Get-G2dPathComparison {
+    if ([IO.Path]::DirectorySeparatorChar -eq [char]92) {
+        return [StringComparison]::OrdinalIgnoreCase
+    }
+    return [StringComparison]::Ordinal
+}
+
+function Test-G2dPathContained {
+    param(
+        [Parameter(Mandatory = $true)][string]$RootPath,
+        [Parameter(Mandatory = $true)][string]$CandidatePath
+    )
+
+    $root = [IO.Path]::GetFullPath($RootPath).TrimEnd(
+        [IO.Path]::DirectorySeparatorChar,
+        [IO.Path]::AltDirectorySeparatorChar
+    )
+    $candidate = [IO.Path]::GetFullPath($CandidatePath)
+    $comparison = Get-G2dPathComparison
+    if ($candidate.Equals($root, $comparison)) { return $true }
+    return $candidate.StartsWith(
+        ($root + [IO.Path]::DirectorySeparatorChar),
+        $comparison
+    )
+}
+
+function Resolve-G2dPhysicalOrProjectedPath {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    $fullPath = [IO.Path]::GetFullPath($Path)
+    $pathRoot = [IO.Path]::GetPathRoot($fullPath)
+    $current = $pathRoot
+    $relativePath = $fullPath.Substring($pathRoot.Length)
+    $separators = [char[]]@(
+        [IO.Path]::DirectorySeparatorChar,
+        [IO.Path]::AltDirectorySeparatorChar
+    )
+    $segments = $relativePath.Split($separators, [StringSplitOptions]::RemoveEmptyEntries)
+    foreach ($segment in $segments) {
+        $candidate = Join-Path $current $segment
+        if (-not [IO.File]::Exists($candidate) -and -not [IO.Directory]::Exists($candidate)) {
+            $current = $candidate
+            continue
+        }
+
+        $item = Get-Item -LiteralPath $candidate -Force -ErrorAction Stop
+        $isReparsePoint = ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0
+        if (-not $isReparsePoint) {
+            $current = $candidate
+            continue
+        }
+
+        $targetItem = $null
+        if ($null -ne $item.PSObject.Methods['ResolveLinkTarget']) {
+            $targetItem = $item.ResolveLinkTarget($true)
+        }
+        if ($null -eq $targetItem) {
+            $targetProperty = $item.PSObject.Properties['Target']
+            $targets = if ($null -eq $targetProperty) { @() } else { @($targetProperty.Value) }
+            if ($targets.Count -ne 1 -or [string]::IsNullOrWhiteSpace([string]$targets[0])) {
+                throw 'G2-D cannot resolve an output path reparse point.'
+            }
+            $targetPath = [string]$targets[0]
+            if (-not [IO.Path]::IsPathRooted($targetPath)) {
+                $targetPath = Join-Path (Split-Path $candidate -Parent) $targetPath
+            }
+            $targetItem = Get-Item -LiteralPath ([IO.Path]::GetFullPath($targetPath)) `
+                -Force -ErrorAction Stop
+        }
+        $current = $targetItem.FullName
+    }
+    return [IO.Path]::GetFullPath($current)
+}
+
+function Assert-G2dPhysicalContainment {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$RootPath,
+        [Parameter(Mandatory = $true)][string]$CandidatePath,
+        [Parameter(Mandatory = $true)][string]$Description
+    )
+
+    $physicalRoot = Resolve-G2dPhysicalOrProjectedPath -Path $RootPath
+    $physicalCandidate = Resolve-G2dPhysicalOrProjectedPath -Path $CandidatePath
+    if (-not (Test-G2dPathContained -RootPath $physicalRoot -CandidatePath $physicalCandidate)) {
+        throw "G2-D $Description escapes its fixed physical root."
+    }
+    return $physicalCandidate
+}
+
+function Assert-G2dFixedOutputPath {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$MetricRunId,
+        [switch]$RequireRunDirectory
+    )
+
+    $null = Get-G2dRefreshPlan -MetricRunId $MetricRunId
+    $outputRoot = [IO.Path]::GetFullPath($script:G2dOutputRoot)
+    $runDirectory = [IO.Path]::GetFullPath((Join-Path $outputRoot $MetricRunId))
+    $physicalOutputRoot = Assert-G2dPhysicalContainment `
+        -RootPath $script:G2dProjectRoot -CandidatePath $outputRoot `
+        -Description 'output root'
+    $physicalRunDirectory = Assert-G2dPhysicalContainment `
+        -RootPath $physicalOutputRoot -CandidatePath $runDirectory `
+        -Description 'run directory'
+
+    if ([IO.File]::Exists($outputRoot)) { throw 'G2-D output root is not a directory.' }
+    if ([IO.File]::Exists($runDirectory)) { throw 'G2-D run path is not a directory.' }
+    if ($RequireRunDirectory -and -not [IO.Directory]::Exists($runDirectory)) {
+        throw 'G2-D fixed run directory does not exist.'
+    }
+    return [pscustomobject][ordered]@{
+        OutputRoot = $outputRoot
+        RunDirectory = $runDirectory
+        PhysicalOutputRoot = $physicalOutputRoot
+        PhysicalRunDirectory = $physicalRunDirectory
+    }
+}
+
+function Initialize-G2dRunDirectory {
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][string]$MetricRunId)
+
+    $paths = Assert-G2dFixedOutputPath -MetricRunId $MetricRunId
+    if (-not [IO.Directory]::Exists($paths.OutputRoot)) {
+        $null = New-Item -ItemType Directory -Path $paths.OutputRoot
+    }
+    $paths = Assert-G2dFixedOutputPath -MetricRunId $MetricRunId
+    if (-not [IO.Directory]::Exists($paths.RunDirectory)) {
+        $null = New-Item -ItemType Directory -Path $paths.RunDirectory
+    }
+    return Assert-G2dFixedOutputPath -MetricRunId $MetricRunId -RequireRunDirectory
+}
+
 function Invoke-G2dStreamLoad {
     [CmdletBinding()]
     param(
@@ -609,17 +756,10 @@ function Invoke-G2dStreamLoad {
     $null = Get-G2dRefreshPlan -MetricRunId $MetricRunId
     if ($AttemptId -notmatch '^[0-9a-f]{32}$') { throw 'G2-D attempt ID is unsafe.' }
     $fullPath = [IO.Path]::GetFullPath($CandidatePath)
-    $runRoot = [IO.Path]::GetFullPath((Join-Path $script:G2dOutputRoot $MetricRunId))
-    $comparison = if ([IO.Path]::DirectorySeparatorChar -eq '\\') {
-        [StringComparison]::OrdinalIgnoreCase
-    } else {
-        [StringComparison]::Ordinal
-    }
-    $rootPrefix = $runRoot.TrimEnd(
-        [IO.Path]::DirectorySeparatorChar,
-        [IO.Path]::AltDirectorySeparatorChar
-    ) + [IO.Path]::DirectorySeparatorChar
-    if (-not $fullPath.StartsWith($rootPrefix, $comparison) -or -not [IO.File]::Exists($fullPath)) {
+    $paths = Assert-G2dFixedOutputPath -MetricRunId $MetricRunId -RequireRunDirectory
+    $null = Assert-G2dPhysicalContainment -RootPath $paths.PhysicalRunDirectory `
+        -CandidatePath $fullPath -Description 'Stream Load candidate'
+    if (-not [IO.File]::Exists($fullPath)) {
         throw 'G2-D Stream Load candidate must be an existing file in the fixed run directory.'
     }
 
@@ -767,7 +907,13 @@ function Write-G2dRefreshReport {
         [Parameter(Mandatory = $true)]$Report
     )
 
-    $path = Join-Path $OutputDirectory 'refresh-report.json'
+    $metricRunId = [string]$Report.metric_run_id
+    $paths = Assert-G2dFixedOutputPath -MetricRunId $metricRunId -RequireRunDirectory
+    $comparison = Get-G2dPathComparison
+    if (-not [IO.Path]::GetFullPath($OutputDirectory).Equals($paths.RunDirectory, $comparison)) {
+        throw 'G2-D report output directory is not the fixed run directory.'
+    }
+    $path = Join-Path $paths.RunDirectory 'refresh-report.json'
     $json = $Report | ConvertTo-Json -Depth 12
     [IO.File]::WriteAllText($path, ($json + "`n"), [Text.UTF8Encoding]::new($false))
     return $path
@@ -804,8 +950,8 @@ function Invoke-G2dRefresh {
         -SourceEventCount $sourceIdentity.source_event_count
     $null = Get-G2dRefreshPlan -MetricRunId $identity.MetricRunId
     $attemptId = New-G2dAttemptId
-    $outputDirectory = Join-Path $script:G2dOutputRoot $identity.MetricRunId
-    $null = New-Item -ItemType Directory -Path $outputDirectory -Force
+    $outputPaths = Initialize-G2dRunDirectory -MetricRunId $identity.MetricRunId
+    $outputDirectory = $outputPaths.RunDirectory
     $sqlSha256 = (Get-FileHash -LiteralPath $script:G2dSqlTemplatePath -Algorithm SHA256).Hash.ToLowerInvariant()
 
     $report = [ordered]@{
@@ -856,6 +1002,9 @@ function Invoke-G2dRefresh {
         )
         $candidates = [ordered]@{}
         foreach ($name in @('overview', 'funnel', 'dimension', 'quality')) {
+            $outputPaths = Assert-G2dFixedOutputPath `
+                -MetricRunId $identity.MetricRunId -RequireRunDirectory
+            $outputDirectory = $outputPaths.RunDirectory
             $path = Join-Path $outputDirectory "$name.csv"
             $null = Export-G2dCandidateCsv -Target $name -Rows $results[$name] -Identity $identity `
                 -OutputDirectory $outputDirectory -OutputPath $path

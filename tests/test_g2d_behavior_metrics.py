@@ -730,6 +730,88 @@ $rows = @(ConvertFrom-G2dMysqlBatch -Lines @(
         self.assertTrue(payload["decoded_backslash"])
         self.assertEqual("plain", payload["plain"])
 
+    def test_latest_snapshot_query_orders_by_commit_time_not_numeric_max(self):
+        payload = self._payload(
+            r'''
+$ErrorActionPreference = 'Stop'
+. (Resolve-Path './scripts/refresh_g2d_behavior_metrics.ps1') -FunctionsOnly
+$sql = Get-G2dLatestSnapshotSql
+[ordered]@{
+    fixed_metadata_table = $sql.Contains(
+        'lakehouse.analytics."real_behavior_detail_v1$snapshots"'
+    )
+    positive_only = [bool]($sql -match '(?i)WHERE\s+snapshot_id\s*>\s*0')
+    chronological = [bool]($sql -match (
+        '(?is)ORDER\s+BY\s+committed_at\s+DESC\s*,\s*' +
+        'snapshot_id\s+DESC\s+LIMIT\s+1'
+    ))
+    numeric_max_absent = -not [bool]($sql -match '(?i)\bmax\s*\(\s*snapshot_id')
+} | ConvertTo-Json -Compress
+'''
+        )
+        self.assertTrue(all(payload.values()), payload)
+
+    def test_output_path_rejects_physical_link_escape_without_touching_outside(self):
+        payload = self._payload(
+            r'''
+$ErrorActionPreference = 'Stop'
+. (Resolve-Path './scripts/refresh_g2d_behavior_metrics.ps1') -FunctionsOnly
+function Test-Rejected([scriptblock]$Action) {
+    try { & $Action | Out-Null; return $false } catch { return $true }
+}
+$base = Join-Path ([IO.Path]::GetTempPath()) ('g2d-refresh-path-' + [guid]::NewGuid().ToString('N'))
+$project = Join-Path $base 'project'
+$tmp = Join-Path $project 'tmp'
+$outside = Join-Path $base 'outside'
+$outsideGraduation = Join-Path $outside 'graduation'
+$outsideRun = Join-Path $outsideGraduation 'g2d/behavior-v1-s9'
+$link = Join-Path $tmp 'graduation'
+$marker = Join-Path $outside 'marker.txt'
+$null = New-Item -ItemType Directory -Path $tmp
+$null = New-Item -ItemType Directory -Path $outsideRun
+[IO.File]::WriteAllText($marker, 'safe', [Text.UTF8Encoding]::new($false))
+$linkCreated = $false
+try {
+    try {
+        $linkType = if ([IO.Path]::DirectorySeparatorChar -eq '\') { 'Junction' } else { 'SymbolicLink' }
+        $null = New-Item -ItemType $linkType -Path $link -Target $outsideGraduation -ErrorAction Stop
+        $linkCreated = $true
+    } catch {
+        $linkCreated = $false
+    }
+    $script:G2dProjectRoot = $project
+    $script:G2dOutputRoot = Join-Path $link 'g2d'
+    $deterministicEscape = Test-Rejected {
+        Assert-G2dPhysicalContainment -RootPath $project -CandidatePath $outsideRun `
+            -Description 'deterministic outside path'
+    }
+    $linkResult = 'unsupported'
+    if ($linkCreated) {
+        $linkResult = if (Test-Rejected {
+            Write-G2dRefreshReport -OutputDirectory (Join-Path $script:G2dOutputRoot 'behavior-v1-s9') `
+                -Report ([ordered]@{ metric_run_id='behavior-v1-s9'; status='FAILED' })
+        }) { 'rejected' } else { 'accepted' }
+    }
+    [ordered]@{
+        deterministic_escape = $deterministicEscape
+        link_result = $linkResult
+        marker_unchanged = (Test-Path -LiteralPath $marker) -and
+            ([IO.File]::ReadAllText($marker) -ceq 'safe')
+        escaped_report_absent = -not (Test-Path -LiteralPath (Join-Path $outsideRun 'refresh-report.json'))
+    } | ConvertTo-Json -Compress
+} finally {
+    if ($linkCreated -and (Test-Path -LiteralPath $link)) {
+        Remove-Item -LiteralPath $link -Force
+    }
+    if (Test-Path -LiteralPath $base) { Remove-Item -LiteralPath $base -Recurse -Force }
+}
+'''
+        )
+        self.assertTrue(payload["deterministic_escape"])
+        self.assertIn(payload["link_result"], {"rejected", "unsupported"})
+        self.assertTrue(payload["marker_unchanged"])
+        self.assertTrue(payload["escaped_report_absent"])
+
     def test_existing_publication_requires_exact_identity_counts_hashes_and_status(self):
         payload = self._payload(
             r'''
