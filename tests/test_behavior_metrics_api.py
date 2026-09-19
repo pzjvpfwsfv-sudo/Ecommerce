@@ -241,6 +241,13 @@ class BehaviorModelsAndCatalogTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "purchase_amount_proxy forbidden claims"):
             MetricDefinitionCatalog.load(self._write_catalog(payload))
 
+    def test_catalog_rejects_duplicate_proxy_forbidden_claim(self):
+        payload = deepcopy(self.catalog_payload)
+        payload["definitions"][7]["forbidden_claims"].append("GMV")
+
+        with self.assertRaisesRegex(ValueError, "purchase_amount_proxy forbidden claims"):
+            MetricDefinitionCatalog.load(self._write_catalog(payload))
+
     def test_catalog_rejects_extra_json_keys(self):
         cases = ((None, "unexpected"), (0, "metric_version"))
         for definition_index, field in cases:

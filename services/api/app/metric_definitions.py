@@ -73,7 +73,10 @@ class MetricDefinitionCatalog:
             for definition in document.definitions
             if definition.metric_name == "purchase_amount_proxy"
         )
-        if set(proxy.forbidden_claims) != PROXY_FORBIDDEN_CLAIMS:
+        if (
+            len(proxy.forbidden_claims) != len(PROXY_FORBIDDEN_CLAIMS)
+            or set(proxy.forbidden_claims) != PROXY_FORBIDDEN_CLAIMS
+        ):
             raise ValueError("purchase_amount_proxy forbidden claims must be exact")
         return cls(document)
 
