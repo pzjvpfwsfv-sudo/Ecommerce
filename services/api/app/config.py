@@ -3,6 +3,12 @@
 from collections.abc import Mapping
 from dataclasses import dataclass
 from os import environ as os_environ
+from pathlib import Path
+
+
+_DEFAULT_BEHAVIOR_METRIC_DEFINITIONS_PATH = (
+    Path(__file__).resolve().parents[3] / "configs" / "metrics" / "behavior-v1.json"
+)
 
 
 @dataclass(frozen=True)
@@ -31,8 +37,16 @@ class ApiSettings:
     ai_tool_executor_max_workers: int = 3
     ai_tool_total_timeout_seconds: float = 20
     ai_tool_max_event_types: int = 20
+    behavior_metric_definitions_path: Path = _DEFAULT_BEHAVIOR_METRIC_DEFINITIONS_PATH
 
     def __post_init__(self) -> None:
+        raw_definitions_path = self.behavior_metric_definitions_path
+        if isinstance(raw_definitions_path, str) and not raw_definitions_path.strip():
+            raise ValueError("BEHAVIOR_METRIC_DEFINITIONS_PATH must not be empty")
+        definitions_path = Path(raw_definitions_path)
+        if definitions_path == Path(""):
+            raise ValueError("BEHAVIOR_METRIC_DEFINITIONS_PATH must not be empty")
+        object.__setattr__(self, "behavior_metric_definitions_path", definitions_path)
         if self.ai_tool_planner_mode not in {"rule_based", "openai_compatible"}:
             raise ValueError(f"unsupported AI_TOOL_PLANNER_MODE: {self.ai_tool_planner_mode}")
         if not 1 <= self.ai_tool_max_calls <= 3:
@@ -80,4 +94,10 @@ def load_settings(environ: Mapping[str, str] | None = None) -> ApiSettings:
         ai_tool_executor_max_workers=int(values.get("AI_TOOL_EXECUTOR_MAX_WORKERS", "3")),
         ai_tool_total_timeout_seconds=float(values.get("AI_TOOL_TOTAL_TIMEOUT_SECONDS", "20")),
         ai_tool_max_event_types=int(values.get("AI_TOOL_MAX_EVENT_TYPES", "20")),
+        behavior_metric_definitions_path=Path(
+            values.get(
+                "BEHAVIOR_METRIC_DEFINITIONS_PATH",
+                str(_DEFAULT_BEHAVIOR_METRIC_DEFINITIONS_PATH),
+            )
+        ),
     )
