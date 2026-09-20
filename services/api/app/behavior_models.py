@@ -3,11 +3,12 @@ from __future__ import annotations
 from datetime import date, datetime
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 
 
 DecimalString = Annotated[str, Field(pattern=r"^[0-9]+\.[0-9]{2,6}$")]
 Sha256String = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
+NonBlankString = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
 
 
 class StrictBehaviorModel(BaseModel):
@@ -159,7 +160,7 @@ class MetricDefinition(StrictBehaviorModel):
     allowed_windows: list[Literal["DAY", "FULL"]] = Field(min_length=1)
     additive: bool
     null_policy: str
-    limitations: list[str] = Field(min_length=1)
+    limitations: list[NonBlankString] = Field(min_length=1)
     forbidden_claims: list[str]
 
 

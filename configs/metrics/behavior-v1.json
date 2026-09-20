@@ -260,7 +260,7 @@
       "allowed_windows": ["FULL"],
       "additive": true,
       "null_policy": "unknown categories remain explicit groups",
-      "limitations": ["Category IDs are not inferred from missing display values."],
+      "limitations": ["Category IDs are not inferred from missing display values; aliases use the deterministic minimum non-null display, while null and reserved IDs remain distinct."],
       "forbidden_claims": []
     },
     {
@@ -273,7 +273,7 @@
       "allowed_windows": ["FULL"],
       "additive": true,
       "null_policy": "unknown brands remain explicit groups",
-      "limitations": ["Brands are not inferred from other product fields."],
+      "limitations": ["Brands are not inferred from other product fields; null uses the UNKNOWN group and literal or reserved IDs are escaped."],
       "forbidden_claims": []
     },
     {
@@ -318,14 +318,14 @@
     {
       "metric_name": "invalid_derived_date_count",
       "display_name": "派生日期异常数",
-      "formula": "count(*) where event_date or event_ts is null",
-      "numerator": "facts with invalid derived date or timestamp",
+      "formula": "count(*) where event_time is not accepted UTC ISO-8601, from_iso8601_timestamp(event_time) is null or differs from event_ts, or event_date differs from either timestamp",
+      "numerator": "facts with invalid or inconsistent source timestamp, derived timestamp, or date",
       "denominator": null,
       "source_fields": ["event_time", "event_date", "event_ts", "event_id"],
       "allowed_windows": ["FULL"],
       "additive": true,
       "null_policy": "invalid derived date fails publication",
-      "limitations": ["A non-zero value fails publication."],
+      "limitations": ["Accepted event_time format is YYYY-MM-DDTHH:mm:ss+00:00; any mismatch fails publication."],
       "forbidden_claims": []
     }
   ]

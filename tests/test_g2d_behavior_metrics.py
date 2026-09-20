@@ -158,6 +158,69 @@ class G2dArtifactContractTests(unittest.TestCase):
         )
         self.assertNotRegex(quality_sql, r"'(?:UN)?RECONCILED'")
 
+    def test_dimension_ids_are_injective_and_category_aliases_roll_up(self):
+        """Null and literal sentinels stay distinct and aliases cannot collide in Doris."""
+        dimension_sql = TRINO_TEMPLATE.read_text(encoding="utf-8").split(
+            "-- result:dimension\n", 1
+        )[1].split("-- result:quality\n", 1)[0]
+        for source_field in ("product_id", "category_id", "brand"):
+            with self.subTest(source_field=source_field):
+                self.assertIn(f"WHEN {source_field} IS NULL THEN 'UNKNOWN'", dimension_sql)
+                self.assertIn(
+                    f"WHEN {source_field} = 'UNKNOWN' OR "
+                    f"starts_with({source_field}, 'G2D_ESC:')",
+                    dimension_sql,
+                )
+                self.assertIn(f"concat('G2D_ESC:', {source_field})", dimension_sql)
+        self.assertIn(
+            "min(dimension_name) FILTER (WHERE dimension_name IS NOT NULL)",
+            dimension_sql,
+        )
+        self.assertIn(
+            "bool_or(identity_is_unknown) OR count_if(dimension_name IS NOT NULL) = 0",
+            dimension_sql,
+        )
+        self.assertRegex(
+            dimension_sql,
+            r"GROUP BY window_type, window_start, window_end, dimension_type,\s*"
+            r"dimension_id",
+        )
+        self.assertNotRegex(
+            dimension_sql,
+            r"(?m)^\s*GROUP BY[^\r\n]*dimension_name",
+        )
+
+    def test_derived_date_quality_cross_checks_the_g2c_timestamp_contract(self):
+        """Non-null derived values must still agree with the accepted source timestamp."""
+        quality_sql = TRINO_TEMPLATE.read_text(encoding="utf-8").split(
+            "-- result:quality\n", 1
+        )[1]
+        self.assertIn(
+            "try(from_iso8601_timestamp(event_time)) AS parsed_event_ts", quality_sql
+        )
+        self.assertIn(
+            r"regexp_like(event_time, '^[0-9]{4}-[0-9]{2}-[0-9]{2}T"
+            r"[0-9]{2}:[0-9]{2}:[0-9]{2}\+00:00$')",
+            quality_sql,
+        )
+        for predicate in (
+            "parsed_event_ts IS NULL",
+            "event_ts <> parsed_event_ts",
+            "event_date <> CAST(parsed_event_ts AS DATE)",
+            "event_date <> CAST(event_ts AS DATE)",
+        ):
+            with self.subTest(predicate=predicate):
+                self.assertIn(predicate, quality_sql)
+
+        payload = json.loads(DEFINITIONS.read_text(encoding="utf-8"))
+        definition = next(
+            item
+            for item in payload["definitions"]
+            if item["metric_name"] == "invalid_derived_date_count"
+        )
+        self.assertIn("from_iso8601_timestamp(event_time)", definition["formula"])
+        self.assertIn("YYYY-MM-DDTHH:mm:ss+00:00", " ".join(definition["limitations"]))
+
 
 class G2dPowerShellContractTests(unittest.TestCase):
     def _run_powershell(self, command):
@@ -246,6 +309,12 @@ $parts = Split-G2dNamedSql -Sql $sql -SnapshotId 3854376992136224865
     duplicate = Test-Rejected { Split-G2dNamedSql -Sql ($sql + "`n-- result:overview`nSELECT 1;") -SnapshotId 1 }
     missing = Test-Rejected { Split-G2dNamedSql -Sql ($sql -replace '-- result:quality', '-- omitted:quality') -SnapshotId 1 }
     unknown_placeholder = Test-Rejected { Split-G2dNamedSql -Sql ($sql + "`n-- __OTHER__") -SnapshotId 1 }
+    unsupported_placeholder_shape = Test-Rejected {
+        $unsupported = [regex]::new('__SNAPSHOT_ID__').Replace(
+            $sql, '__OTHER-ID__', 1
+        )
+        Split-G2dNamedSql -Sql $unsupported -SnapshotId 1
+    }
     extra_statement = Test-Rejected { Split-G2dNamedSql -Sql ($sql + "`nSELECT 1;") -SnapshotId 1 }
     zero_snapshot = Test-Rejected { Split-G2dNamedSql -Sql $sql -SnapshotId 0 }
 } | ConvertTo-Json -Depth 5 -Compress
@@ -260,6 +329,7 @@ $parts = Split-G2dNamedSql -Sql $sql -SnapshotId 3854376992136224865
         self.assertTrue(payload["duplicate"])
         self.assertTrue(payload["missing"])
         self.assertTrue(payload["unknown_placeholder"])
+        self.assertTrue(payload["unsupported_placeholder_shape"])
         self.assertTrue(payload["extra_statement"])
         self.assertTrue(payload["zero_snapshot"])
 
@@ -335,11 +405,13 @@ $funnel = @(
     [pscustomobject]@{ window_type='DAY'; window_start='2024-01-02'; window_end='2024-01-02'; missing_session_event_count='0'; view_sessions='301'; view_to_cart_sessions='101'; completed_sessions='41' },
     [pscustomobject]@{ window_type='FULL'; window_start='2024-01-01'; window_end='2024-01-02'; missing_session_event_count='0'; view_sessions='600'; view_to_cart_sessions='200'; completed_sessions='80' }
 )
-$dimension = @(
-    [pscustomobject]@{ window_type='FULL'; window_start='2024-01-01'; window_end='2024-01-02'; dimension_type='product'; dimension_id='p1'; dimension_name='p1'; is_unknown='false'; view_count='10'; cart_count='2'; purchase_count='1'; unique_user_count='8'; purchase_amount_proxy='12.00' },
-    [pscustomobject]@{ window_type='FULL'; window_start='2024-01-01'; window_end='2024-01-02'; dimension_type='category'; dimension_id='c1'; dimension_name='cat'; is_unknown='0'; view_count='10'; cart_count='2'; purchase_count='1'; unique_user_count='8'; purchase_amount_proxy='12.00' },
-    [pscustomobject]@{ window_type='FULL'; window_start='2024-01-01'; window_end='2024-01-02'; dimension_type='brand'; dimension_id='b1'; dimension_name='brand'; is_unknown='1'; view_count='10'; cart_count='2'; purchase_count='1'; unique_user_count='8'; purchase_amount_proxy='12.00' }
-)
+$dimension = @()
+foreach ($dimensionType in @('product', 'category', 'brand')) {
+    $dimension += [pscustomobject]@{ window_type='DAY'; window_start='2024-01-01'; window_end='2024-01-01'; dimension_type=$dimensionType; dimension_id="$dimensionType-1"; dimension_name="$dimensionType one"; is_unknown='0'; view_count='350'; cart_count='100'; purchase_count='49'; unique_user_count='300'; purchase_amount_proxy='490.00' }
+    $dimension += [pscustomobject]@{ window_type='DAY'; window_start='2024-01-02'; window_end='2024-01-02'; dimension_type=$dimensionType; dimension_id="$dimensionType-2"; dimension_name="$dimensionType two"; is_unknown='0'; view_count='350'; cart_count='100'; purchase_count='51'; unique_user_count='301'; purchase_amount_proxy='510.00' }
+    $dimension += [pscustomobject]@{ window_type='FULL'; window_start='2024-01-01'; window_end='2024-01-02'; dimension_type=$dimensionType; dimension_id="$dimensionType-1"; dimension_name="$dimensionType one"; is_unknown='0'; view_count='350'; cart_count='100'; purchase_count='49'; unique_user_count='300'; purchase_amount_proxy='490.00' }
+    $dimension += [pscustomobject]@{ window_type='FULL'; window_start='2024-01-01'; window_end='2024-01-02'; dimension_type=$dimensionType; dimension_id="$dimensionType-2"; dimension_name="$dimensionType two"; is_unknown='0'; view_count='350'; cart_count='100'; purchase_count='51'; unique_user_count='301'; purchase_amount_proxy='510.00' }
+}
 $quality = @([pscustomobject]@{
     window_type='FULL'; window_start='2024-01-01'; window_end='2024-01-02'
     source_event_count='1002'; clean_event_count='1000'; late_event_count='2'
@@ -391,6 +463,130 @@ $extraDayQuality += @($dayQuality)
         self.assertTrue(payload["invalid_event_type"])
         self.assertTrue(payload["extra_day_quality"])
 
+    def test_bundle_rejects_cross_family_semantic_contradictions(self):
+        """Publication requires one coherent source, window, quality, and dimension truth."""
+        payload = self._payload(
+            r'''
+$ErrorActionPreference = 'Stop'
+Import-Module ./scripts/lib/G2d.BehaviorMetrics.psm1 -Force
+function Copy-Rows([object[]]$Rows) {
+    return @(($Rows | ConvertTo-Json -Depth 10) | ConvertFrom-Json)
+}
+function Test-Rejected([object[]]$Overview, [object[]]$Funnel, [object[]]$Dimension, [object[]]$Quality) {
+    try {
+        Assert-G2dMetricBundle -Identity $identity -SourceIdentity $sourceIdentity `
+            -Overview $Overview -Funnel $Funnel -Dimension $Dimension -Quality $Quality | Out-Null
+        return $false
+    } catch {
+        return $true
+    }
+}
+$identity = Get-G2dMetricIdentity -SnapshotId 9 `
+    -DataScope g2c-correctness-subset -SourceEventCount 1002
+$sourceIdentity = @([pscustomobject]@{
+    source_event_count='1002'; window_start='2024-01-01'; window_end='2024-01-02'
+    distinct_event_count='1002'; source_snapshot_id='9'
+    snapshot_committed_at='2024-01-03T00:00:00Z'
+})
+$overview = @(
+    [pscustomobject]@{ window_type='DAY'; window_start='2024-01-01'; window_end='2024-01-01'; event_count='500'; view_count='350'; cart_count='100'; purchase_count='49'; unique_user_count='300'; session_count='320'; product_count='200'; purchase_amount_proxy='490.00' },
+    [pscustomobject]@{ window_type='DAY'; window_start='2024-01-02'; window_end='2024-01-02'; event_count='502'; view_count='350'; cart_count='100'; purchase_count='51'; unique_user_count='301'; session_count='321'; product_count='201'; purchase_amount_proxy='510.00' },
+    [pscustomobject]@{ window_type='FULL'; window_start='2024-01-01'; window_end='2024-01-02'; event_count='1002'; view_count='700'; cart_count='200'; purchase_count='100'; unique_user_count='501'; session_count='600'; product_count='350'; purchase_amount_proxy='1000.00' }
+)
+$funnel = @(
+    [pscustomobject]@{ window_type='DAY'; window_start='2024-01-01'; window_end='2024-01-01'; missing_session_event_count='1'; view_sessions='300'; view_to_cart_sessions='100'; completed_sessions='40' },
+    [pscustomobject]@{ window_type='DAY'; window_start='2024-01-02'; window_end='2024-01-02'; missing_session_event_count='2'; view_sessions='301'; view_to_cart_sessions='101'; completed_sessions='41' },
+    [pscustomobject]@{ window_type='FULL'; window_start='2024-01-01'; window_end='2024-01-02'; missing_session_event_count='3'; view_sessions='500'; view_to_cart_sessions='180'; completed_sessions='70' }
+)
+$dimension = @()
+foreach ($dimensionType in @('product', 'category', 'brand')) {
+    $dimension += [pscustomobject]@{ window_type='DAY'; window_start='2024-01-01'; window_end='2024-01-01'; dimension_type=$dimensionType; dimension_id="$dimensionType-1"; dimension_name="$dimensionType one"; is_unknown='0'; view_count='350'; cart_count='100'; purchase_count='49'; unique_user_count='300'; purchase_amount_proxy='490.00' }
+    $dimension += [pscustomobject]@{ window_type='DAY'; window_start='2024-01-02'; window_end='2024-01-02'; dimension_type=$dimensionType; dimension_id="$dimensionType-2"; dimension_name="$dimensionType two"; is_unknown='0'; view_count='350'; cart_count='100'; purchase_count='51'; unique_user_count='301'; purchase_amount_proxy='510.00' }
+    $dimension += [pscustomobject]@{ window_type='FULL'; window_start='2024-01-01'; window_end='2024-01-02'; dimension_type=$dimensionType; dimension_id="$dimensionType-1"; dimension_name="$dimensionType one"; is_unknown='0'; view_count='350'; cart_count='100'; purchase_count='49'; unique_user_count='300'; purchase_amount_proxy='490.00' }
+    $dimension += [pscustomobject]@{ window_type='FULL'; window_start='2024-01-01'; window_end='2024-01-02'; dimension_type=$dimensionType; dimension_id="$dimensionType-2"; dimension_name="$dimensionType two"; is_unknown='0'; view_count='350'; cart_count='100'; purchase_count='51'; unique_user_count='301'; purchase_amount_proxy='510.00' }
+}
+$quality = @([pscustomobject]@{
+    window_type='FULL'; window_start='2024-01-01'; window_end='2024-01-02'
+    source_event_count='1002'; clean_event_count='1000'; late_event_count='2'
+    clean_event_rate='0.99800399'; late_event_rate='0.00199601'
+    distinct_event_count='1002'; duplicate_event_count='0'; missing_session_count='3'
+    unknown_category_count='0'; unknown_brand_count='0'; invalid_event_type_count='0'
+    empty_key_id_count='0'; invalid_price_count='0'; invalid_derived_date_count='0'
+    overview_event_count='1002'; reconciliation_status='PASS'
+})
+$valid = -not (Test-Rejected $overview $funnel $dimension $quality)
+$badRouteTotal = Copy-Rows $quality; $badRouteTotal[0].clean_event_count = '999'
+$badCleanRate = Copy-Rows $quality; $badCleanRate[0].clean_event_rate = '0.50000000'
+$badLateRate = Copy-Rows $quality; $badLateRate[0].late_event_rate = '0.50000000'
+$badEventType = Copy-Rows $quality; $badEventType[0].invalid_event_type_count = '1'
+$badKey = Copy-Rows $quality; $badKey[0].empty_key_id_count = '1'
+$badPrice = Copy-Rows $quality; $badPrice[0].invalid_price_count = '1'
+$badDerivedDate = Copy-Rows $quality; $badDerivedDate[0].invalid_derived_date_count = '1'
+$badSource = Copy-Rows $quality; $badSource[0].source_event_count = '1001'
+$badOverviewTotal = Copy-Rows $quality; $badOverviewTotal[0].overview_event_count = '1001'
+$badDistinct = Copy-Rows $quality; $badDistinct[0].distinct_event_count = '1001'
+$badDuplicates = Copy-Rows $quality; $badDuplicates[0].duplicate_event_count = '1'
+$badOverviewDaySum = Copy-Rows $overview; $badOverviewDaySum[0].view_count = '351'
+$badOverviewAmount = Copy-Rows $overview; $badOverviewAmount[0].purchase_amount_proxy = '491.00'
+$missingFunnelDay = @((Copy-Rows $funnel) | Where-Object { $_.window_start -cne '2024-01-02' })
+$badMissingFull = Copy-Rows $funnel; ($badMissingFull | Where-Object window_type -ceq 'FULL').missing_session_event_count = '2'
+$badMissingDay = Copy-Rows $funnel; $badMissingDay[0].missing_session_event_count = '2'
+$tooManySessions = Copy-Rows $funnel; $tooManySessions[0].view_sessions = '321'
+$missingDimensionWindow = @((Copy-Rows $dimension) | Where-Object {
+    -not ($_.window_type -ceq 'DAY' -and $_.window_start -ceq '2024-01-02' -and $_.dimension_type -ceq 'brand')
+})
+$badDimensionTotal = Copy-Rows $dimension
+($badDimensionTotal | Where-Object { $_.window_type -ceq 'DAY' -and $_.window_start -ceq '2024-01-01' -and $_.dimension_type -ceq 'product' }).view_count = '349'
+$badDimensionAmount = Copy-Rows $dimension
+($badDimensionAmount | Where-Object { $_.window_type -ceq 'FULL' -and $_.dimension_type -ceq 'brand' -and $_.dimension_id -ceq 'brand-1' }).purchase_amount_proxy = '489.00'
+$badFullIdentity = Copy-Rows $dimension
+($badFullIdentity | Where-Object { $_.window_type -ceq 'FULL' -and $_.dimension_type -ceq 'category' -and $_.dimension_id -ceq 'category-2' }).dimension_id = 'category-3'
+$badFullDimensionValue = Copy-Rows $dimension
+($badFullDimensionValue | Where-Object { $_.window_type -ceq 'FULL' -and $_.dimension_type -ceq 'product' -and $_.dimension_id -ceq 'product-1' }).view_count = '349'
+($badFullDimensionValue | Where-Object { $_.window_type -ceq 'FULL' -and $_.dimension_type -ceq 'product' -and $_.dimension_id -ceq 'product-2' }).view_count = '351'
+$wrongStoredIdentity = Copy-Rows $overview
+$wrongStoredIdentity[0] | Add-Member -NotePropertyName metric_run_id -NotePropertyValue 'behavior-v1-s10'
+$wrongStoredIdentity[0] | Add-Member -NotePropertyName dataset_id -NotePropertyValue 'rees46-multicategory'
+$wrongStoredIdentity[0] | Add-Member -NotePropertyName metric_version -NotePropertyValue 'behavior-v1'
+$partialStoredIdentity = Copy-Rows $overview
+$partialStoredIdentity[0] | Add-Member -NotePropertyName metric_run_id -NotePropertyValue 'behavior-v1-s9'
+$mixedStoredIdentity = Copy-Rows $overview
+$mixedStoredIdentity[0] | Add-Member -NotePropertyName metric_run_id -NotePropertyValue 'behavior-v1-s9'
+$mixedStoredIdentity[0] | Add-Member -NotePropertyName dataset_id -NotePropertyValue 'rees46-multicategory'
+$mixedStoredIdentity[0] | Add-Member -NotePropertyName metric_version -NotePropertyValue 'behavior-v1'
+[ordered]@{
+    valid = $valid
+    route_total = Test-Rejected $overview $funnel $dimension $badRouteTotal
+    clean_rate = Test-Rejected $overview $funnel $dimension $badCleanRate
+    late_rate = Test-Rejected $overview $funnel $dimension $badLateRate
+    invalid_event_type = Test-Rejected $overview $funnel $dimension $badEventType
+    invalid_key = Test-Rejected $overview $funnel $dimension $badKey
+    invalid_price = Test-Rejected $overview $funnel $dimension $badPrice
+    invalid_derived_date = Test-Rejected $overview $funnel $dimension $badDerivedDate
+    source_total = Test-Rejected $overview $funnel $dimension $badSource
+    overview_total = Test-Rejected $overview $funnel $dimension $badOverviewTotal
+    distinct_total = Test-Rejected $overview $funnel $dimension $badDistinct
+    duplicate_total = Test-Rejected $overview $funnel $dimension $badDuplicates
+    overview_day_count_total = Test-Rejected $badOverviewDaySum $funnel $dimension $quality
+    overview_day_amount_total = Test-Rejected $badOverviewAmount $funnel $dimension $quality
+    missing_funnel_day = Test-Rejected $overview $missingFunnelDay $dimension $quality
+    missing_full_total = Test-Rejected $overview $badMissingFull $dimension $quality
+    missing_day_total = Test-Rejected $overview $badMissingDay $dimension $quality
+    sessions_exceed_overview = Test-Rejected $overview $tooManySessions $dimension $quality
+    dimension_window_coverage = Test-Rejected $overview $funnel $missingDimensionWindow $quality
+    dimension_count_total = Test-Rejected $overview $funnel $badDimensionTotal $quality
+    dimension_amount_total = Test-Rejected $overview $funnel $badDimensionAmount $quality
+    dimension_full_identity = Test-Rejected $overview $funnel $badFullIdentity $quality
+    dimension_full_value = Test-Rejected $overview $funnel $badFullDimensionValue $quality
+    wrong_stored_identity = Test-Rejected $wrongStoredIdentity $funnel $dimension $quality
+    partial_stored_identity = Test-Rejected $partialStoredIdentity $funnel $dimension $quality
+    mixed_stored_identity = Test-Rejected $mixedStoredIdentity $funnel $dimension $quality
+} | ConvertTo-Json -Compress
+'''
+        )
+        self.assertTrue(payload.pop("valid"), payload)
+        self.assertTrue(all(payload.values()), payload)
+
     def test_bundle_rejects_invalid_shapes_windows_values_and_keys(self):
         payload = self._payload(
             r'''
@@ -410,8 +606,16 @@ $overview = @(
     [pscustomobject]@{ window_type='DAY'; window_start='2024-01-01'; window_end='2024-01-01'; event_count='1002'; view_count='700'; cart_count='200'; purchase_count='100'; unique_user_count='500'; session_count='600'; product_count='300'; purchase_amount_proxy='1.00' },
     [pscustomobject]@{ window_type='FULL'; window_start='2024-01-01'; window_end='2024-01-01'; event_count='1002'; view_count='700'; cart_count='200'; purchase_count='100'; unique_user_count='500'; session_count='600'; product_count='300'; purchase_amount_proxy='1.00' }
 )
-$funnel = @([pscustomobject]@{ window_type='FULL'; window_start='2024-01-01'; window_end='2024-01-01'; missing_session_event_count='0'; view_sessions='600'; view_to_cart_sessions='200'; completed_sessions='100' })
-$dimension = @([pscustomobject]@{ window_type='FULL'; window_start='2024-01-01'; window_end='2024-01-01'; dimension_type='product'; dimension_id='p1'; dimension_name='p1'; is_unknown='false'; view_count='1'; cart_count='0'; purchase_count='0'; unique_user_count='1'; purchase_amount_proxy='0.00' })
+$funnel = @(
+    [pscustomobject]@{ window_type='DAY'; window_start='2024-01-01'; window_end='2024-01-01'; missing_session_event_count='0'; view_sessions='600'; view_to_cart_sessions='200'; completed_sessions='100' },
+    [pscustomobject]@{ window_type='FULL'; window_start='2024-01-01'; window_end='2024-01-01'; missing_session_event_count='0'; view_sessions='600'; view_to_cart_sessions='200'; completed_sessions='100' }
+)
+$dimension = @()
+foreach ($dimensionType in @('product', 'category', 'brand')) {
+    foreach ($windowType in @('DAY', 'FULL')) {
+        $dimension += [pscustomobject]@{ window_type=$windowType; window_start='2024-01-01'; window_end='2024-01-01'; dimension_type=$dimensionType; dimension_id="$dimensionType-1"; dimension_name="$dimensionType one"; is_unknown='false'; view_count='700'; cart_count='200'; purchase_count='100'; unique_user_count='500'; purchase_amount_proxy='1.00' }
+    }
+}
 $quality = @([pscustomobject]@{ window_type='FULL'; window_start='2024-01-01'; window_end='2024-01-01'; source_event_count='1002'; clean_event_count='1002'; late_event_count='0'; clean_event_rate='1'; late_event_rate='0'; distinct_event_count='1002'; duplicate_event_count='0'; missing_session_count='0'; unknown_category_count='0'; unknown_brand_count='0'; invalid_event_type_count='0'; empty_key_id_count='0'; invalid_price_count='0'; invalid_derived_date_count='0'; overview_event_count='1002'; reconciliation_status='PASS' })
 $twoFull = Copy-Rows $overview; $twoFull += Copy-Rows @($overview[1])
 $badWindow = Copy-Rows $funnel; $badWindow[0].window_end = '2024-01-02'
@@ -1174,6 +1378,169 @@ class G2dVerifierTests(unittest.TestCase):
         result = self._run_powershell(command)
         self.assertEqual(0, result.returncode, result.stderr or result.stdout)
         return json.loads(result.stdout.strip().splitlines()[-1])
+
+    def test_api_contract_comparison_rejects_every_false_pass_shape(self):
+        """Broken API payloads must not pass by matching only summary evidence."""
+        payload = self._payload(
+            r'''
+$ErrorActionPreference = 'Stop'
+. (Resolve-Path './scripts/verify_g2d_behavior_metrics.ps1') -FunctionsOnly
+function Copy-Value($Value) {
+    return (($Value | ConvertTo-Json -Depth 20) | ConvertFrom-Json)
+}
+function Test-Rejected([scriptblock]$Mutate) {
+    $candidate = Copy-Value $apiPayloads
+    & $Mutate $candidate
+    try {
+        Assert-G2dApiResponseContracts -Identity $identity -Publication $publication `
+            -Overview $overview -Funnel $funnel -Dimension $dimension -Quality $quality `
+            -ApiPayloads $candidate -ExpectedDefinitions $expectedDefinitions | Out-Null
+        return $false
+    } catch {
+        return $true
+    }
+}
+$identity = Get-G2dMetricIdentity -SnapshotId 3854376992136224865 `
+    -DataScope g2c-correctness-subset -SourceEventCount 1002
+$publication = [pscustomobject]@{
+    metric_run_id='behavior-v1-s3854376992136224865'; dataset_id='rees46-multicategory'
+    metric_version='behavior-v1'; data_scope='g2c-correctness-subset'
+    source_snapshot_id='3854376992136224865'; source_event_count='1002'
+    window_start='2024-01-01'; window_end='2024-01-02'
+    calculated_at='2024-01-03 00:00:00.000'; published_at='2024-01-03 00:01:00.000'
+    overview_row_count='3'; overview_sha256=('a' * 64)
+    funnel_row_count='3'; funnel_sha256=('b' * 64)
+    dimension_row_count='2'; dimension_sha256=('c' * 64)
+    quality_row_count='1'; quality_sha256=('d' * 64); status='PUBLISHED'
+}
+$overview = @([pscustomobject]@{
+    window_type='FULL'; window_start='2024-01-01'; window_end='2024-01-02'
+    event_count='1002'; view_count='700'; cart_count='200'; purchase_count='100'
+    unique_user_count='500'; session_count='600'; product_count='300'
+    purchase_amount_proxy='1000.00'
+})
+$funnel = @([pscustomobject]@{
+    window_type='FULL'; window_start='2024-01-01'; window_end='2024-01-02'
+    missing_session_event_count='2'; view_sessions='4'; view_to_cart_sessions='2'
+    completed_sessions='1'
+})
+$dimension = @(
+    [pscustomobject]@{ window_type='FULL'; window_start='2024-01-01'; window_end='2024-01-02'; dimension_type='product'; dimension_id='p1'; dimension_name='P1'; is_unknown='0'; view_count='7'; cart_count='3'; purchase_count='2'; unique_user_count='5'; purchase_amount_proxy='20.00' },
+    [pscustomobject]@{ window_type='FULL'; window_start='2024-01-01'; window_end='2024-01-02'; dimension_type='product'; dimension_id='p2'; dimension_name='P2'; is_unknown='0'; view_count='5'; cart_count='2'; purchase_count='1'; unique_user_count='4'; purchase_amount_proxy='10.00' }
+)
+$quality = [pscustomobject]@{
+    window_type='FULL'; window_start='2024-01-01'; window_end='2024-01-02'
+    source_event_count='1002'; clean_event_count='1001'; late_event_count='1'
+    clean_event_rate='0.999001996'; late_event_rate='0.000998004'
+    distinct_event_count='1002'; duplicate_event_count='0'; missing_session_count='2'
+    unknown_category_count='3'; unknown_brand_count='4'; invalid_event_type_count='0'
+    empty_key_id_count='0'; invalid_price_count='0'; invalid_derived_date_count='0'
+    overview_event_count='1002'; reconciliation_status='PASS'
+}
+$meta = [pscustomobject]@{
+    dataset_id='rees46-multicategory'; metric_version='behavior-v1'
+    metric_run_id='behavior-v1-s3854376992136224865'
+    source_snapshot_id='3854376992136224865'; window_start='2024-01-01'
+    window_end='2024-01-02'; calculated_at='2024-01-03T00:00:00Z'
+    data_scope='g2c-correctness-subset'; source_event_count=1002
+    warnings=@('correctness subset; not the full 2% user sample')
+}
+$expectedDefinitions = Get-Content configs/metrics/behavior-v1.json -Raw -Encoding UTF8 |
+    ConvertFrom-Json
+$apiPayloads = [ordered]@{
+    publication = [pscustomobject]@{
+        meta=$meta
+        data=[pscustomobject]@{
+            published_at='2024-01-03T00:01:00Z'; overview_row_count=3
+            overview_sha256=('a' * 64); funnel_row_count=3; funnel_sha256=('b' * 64)
+            dimension_row_count=2; dimension_sha256=('c' * 64); quality_row_count=1
+            quality_sha256=('d' * 64); status='PUBLISHED'
+        }
+    }
+    overview = [pscustomobject]@{ meta=$meta; data=@([pscustomobject]@{
+        window_type='FULL'; window_start='2024-01-01'; window_end='2024-01-02'
+        event_count=1002; view_count=700; cart_count=200; purchase_count=100
+        unique_user_count=500; session_count=600; product_count=300
+        purchase_amount_proxy='1000.00'
+    }) }
+    funnel = [pscustomobject]@{ meta=$meta; data=@([pscustomobject]@{
+        window_type='FULL'; window_start='2024-01-01'; window_end='2024-01-02'
+        missing_session_event_count=2; view_sessions=4; view_to_cart_sessions=2
+        completed_sessions=1; view_to_cart_rate='0.500000'
+        cart_to_purchase_rate='0.500000'; full_conversion_rate='0.250000'
+    }) }
+    rankings = [pscustomobject]@{ meta=$meta; data=@(
+        [pscustomobject]@{ window_type='FULL'; window_start='2024-01-01'; window_end='2024-01-02'; dimension_type='product'; dimension_id='p1'; dimension_name='P1'; is_unknown=$false; view_count=7; cart_count=3; purchase_count=2; unique_user_count=5; purchase_amount_proxy='20.00' },
+        [pscustomobject]@{ window_type='FULL'; window_start='2024-01-01'; window_end='2024-01-02'; dimension_type='product'; dimension_id='p2'; dimension_name='P2'; is_unknown=$false; view_count=5; cart_count=2; purchase_count=1; unique_user_count=4; purchase_amount_proxy='10.00' }
+    ) }
+    quality = [pscustomobject]@{ meta=$meta; data=[pscustomobject]@{
+        window_type='FULL'; window_start='2024-01-01'; window_end='2024-01-02'
+        source_event_count=1002; clean_event_count=1001; late_event_count=1
+        clean_event_rate='0.999002'; late_event_rate='0.000998'
+        distinct_event_count=1002; duplicate_event_count=0; missing_session_count=2
+        unknown_category_count=3; unknown_brand_count=4; invalid_event_type_count=0
+        empty_key_id_count=0; invalid_price_count=0; invalid_derived_date_count=0
+        overview_event_count=1002; reconciliation_status='PASS'
+    } }
+    definitions = $expectedDefinitions
+}
+$valid = $true
+try {
+    Assert-G2dApiResponseContracts -Identity $identity -Publication $publication `
+        -Overview $overview -Funnel $funnel -Dimension $dimension -Quality $quality `
+        -ApiPayloads $apiPayloads -ExpectedDefinitions $expectedDefinitions | Out-Null
+} catch {
+    $valid = $false
+}
+$fullIdentity = Get-G2dMetricIdentity -SnapshotId 3854376992136224865 `
+    -DataScope stable-user-2pct-full -SourceEventCount 2199938
+$fullPublication = Copy-Value $publication
+$fullPublication.data_scope = 'stable-user-2pct-full'
+$fullPublication.source_event_count = '2199938'
+$fullPayloads = Copy-Value $apiPayloads
+foreach ($name in @('publication', 'overview', 'funnel', 'rankings', 'quality')) {
+    $fullPayloads.$name.meta.data_scope = 'stable-user-2pct-full'
+    $fullPayloads.$name.meta.source_event_count = 2199938
+    $fullPayloads.$name.meta.warnings = @()
+}
+$fullScopeValid = $true
+try {
+    Assert-G2dApiResponseContracts -Identity $fullIdentity -Publication $fullPublication `
+        -Overview $overview -Funnel $funnel -Dimension $dimension -Quality $quality `
+        -ApiPayloads $fullPayloads -ExpectedDefinitions $expectedDefinitions | Out-Null
+} catch {
+    $fullScopeValid = $false
+}
+$fullScopeWarningRejected = $false
+$fullPayloads.overview.meta.warnings = @('correctness subset; not the full 2% user sample')
+try {
+    Assert-G2dApiResponseContracts -Identity $fullIdentity -Publication $fullPublication `
+        -Overview $overview -Funnel $funnel -Dimension $dimension -Quality $quality `
+        -ApiPayloads $fullPayloads -ExpectedDefinitions $expectedDefinitions | Out-Null
+} catch {
+    $fullScopeWarningRejected = $true
+}
+[ordered]@{
+    valid = $valid
+    full_scope_valid = $fullScopeValid
+    full_scope_subset_warning_rejected = $fullScopeWarningRejected
+    missing_subset_warning = Test-Rejected { param($p) $p.quality.meta.warnings = @() }
+    wrong_meta_window = Test-Rejected { param($p) $p.overview.meta.window_start = '2024-01-02' }
+    wrong_meta_calculated_at = Test-Rejected { param($p) $p.funnel.meta.calculated_at = '2024-01-04T00:00:00Z' }
+    wrong_publication_time = Test-Rejected { param($p) $p.publication.data.published_at = '2024-01-04T00:01:00Z' }
+    wrong_funnel_rate = Test-Rejected { param($p) $p.funnel.data[0].full_conversion_rate = '0.999999' }
+    duplicate_ranking = Test-Rejected { param($p) $p.rankings.data[1] = $p.rankings.data[0] }
+    wrong_ranking_order = Test-Rejected { param($p) $first = $p.rankings.data[0]; $p.rankings.data[0] = $p.rankings.data[1]; $p.rankings.data[1] = $first }
+    wrong_ranking_field = Test-Rejected { param($p) $p.rankings.data[0].is_unknown = $true }
+    wrong_quality_rate = Test-Rejected { param($p) $p.quality.data.clean_event_rate = '0.100000' }
+    incomplete_definitions = Test-Rejected { param($p) $p.definitions.definitions = @($p.definitions.definitions[0]) }
+    duplicate_definition = Test-Rejected { param($p) $p.definitions.definitions[-1].metric_name = $p.definitions.definitions[0].metric_name }
+    changed_definition = Test-Rejected { param($p) $p.definitions.definitions[0].formula = 'count_if(false)' }
+} | ConvertTo-Json -Compress
+'''
+        )
+        self.assertTrue(payload.pop("valid"), payload)
+        self.assertTrue(all(payload.values()), payload)
 
     def test_verification_evidence_accepts_the_reviewed_1002_row_contract(self):
         payload = self._payload(

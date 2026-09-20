@@ -146,7 +146,7 @@ G2-B 已实现独立 Java DataStream 真实事件入口，并完成 1,000 条真
 
 G2-C 已将同一真实链路的 `clean=1,001` 与 `late=1` 通过单一 Flink SQL writer 写入正式 Iceberg 表 `lakehouse.analytics.real_behavior_detail_v1`。Trino 核对总数和不同 `event_id` 均为 1,002，五类字段质量违规为 0；另完成 17 个源字段、共 17,034 次逐值比较且零差异。证据见 [真实事件湖仓运行手册](real-event-lakehouse-runbook.md)。本轮仍只是正确性验收，不把它描述为 220 万条全量容量或长期故障恢复验收。
 
-G2-D 已将 Snapshot `881836466779140976` 发布为 `behavior-v1-s881836466779140976`。Trino 源总数、Doris `DAY/FULL` 总数和 API overview 均为 1,002，`clean=1,001`、`late=1`、不同 `event_id=1,002`；四张 Doris 指标表行数为 `2/2/1,780/1`，重算 SHA-256 均与发布元数据一致，六个 API 均返回 HTTP 200。`purchase_amount_proxy` 仅是购买事件价格字段的分析代理值，不具备数量、币种、折扣、退款、取消或支付状态语义。完整证据与重跑边界见 [G2-D 行为指标与版本化 API 验收记录](behavior-metrics-api-runbook.md)。本次 1,002 条结果明确是非容量证据；下一步为 G2-E 独立 Olist 订单域。最新完整自动化回归为 `552` 项通过，耗时 `302.152` 秒。
+G2-D 已将 Snapshot `881836466779140976` 发布为 `behavior-v1-s881836466779140976`。Trino 源总数、Doris `DAY/FULL` 总数和 API overview 均为 1,002，`clean=1,001`、`late=1`、不同 `event_id=1,002`；四张 Doris 指标表行数为 `2/2/1,780/1`，重算 SHA-256 均与发布元数据一致，六个 API 均返回 HTTP 200。`purchase_amount_proxy` 仅是购买事件价格字段的分析代理值，不具备数量、币种、折扣、退款、取消或支付状态语义。该 run 是最终 SQL/verifier 加固前的不可变历史证据，既有发布未刷新或覆盖；加固后的动态发布验收必须等待自然产生的新 Snapshot。完整证据与重跑边界见 [G2-D 行为指标与版本化 API 验收记录](behavior-metrics-api-runbook.md)。本次 1,002 条结果明确是非容量证据；下一步为 G2-E 独立 Olist 订单域。最新完整自动化回归为 `558` 项通过，耗时 `186.763` 秒。
 
 ## GitHub 备份边界
 

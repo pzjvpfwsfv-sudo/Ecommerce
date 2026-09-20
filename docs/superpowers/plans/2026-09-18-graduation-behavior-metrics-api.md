@@ -321,9 +321,9 @@ function Get-G2dMetricIdentity {
 
 ```powershell
 if ($fullOverview.event_count -ne $Identity.SourceEventCount) { throw 'Source total mismatch.' }
-if ($fullOverview.event_count -ne
-        $fullOverview.view_count + $fullOverview.cart_count + $fullOverview.purchase_count) {
-    throw 'Event type totals do not reconcile.'
+if ($fullOverview.view_count + $fullOverview.cart_count + $fullOverview.purchase_count -gt
+        $fullOverview.event_count) {
+    throw 'Named event type totals exceed the valid event total.'
 }
 if (($dayOverview | Measure-Object event_count -Sum).Sum -ne $fullOverview.event_count) {
     throw 'DAY and FULL totals do not reconcile.'
@@ -337,7 +337,7 @@ if ($fullFunnel.completed_sessions -gt $fullFunnel.view_to_cart_sessions -or
 }
 ```
 
-Also require exactly one FULL row per overview/funnel/quality family, identical min/max windows, nonnegative integers, two-decimal nonnegative amount strings, known dimension types, unique composite keys, and `quality.reconciliation_status='PASS'`.
+The named overview counts intentionally omit valid `remove_from_cart` events, so their sum may be lower than `event_count`; only a sum greater than the valid event total is contradictory. Also require exactly one FULL row per overview/funnel/quality family; identical DAY/FULL window sets; nonnegative integers; two-decimal nonnegative amount strings; known dimension types; unique composite keys; and `quality.reconciliation_status='PASS'`. Reconcile source, overview, quality, distinct-event, clean/late, duplicate, invalid-field, missing-session, and rate fields. Require DAY additive overview totals to equal FULL, funnel session bounds to agree with overview/quality totals, every dimension family to cover every metric window, and each FULL dimension ID/value to equal the union/sum of its DAY rows. If stored rows include identity columns, require the complete identity tuple and exact equality with the requested run.
 
 - [ ] **Step 5: Implement deterministic candidate CSV export**
 
@@ -738,9 +738,9 @@ The verifier must check dependency readiness without deleting or recreating serv
 1. Read the latest PUBLISHED run from Doris and require scope `g2c-correctness-subset`, plus four nonzero/expected row counts and four lowercase SHA-256 values.
 2. Query Trino source identity and require Snapshot, total 1,002 and distinct IDs 1,002.
 3. Query all four Doris metric tables by the exact run ID and recompute each canonical digest.
-4. Require DAY totals sum to FULL total, event-type counts reconcile, clean=1,001, late=1, funnel stages are monotonic, and all metric windows agree.
-5. Call all six API endpoints and require the same run, Snapshot, scope, source total and warning.
-6. Require the definition endpoint to preserve proxy limitations and forbidden claims.
+4. Require the complete bundle contract: DAY additive totals sum to FULL, named event-type counts never exceed the event total (preserving `remove_from_cart`), source/quality/distinct/clean/late/duplicate/invalid/missing-session totals and rates reconcile, funnel stages are monotonic and bounded by overview sessions, all metric windows agree, and dimension DAY/FULL identity and additive totals reconcile.
+5. Call all six API endpoints and compare every metadata and payload field exactly with the PUBLISHED Doris row and all four stored metric families. Recompute funnel and quality rates, require exact ranking order and unique rows, and require the correctness-subset warning only for subset scope (with no such warning for full scope).
+6. Require the definition endpoint to return the exact ordered set of 25 unique definitions, including every field and array from the validated local catalog, nonblank limitations, and the amount-proxy forbidden claims.
 7. Write a compact report only after every assertion passes.
 
 - [x] **Step 4: Run verifier tests and confirm GREEN**
@@ -813,6 +813,7 @@ The Task 6 owner stops after the local commit. The controller owns the required 
 - Regression: the eight focused acceptance-fix tests passed in `5.368 s`; `python -m unittest discover -s tests -q` passed `552` tests in `302.152 s`.
 - Boundary: the 1,002-row subset is correctness-only, explicitly not capacity evidence or the full 2% user sample. G2-E is next.
 - Detailed commands, failures, recovery actions, values and digests are recorded in `docs/graduation/behavior-metrics-api-runbook.md`.
+- Final hardening note (2026-09-21): this dynamic result is retained as historical pre-hardening evidence. The published run was not refreshed or overwritten after SQL identity/date semantics and verifier strictness changed; a naturally new source Snapshot is required for a post-hardening publication and live acceptance run.
 
 ## Self-Review
 

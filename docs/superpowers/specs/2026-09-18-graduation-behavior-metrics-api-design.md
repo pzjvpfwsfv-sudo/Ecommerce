@@ -109,7 +109,7 @@ lakehouse.analytics.real_behavior_detail_v1
 - 购买事件金额代理值。
 - 维度 ID、展示名称和 `is_unknown`。
 
-商品使用 `product_id`；品类使用 `category_id` 作为稳定键、`category_code` 作为可空展示名；品牌缺失进入明确的未知组。不能猜测补齐缺失品类或品牌。API 排行只允许后端白名单排序字段和 `1..100` 的 limit，不能把客户端字段直接拼进 SQL。
+商品使用 `product_id`；品类使用 `category_id` 作为稳定键、`category_code` 作为可空展示名；品牌缺失进入明确的未知组。维度 ID 的空值继续使用 `UNKNOWN`，已知值只有在等于 `UNKNOWN` 或以保留前缀 `G2D_ESC:` 开头时才递归增加该前缀，因而空值、字面量和已转义值保持一一对应。相同品类 ID 的多个展示别名按最小非空值确定性聚合为一行；只有 ID 缺失或该 ID 的全部展示名均缺失时才标记为未知。不能猜测补齐缺失品类或品牌。API 排行只允许后端白名单排序字段和 `1..100` 的 limit，不能把客户端字段直接拼进 SQL。
 
 ### 5.4 数据质量
 
@@ -120,6 +120,8 @@ lakehouse.analytics.real_behavior_detail_v1
 - 缺失会话、品类名称、品牌的数量及占比。
 - 非法事件类型、空关键 ID、非法金额、派生日期不一致数量。
 - 源总数、质量总数与 overview 总数对账结果。
+
+`invalid_derived_date_count` 不只检查空值：`event_time` 必须符合 G2-C 已接受的 `YYYY-MM-DDTHH:mm:ss+00:00`，Trino `from_iso8601_timestamp(event_time)` 的结果必须非空并与 `event_ts` 相等，`event_date` 还必须同时等于解析时间和 `event_ts` 的日期。
 
 质量问题和业务未知维度必须保留，不能通过过滤让指标“看起来更干净”。DLQ 不进入事实指标，其统计仍属于 G2-B 质量证据。
 
@@ -213,11 +215,12 @@ Repository 只负责参数化 Doris 查询，Service 负责响应组装、比率
 3. Repository 测试验证参数绑定和排序白名单，禁止 SQL 注入。
 4. Service/API 测试验证统一 meta、Decimal 字符串、422/503、空排行和旧接口兼容。
 5. 刷新脚本测试验证“候选装载失败时不发布”、重复 run、错误 Snapshot 和对账失败。
-6. 动态验收从正式 Iceberg 表计算，再核对 Trino、Doris 和 FastAPI 三层结果。
+6. 动态验收从正式 Iceberg 表计算，再核对 Trino、Doris 和 FastAPI 三层结果；API 校验逐字段比较完整 meta/data、漏斗与质量比率、排行精确顺序及唯一性，并逐项比较 25 个唯一指标定义。
+7. 发布前 bundle 校验 clean/late、质量比率、重复与非法计数、overview/funnel/dimension 的 DAY/FULL 窗口集合、缺失会话、维度分区汇总及稳定 ID 的逐日到全窗对账，同时保留合法 `remove_from_cart` 导致的公开三事件计数差额。
 
 当前 1,002 条正式表必须至少满足：
 
-- FULL `event_count=1002`，事件类型之和等于 1,002。
+- FULL `event_count=1002`；view/cart/purchase 三项之和不得超过总数，合法 `remove_from_cart` 只进入总数形成可解释差额。
 - quality `clean=1001`、`late=1`、不同 `event_id=1002`。
 - DAY 总事件数之和等于 FULL 总事件数。
 - 四张指标表的 `metric_run_id`、版本、Snapshot、数据范围和窗口完全一致。

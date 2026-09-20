@@ -169,37 +169,63 @@ windowed AS (
 ),
 dimension_rows AS (
     SELECT window_type, window_start, window_end, 'product' AS dimension_type,
-           coalesce(product_id, 'UNKNOWN') AS dimension_id, product_id AS dimension_name,
-           product_id IS NULL AS is_unknown, event_type, user_id, price_decimal
+           CASE
+               WHEN product_id IS NULL THEN 'UNKNOWN'
+               WHEN product_id = 'UNKNOWN' OR starts_with(product_id, 'G2D_ESC:')
+                   THEN concat('G2D_ESC:', product_id)
+               ELSE product_id
+           END AS dimension_id,
+           product_id AS dimension_name, product_id IS NULL AS identity_is_unknown,
+           event_type, user_id, price_decimal
     FROM windowed
     UNION ALL
     SELECT window_type, window_start, window_end, 'category' AS dimension_type,
-           coalesce(category_id, 'UNKNOWN') AS dimension_id, category_code AS dimension_name,
-           category_id IS NULL OR category_code IS NULL AS is_unknown, event_type, user_id, price_decimal
+           CASE
+               WHEN category_id IS NULL THEN 'UNKNOWN'
+               WHEN category_id = 'UNKNOWN' OR starts_with(category_id, 'G2D_ESC:')
+                   THEN concat('G2D_ESC:', category_id)
+               ELSE category_id
+           END AS dimension_id,
+           category_code AS dimension_name, category_id IS NULL AS identity_is_unknown,
+           event_type, user_id, price_decimal
     FROM windowed
     UNION ALL
     SELECT window_type, window_start, window_end, 'brand' AS dimension_type,
-           coalesce(brand, 'UNKNOWN') AS dimension_id, brand AS dimension_name,
-           brand IS NULL AS is_unknown, event_type, user_id, price_decimal
+           CASE
+               WHEN brand IS NULL THEN 'UNKNOWN'
+               WHEN brand = 'UNKNOWN' OR starts_with(brand, 'G2D_ESC:')
+                   THEN concat('G2D_ESC:', brand)
+               ELSE brand
+           END AS dimension_id,
+           brand AS dimension_name, brand IS NULL AS identity_is_unknown,
+           event_type, user_id, price_decimal
     FROM windowed
+),
+dimension_rollup AS (
+    SELECT window_type, window_start, window_end, dimension_type, dimension_id,
+           min(dimension_name) FILTER (WHERE dimension_name IS NOT NULL) AS dimension_name,
+           bool_or(identity_is_unknown) OR count_if(dimension_name IS NOT NULL) = 0
+               AS is_unknown,
+           count_if(event_type = 'view') AS view_count,
+           count_if(event_type = 'cart') AS cart_count,
+           count_if(event_type = 'purchase') AS purchase_count,
+           count(DISTINCT user_id) FILTER (WHERE user_id IS NOT NULL) AS unique_user_count,
+           coalesce(sum(price_decimal) FILTER (WHERE event_type = 'purchase'), DECIMAL '0.00')
+               AS purchase_amount_proxy
+    FROM dimension_rows
+    GROUP BY window_type, window_start, window_end, dimension_type, dimension_id
 )
 SELECT window_type, window_start, window_end, dimension_type, dimension_id, dimension_name,
-       is_unknown,
-       count_if(event_type = 'view') AS view_count,
-       count_if(event_type = 'cart') AS cart_count,
-       count_if(event_type = 'purchase') AS purchase_count,
-       count(DISTINCT user_id) FILTER (WHERE user_id IS NOT NULL) AS unique_user_count,
-       coalesce(sum(price_decimal) FILTER (WHERE event_type = 'purchase'), DECIMAL '0.00')
-           AS purchase_amount_proxy
-FROM dimension_rows
-GROUP BY window_type, window_start, window_end, dimension_type, dimension_id, dimension_name,
-         is_unknown
+       is_unknown, view_count, cart_count, purchase_count, unique_user_count,
+       purchase_amount_proxy
+FROM dimension_rollup
 ORDER BY window_type, window_start, dimension_type, dimension_id;
 
 -- result:quality
 WITH base AS (
     SELECT event_date, event_ts, event_time, event_type, user_id, user_session, product_id,
-           category_code, brand, price_decimal, event_id, quality_route
+           category_code, brand, price_decimal, event_id, quality_route,
+           try(from_iso8601_timestamp(event_time)) AS parsed_event_ts
     FROM lakehouse.analytics.real_behavior_detail_v1
         FOR VERSION AS OF __SNAPSHOT_ID__
 ),
@@ -221,7 +247,14 @@ quality_counts AS (
                OR product_id IS NULL OR trim(product_id) = ''
            ) AS empty_key_id_count,
            count_if(price_decimal IS NULL) AS invalid_price_count,
-           count_if(event_date IS NULL OR event_ts IS NULL OR event_time IS NULL)
+           count_if(
+               event_date IS NULL OR event_ts IS NULL OR event_time IS NULL
+               OR NOT regexp_like(event_time, '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\+00:00$')
+               OR parsed_event_ts IS NULL
+               OR event_ts <> parsed_event_ts
+               OR event_date <> CAST(parsed_event_ts AS DATE)
+               OR event_date <> CAST(event_ts AS DATE)
+           )
                AS invalid_derived_date_count,
            count(*) AS overview_event_count
     FROM base

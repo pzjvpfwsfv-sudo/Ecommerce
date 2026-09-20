@@ -165,6 +165,125 @@ function Assert-G2dRate {
     }
 }
 
+function ConvertTo-G2dDecimal {
+    param(
+        [Parameter(Mandatory = $true)]$Value,
+        [Parameter(Mandatory = $true)][string]$Name
+    )
+
+    $text = [Convert]::ToString($Value, [Globalization.CultureInfo]::InvariantCulture)
+    $parsed = 0D
+    if (-not [decimal]::TryParse(
+            $text,
+            [Globalization.NumberStyles]::AllowDecimalPoint,
+            [Globalization.CultureInfo]::InvariantCulture,
+            [ref]$parsed) -or $parsed -lt 0) {
+        throw "$Name must be a nonnegative decimal."
+    }
+    return $parsed
+}
+
+function Assert-G2dRateMatchesCounts {
+    param(
+        [Parameter(Mandatory = $true)]$Value,
+        [Parameter(Mandatory = $true)][long]$Numerator,
+        [Parameter(Mandatory = $true)][long]$Denominator,
+        [Parameter(Mandatory = $true)][string]$Name
+    )
+
+    if ($Denominator -le 0) { throw "$Name denominator must be positive." }
+    $actual = ConvertTo-G2dDecimal $Value $Name
+    $expected = [Math]::Round(
+        ([decimal]$Numerator / [decimal]$Denominator),
+        8,
+        [MidpointRounding]::AwayFromZero
+    )
+    if ($actual -ne $expected) { throw "$Name does not match its counts." }
+}
+
+function Get-G2dWindowKey {
+    param(
+        [Parameter(Mandatory = $true)]$Row,
+        [Parameter(Mandatory = $true)][string]$Family
+    )
+
+    $windowType = [string](Get-G2dPropertyValue $Row 'window_type')
+    $windowStart = ConvertTo-G2dDateText `
+        (Get-G2dPropertyValue $Row 'window_start') "$Family.window_start"
+    $windowEnd = ConvertTo-G2dDateText `
+        (Get-G2dPropertyValue $Row 'window_end') "$Family.window_end"
+    return "$windowType`u{001F}$windowStart`u{001F}$windowEnd"
+}
+
+function Assert-G2dOptionalRowIdentity {
+    param(
+        [Parameter(Mandatory = $true)]$Row,
+        [Parameter(Mandatory = $true)]$Identity,
+        [Parameter(Mandatory = $true)][string]$Family
+    )
+
+    $fields = @('metric_run_id', 'dataset_id', 'metric_version')
+    $present = @($fields | Where-Object { $null -ne $Row.PSObject.Properties[$_] })
+    if ($present.Count -eq 0) { return }
+    if ($present.Count -ne $fields.Count) {
+        throw "$Family row identity is incomplete."
+    }
+    $expected = @(
+        [string]$Identity.MetricRunId,
+        [string]$Identity.DatasetId,
+        [string]$Identity.MetricVersion
+    )
+    for ($index = 0; $index -lt $fields.Count; $index++) {
+        if ([string](Get-G2dPropertyValue $Row $fields[$index]) -cne $expected[$index]) {
+            throw "$Family row identity does not match the metric identity."
+        }
+    }
+}
+
+function Assert-G2dOptionalFamilyIdentity {
+    param(
+        [Parameter(Mandatory = $true)][object[]]$Rows,
+        [Parameter(Mandatory = $true)]$Identity,
+        [Parameter(Mandatory = $true)][string]$Family
+    )
+
+    $rowsWithIdentity = 0
+    foreach ($row in $Rows) {
+        $hasIdentity = $false
+        foreach ($field in @('metric_run_id', 'dataset_id', 'metric_version')) {
+            if ($null -ne $row.PSObject.Properties[$field]) {
+                $hasIdentity = $true
+                break
+            }
+        }
+        if ($hasIdentity) { $rowsWithIdentity++ }
+        Assert-G2dOptionalRowIdentity $row $Identity $Family
+    }
+    if ($rowsWithIdentity -ne 0 -and $rowsWithIdentity -ne $Rows.Count) {
+        throw "$Family identity columns must be present on every row or no rows."
+    }
+}
+
+function Assert-G2dStringSetsEqual {
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$Expected,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$Actual,
+        [Parameter(Mandatory = $true)][string]$Message
+    )
+
+    $expectedSet = [Collections.Generic.HashSet[string]]::new(
+        [string[]]$Expected,
+        [StringComparer]::Ordinal
+    )
+    $actualSet = [Collections.Generic.HashSet[string]]::new(
+        [string[]]$Actual,
+        [StringComparer]::Ordinal
+    )
+    if ($expectedSet.Count -ne $actualSet.Count -or -not $expectedSet.SetEquals($actualSet)) {
+        throw $Message
+    }
+}
+
 function Assert-G2dUniqueKeys {
     param(
         [Parameter(Mandatory = $true)][object[]]$Rows,
@@ -268,7 +387,7 @@ function Split-G2dNamedSql {
     )
 
     $snapshot = ConvertTo-G2dInt64 -Value $SnapshotId -Name 'G2-D snapshot ID' -Positive
-    $placeholderMatches = [regex]::Matches($Sql, '__[A-Za-z0-9_]+__')
+    $placeholderMatches = [regex]::Matches($Sql, '__[^\r\n]*?__')
     if ($placeholderMatches.Count -eq 0) { throw 'G2-D SQL snapshot placeholder is missing.' }
     foreach ($match in $placeholderMatches) {
         if ($match.Value -cne '__SNAPSHOT_ID__') { throw 'G2-D SQL contains an unknown placeholder.' }
@@ -449,6 +568,10 @@ function Assert-G2dMetricBundle {
     Assert-G2dUniqueKeys $Funnel @('window_type', 'window_start') 'funnel'
     Assert-G2dUniqueKeys $Dimension @('window_type', 'window_start', 'dimension_type', 'dimension_id') 'dimension'
     Assert-G2dUniqueKeys $Quality @('window_type', 'window_start') 'quality'
+    Assert-G2dOptionalFamilyIdentity $Overview $Identity 'overview'
+    Assert-G2dOptionalFamilyIdentity $Funnel $Identity 'funnel'
+    Assert-G2dOptionalFamilyIdentity $Dimension $Identity 'dimension'
+    Assert-G2dOptionalFamilyIdentity $Quality $Identity 'quality'
 
     $overviewIntegerColumns = @(
         'event_count', 'view_count', 'cart_count', 'purchase_count', 'unique_user_count',
@@ -459,6 +582,7 @@ function Assert-G2dMetricBundle {
         foreach ($column in $overviewIntegerColumns) {
             $counts[$column] = ConvertTo-G2dInt64 (Get-G2dPropertyValue $row $column) "overview.$column"
         }
+        if ($counts.event_count -le 0) { throw 'Overview windows cannot be empty.' }
         if ($counts.view_count + $counts.cart_count + $counts.purchase_count -gt $counts.event_count) {
             throw 'Event type totals exceed the row event total.'
         }
@@ -487,7 +611,15 @@ function Assert-G2dMetricBundle {
         }
         $dimensionId = [string](Get-G2dPropertyValue $row 'dimension_id')
         if ([string]::IsNullOrEmpty($dimensionId)) { throw 'Dimension ID cannot be empty.' }
-        $null = ConvertTo-G2dBooleanInt (Get-G2dPropertyValue $row 'is_unknown') 'dimension.is_unknown'
+        $isUnknown = ConvertTo-G2dBooleanInt `
+            (Get-G2dPropertyValue $row 'is_unknown') 'dimension.is_unknown'
+        $dimensionName = Get-G2dPropertyValue $row 'dimension_name'
+        if ($dimensionId -ceq 'UNKNOWN' -and $isUnknown -ne 1) {
+            throw 'The reserved unknown dimension ID must be marked unknown.'
+        }
+        if ($isUnknown -eq 0 -and [string]::IsNullOrWhiteSpace([string]$dimensionName)) {
+            throw 'Known dimensions require a display name.'
+        }
         foreach ($column in $dimensionIntegerColumns) {
             $null = ConvertTo-G2dInt64 (Get-G2dPropertyValue $row $column) "dimension.$column"
         }
@@ -519,28 +651,183 @@ function Assert-G2dMetricBundle {
         (ConvertTo-G2dInt64 $fullOverview.purchase_count 'overview.purchase_count')
     if ($knownEventTotal -gt $fullEventCount) { throw 'Event type totals exceed the source total.' }
 
-    $dayTotal = 0L
     $dayRows = @($Overview | Where-Object { $_.window_type -ceq 'DAY' })
     if ($dayRows.Count -eq 0) { throw 'Overview must contain DAY rows.' }
-    foreach ($row in $dayRows) {
-        $dayTotal += ConvertTo-G2dInt64 $row.event_count 'overview.event_count'
+    foreach ($column in @('event_count', 'view_count', 'cart_count', 'purchase_count')) {
+        $dayTotal = 0L
+        foreach ($row in $dayRows) {
+            $dayTotal += ConvertTo-G2dInt64 $row.$column "overview.$column"
+        }
+        $fullTotal = ConvertTo-G2dInt64 $fullOverview.$column "overview.$column"
+        if ($dayTotal -ne $fullTotal) {
+            throw "DAY and FULL overview '$column' values do not reconcile."
+        }
     }
-    if ($dayTotal -ne $fullEventCount) { throw 'DAY and FULL totals do not reconcile.' }
+    $dayAmount = 0D
+    foreach ($row in $dayRows) {
+        $dayAmount += ConvertTo-G2dDecimal $row.purchase_amount_proxy 'overview.purchase_amount_proxy'
+    }
+    $fullAmount = ConvertTo-G2dDecimal `
+        $fullOverview.purchase_amount_proxy 'overview.purchase_amount_proxy'
+    if ($dayAmount -ne $fullAmount) {
+        throw 'DAY and FULL overview purchase amounts do not reconcile.'
+    }
 
+    $qualitySource = ConvertTo-G2dInt64 $fullQuality.source_event_count 'quality.source_event_count'
+    $qualityClean = ConvertTo-G2dInt64 $fullQuality.clean_event_count 'quality.clean_event_count'
+    $qualityLate = ConvertTo-G2dInt64 $fullQuality.late_event_count 'quality.late_event_count'
     $qualityDistinct = ConvertTo-G2dInt64 $fullQuality.distinct_event_count 'quality.distinct_event_count'
     $qualityDuplicateCount = ConvertTo-G2dInt64 $fullQuality.duplicate_event_count 'quality.duplicate_event_count'
-    if ($qualityDistinct -ne $fullEventCount -or $qualityDuplicateCount -ne 0) {
+    $qualityOverview = ConvertTo-G2dInt64 $fullQuality.overview_event_count 'quality.overview_event_count'
+    if ($qualitySource -ne $sourceCount -or $qualityOverview -ne $fullEventCount -or
+            $qualityDistinct -ne $sourceDistinct -or
+            $qualityDistinct + $qualityDuplicateCount -ne $qualitySource -or
+            $qualityDuplicateCount -ne 0) {
         throw 'Duplicate event IDs detected.'
     }
-    if ((ConvertTo-G2dInt64 $fullQuality.source_event_count 'quality.source_event_count') -ne $fullEventCount -or
-            (ConvertTo-G2dInt64 $fullQuality.overview_event_count 'quality.overview_event_count') -ne $fullEventCount) {
-        throw 'Quality totals do not reconcile.'
+    if ($qualityClean + $qualityLate -ne $qualitySource) {
+        throw 'Clean and late counts do not reconcile to the source total.'
     }
-    if ((ConvertTo-G2dInt64 $fullQuality.invalid_event_type_count 'quality.invalid_event_type_count') -ne 0) {
-        throw 'Invalid event types detected.'
+    Assert-G2dRateMatchesCounts $fullQuality.clean_event_rate $qualityClean $qualitySource `
+        'quality.clean_event_rate'
+    Assert-G2dRateMatchesCounts $fullQuality.late_event_rate $qualityLate $qualitySource `
+        'quality.late_event_rate'
+    foreach ($column in @(
+            'invalid_event_type_count', 'empty_key_id_count', 'invalid_price_count',
+            'invalid_derived_date_count')) {
+        if ((ConvertTo-G2dInt64 $fullQuality.$column "quality.$column") -ne 0) {
+            throw "Quality gate '$column' must be zero."
+        }
     }
     if ([string]$fullQuality.reconciliation_status -cne 'PASS') {
         throw "Quality reconciliation status must be 'PASS'."
+    }
+
+    $overviewWindowKeys = [string[]]@($Overview | ForEach-Object {
+        Get-G2dWindowKey $_ 'overview'
+    })
+    $funnelWindowKeys = [string[]]@($Funnel | ForEach-Object {
+        Get-G2dWindowKey $_ 'funnel'
+    })
+    Assert-G2dStringSetsEqual $overviewWindowKeys $funnelWindowKeys `
+        'Funnel windows must exactly match overview windows.'
+
+    $dayMissingSessionTotal = 0L
+    foreach ($funnelRow in $Funnel) {
+        $matchingOverview = @($Overview | Where-Object {
+            $_.window_type -ceq $funnelRow.window_type -and
+                $_.window_start -ceq $funnelRow.window_start -and
+                $_.window_end -ceq $funnelRow.window_end
+        })
+        if ($matchingOverview.Count -ne 1) {
+            throw 'Funnel window does not have exactly one overview row.'
+        }
+        $missing = ConvertTo-G2dInt64 `
+            $funnelRow.missing_session_event_count 'funnel.missing_session_event_count'
+        $eventCount = ConvertTo-G2dInt64 $matchingOverview[0].event_count 'overview.event_count'
+        $sessionCount = ConvertTo-G2dInt64 $matchingOverview[0].session_count 'overview.session_count'
+        $viewSessions = ConvertTo-G2dInt64 $funnelRow.view_sessions 'funnel.view_sessions'
+        if ($missing -gt $eventCount -or $viewSessions -gt $sessionCount) {
+            throw 'Funnel counts exceed their overview window bounds.'
+        }
+        if ([string]$funnelRow.window_type -ceq 'DAY') {
+            $dayMissingSessionTotal += $missing
+        }
+    }
+    $fullMissingSessionCount = ConvertTo-G2dInt64 `
+        $fullFunnel.missing_session_event_count 'funnel.missing_session_event_count'
+    $qualityMissingSessionCount = ConvertTo-G2dInt64 `
+        $fullQuality.missing_session_count 'quality.missing_session_count'
+    if ($dayMissingSessionTotal -ne $fullMissingSessionCount -or
+            $fullMissingSessionCount -ne $qualityMissingSessionCount) {
+        throw 'Missing-session totals do not reconcile across DAY, FULL, and quality.'
+    }
+
+    $dimensionTypes = @('product', 'category', 'brand')
+    foreach ($overviewRow in $Overview) {
+        foreach ($dimensionType in $dimensionTypes) {
+            $matchingDimensions = @($Dimension | Where-Object {
+                $_.window_type -ceq $overviewRow.window_type -and
+                    $_.window_start -ceq $overviewRow.window_start -and
+                    $_.window_end -ceq $overviewRow.window_end -and
+                    $_.dimension_type -ceq $dimensionType
+            })
+            if ($matchingDimensions.Count -eq 0) {
+                throw "Dimension '$dimensionType' does not cover an overview window."
+            }
+            foreach ($column in @('view_count', 'cart_count', 'purchase_count')) {
+                $dimensionTotal = 0L
+                foreach ($dimensionRow in $matchingDimensions) {
+                    $dimensionTotal += ConvertTo-G2dInt64 `
+                        $dimensionRow.$column "dimension.$column"
+                }
+                $overviewTotal = ConvertTo-G2dInt64 $overviewRow.$column "overview.$column"
+                if ($dimensionTotal -ne $overviewTotal) {
+                    throw "Dimension '$dimensionType' does not reconcile '$column'."
+                }
+            }
+            $dimensionAmount = 0D
+            foreach ($dimensionRow in $matchingDimensions) {
+                $dimensionAmount += ConvertTo-G2dDecimal `
+                    $dimensionRow.purchase_amount_proxy 'dimension.purchase_amount_proxy'
+            }
+            $overviewAmount = ConvertTo-G2dDecimal `
+                $overviewRow.purchase_amount_proxy 'overview.purchase_amount_proxy'
+            if ($dimensionAmount -ne $overviewAmount) {
+                throw "Dimension '$dimensionType' does not reconcile purchase amount."
+            }
+        }
+    }
+
+    foreach ($dimensionRow in $Dimension) {
+        $matchingOverview = @($Overview | Where-Object {
+            $_.window_type -ceq $dimensionRow.window_type -and
+                $_.window_start -ceq $dimensionRow.window_start -and
+                $_.window_end -ceq $dimensionRow.window_end
+        })
+        if ($matchingOverview.Count -ne 1) {
+            throw 'Dimension window does not have exactly one overview row.'
+        }
+    }
+
+    foreach ($dimensionType in $dimensionTypes) {
+        $dayDimensionRows = @($Dimension | Where-Object {
+            $_.window_type -ceq 'DAY' -and $_.dimension_type -ceq $dimensionType
+        })
+        $fullDimensionRows = @($Dimension | Where-Object {
+            $_.window_type -ceq 'FULL' -and $_.dimension_type -ceq $dimensionType
+        })
+        $dayIds = [string[]]@($dayDimensionRows | ForEach-Object { [string]$_.dimension_id })
+        $fullIds = [string[]]@($fullDimensionRows | ForEach-Object { [string]$_.dimension_id })
+        Assert-G2dStringSetsEqual $dayIds $fullIds `
+            "Dimension '$dimensionType' FULL identities must equal the DAY identity union."
+        foreach ($fullDimensionRow in $fullDimensionRows) {
+            $matchingDayRows = @($dayDimensionRows | Where-Object {
+                $_.dimension_id -ceq $fullDimensionRow.dimension_id
+            })
+            foreach ($column in @('view_count', 'cart_count', 'purchase_count')) {
+                $dayDimensionTotal = 0L
+                foreach ($dayDimensionRow in $matchingDayRows) {
+                    $dayDimensionTotal += ConvertTo-G2dInt64 `
+                        $dayDimensionRow.$column "dimension.$column"
+                }
+                $fullDimensionTotal = ConvertTo-G2dInt64 `
+                    $fullDimensionRow.$column "dimension.$column"
+                if ($dayDimensionTotal -ne $fullDimensionTotal) {
+                    throw "Dimension '$dimensionType' FULL '$column' does not equal DAY totals."
+                }
+            }
+            $dayDimensionAmount = 0D
+            foreach ($dayDimensionRow in $matchingDayRows) {
+                $dayDimensionAmount += ConvertTo-G2dDecimal `
+                    $dayDimensionRow.purchase_amount_proxy 'dimension.purchase_amount_proxy'
+            }
+            $fullDimensionAmount = ConvertTo-G2dDecimal `
+                $fullDimensionRow.purchase_amount_proxy 'dimension.purchase_amount_proxy'
+            if ($dayDimensionAmount -ne $fullDimensionAmount) {
+                throw "Dimension '$dimensionType' FULL amount does not equal DAY totals."
+            }
+        }
     }
 
     return [pscustomobject][ordered]@{

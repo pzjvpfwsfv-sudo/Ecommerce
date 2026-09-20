@@ -22,6 +22,7 @@ from app.behavior_models import (  # noqa: E402
     DimensionRanking,
     FunnelPoint,
     FunnelResponse,
+    MetricDefinition,
     MetricDefinitionsResponse,
     OverviewPoint,
     OverviewResponse,
@@ -370,6 +371,25 @@ class BehaviorModelsAndCatalogTests(unittest.TestCase):
 
         with self.assertRaises(ValidationError):
             MetricDefinitionCatalog.load(self._write_catalog(payload))
+
+    def test_metric_definition_rejects_blank_limitations_and_strips_valid_text(self):
+        payload = deepcopy(self.catalog_payload)
+        payload["definitions"][0]["limitations"] = ["   "]
+
+        with self.assertRaises(ValidationError):
+            MetricDefinitionCatalog.load(self._write_catalog(payload))
+
+        definition_payload = deepcopy(self.catalog_payload["definitions"][0])
+        definition_payload["limitations"] = ["  bounded evidence  "]
+        definition = MetricDefinition.model_validate(definition_payload)
+        response = MetricDefinitionsResponse(
+            domain="behavior",
+            dataset_id="rees46-multicategory",
+            metric_version="behavior-v1",
+            definitions=[definition],
+        )
+
+        self.assertEqual(["bounded evidence"], response.definitions[0].limitations)
 
     def test_catalog_rejects_missing_proxy_forbidden_claims(self):
         payload = deepcopy(self.catalog_payload)

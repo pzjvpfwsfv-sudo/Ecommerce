@@ -25,6 +25,415 @@ $script:G2dApiContracts = @(
     'GET /api/v1/behavior/quality',
     'GET /api/v1/metrics/definitions?domain=behavior&version=behavior-v1'
 )
+$script:G2dExpectedMetricNames = @(
+    'event_count', 'view_count', 'cart_count', 'purchase_count',
+    'unique_user_count', 'session_count', 'product_count', 'purchase_amount_proxy',
+    'view_sessions', 'view_to_cart_sessions', 'completed_sessions',
+    'view_to_cart_rate', 'cart_to_purchase_rate', 'full_conversion_rate',
+    'clean_event_count', 'late_event_count', 'distinct_event_count',
+    'duplicate_event_count', 'missing_session_count', 'unknown_category_count',
+    'unknown_brand_count', 'invalid_event_type_count', 'empty_key_id_count',
+    'invalid_price_count', 'invalid_derived_date_count'
+)
+
+function Get-G2dVerifierValue {
+    param(
+        [Parameter(Mandatory = $true)]$Object,
+        [Parameter(Mandatory = $true)][string]$Name
+    )
+
+    if ($Object -is [Collections.IDictionary]) {
+        if (-not $Object.Contains($Name)) { throw "G2-D API field '$Name' is missing." }
+        return $Object[$Name]
+    }
+    $property = $Object.PSObject.Properties[$Name]
+    if ($null -eq $property) { throw "G2-D API field '$Name' is missing." }
+    return $property.Value
+}
+
+function Assert-G2dVerifierProperties {
+    param(
+        [Parameter(Mandatory = $true)]$Object,
+        [Parameter(Mandatory = $true)][string[]]$Expected,
+        [Parameter(Mandatory = $true)][string]$Name
+    )
+
+    $actual = if ($Object -is [Collections.IDictionary]) {
+        @($Object.Keys | ForEach-Object { [string]$_ })
+    } else {
+        @($Object.PSObject.Properties.Name)
+    }
+    $actual = @($actual | Sort-Object -CaseSensitive)
+    $wanted = @($Expected | Sort-Object -CaseSensitive)
+    if (($actual -join "`u{001F}") -cne ($wanted -join "`u{001F}")) {
+        throw "G2-D API '$Name' fields do not match the public contract."
+    }
+}
+
+function ConvertTo-G2dVerifierDate {
+    param([Parameter(Mandatory = $true)]$Value)
+
+    if ($Value -is [datetime]) {
+        return $Value.ToString('yyyy-MM-dd', [Globalization.CultureInfo]::InvariantCulture)
+    }
+    $text = [Convert]::ToString($Value, [Globalization.CultureInfo]::InvariantCulture)
+    $parsed = [datetime]::MinValue
+    if (-not [datetime]::TryParseExact(
+            $text,
+            'yyyy-MM-dd',
+            [Globalization.CultureInfo]::InvariantCulture,
+            [Globalization.DateTimeStyles]::None,
+            [ref]$parsed)) {
+        throw 'G2-D API date is invalid.'
+    }
+    return $parsed.ToString('yyyy-MM-dd', [Globalization.CultureInfo]::InvariantCulture)
+}
+
+function ConvertTo-G2dVerifierTimestamp {
+    param([Parameter(Mandatory = $true)]$Value)
+
+    $text = [Convert]::ToString($Value, [Globalization.CultureInfo]::InvariantCulture)
+    $parsed = [datetimeoffset]::MinValue
+    if (-not [datetimeoffset]::TryParse(
+            $text,
+            [Globalization.CultureInfo]::InvariantCulture,
+            [Globalization.DateTimeStyles]::AssumeUniversal,
+            [ref]$parsed)) {
+        throw 'G2-D API timestamp is invalid.'
+    }
+    return $parsed.ToUniversalTime().ToString(
+        "yyyy-MM-dd'T'HH:mm:ss.fffffff'Z'",
+        [Globalization.CultureInfo]::InvariantCulture
+    )
+}
+
+function ConvertTo-G2dVerifierBoolean {
+    param([Parameter(Mandatory = $true)]$Value)
+
+    if ($Value -is [bool]) { return [bool]$Value }
+    $text = [Convert]::ToString($Value, [Globalization.CultureInfo]::InvariantCulture)
+    if ($text -ceq '1' -or $text -ceq 'true' -or $text -ceq 'True') { return $true }
+    if ($text -ceq '0' -or $text -ceq 'false' -or $text -ceq 'False') { return $false }
+    throw 'G2-D API boolean is invalid.'
+}
+
+function ConvertTo-G2dVerifierDecimal {
+    param(
+        [Parameter(Mandatory = $true)]$Value,
+        [Parameter(Mandatory = $true)][string]$Name
+    )
+
+    $parsed = 0D
+    $text = [Convert]::ToString($Value, [Globalization.CultureInfo]::InvariantCulture)
+    if (-not [decimal]::TryParse(
+            $text,
+            [Globalization.NumberStyles]::AllowDecimalPoint,
+            [Globalization.CultureInfo]::InvariantCulture,
+            [ref]$parsed) -or $parsed -lt 0) {
+        throw "G2-D $Name is not a nonnegative decimal."
+    }
+    return $parsed
+}
+
+function Format-G2dVerifierRate {
+    param(
+        [Parameter(Mandatory = $true)]$Numerator,
+        [Parameter(Mandatory = $true)]$Denominator
+    )
+
+    $numeratorValue = ConvertTo-G2dVerifierDecimal $Numerator 'rate numerator'
+    $denominatorValue = ConvertTo-G2dVerifierDecimal $Denominator 'rate denominator'
+    if ($denominatorValue -eq 0) { return $null }
+    return [Math]::Round(
+        ($numeratorValue / $denominatorValue),
+        6,
+        [MidpointRounding]::AwayFromZero
+    ).ToString('0.000000', [Globalization.CultureInfo]::InvariantCulture)
+}
+
+function Format-G2dVerifierStoredRate {
+    param([Parameter(Mandatory = $true)]$Value)
+
+    $parsed = ConvertTo-G2dVerifierDecimal $Value 'stored quality rate'
+    return [Math]::Round(
+        $parsed,
+        6,
+        [MidpointRounding]::AwayFromZero
+    ).ToString('0.000000', [Globalization.CultureInfo]::InvariantCulture)
+}
+
+function Assert-G2dVerifierFieldEqual {
+    param(
+        $Expected,
+        $Actual,
+        [Parameter(Mandatory = $true)][string]$Field,
+        [Parameter(Mandatory = $true)][string]$Family
+    )
+
+    if ($null -eq $Expected -or $null -eq $Actual) {
+        if ($null -ne $Expected -or $null -ne $Actual) {
+            throw "G2-D API '$Family' mismatch for '$Field'."
+        }
+        return
+    }
+    if ($Field -in @('window_start', 'window_end')) {
+        $equal = (ConvertTo-G2dVerifierDate $Expected) -ceq (ConvertTo-G2dVerifierDate $Actual)
+    } elseif ($Field -in @('calculated_at', 'published_at')) {
+        $equal = (ConvertTo-G2dVerifierTimestamp $Expected) -ceq
+            (ConvertTo-G2dVerifierTimestamp $Actual)
+    } elseif ($Field -ceq 'is_unknown') {
+        $equal = (ConvertTo-G2dVerifierBoolean $Expected) -eq
+            (ConvertTo-G2dVerifierBoolean $Actual)
+    } else {
+        $equal = [Convert]::ToString(
+            $Expected,
+            [Globalization.CultureInfo]::InvariantCulture
+        ) -ceq [Convert]::ToString(
+            $Actual,
+            [Globalization.CultureInfo]::InvariantCulture
+        )
+    }
+    if (-not $equal) { throw "G2-D API '$Family' mismatch for '$Field'." }
+}
+
+function Assert-G2dApiRowsEqual {
+    param(
+        [Parameter(Mandatory = $true)][object[]]$ExpectedRows,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$ActualRows,
+        [Parameter(Mandatory = $true)][string[]]$Fields,
+        [Parameter(Mandatory = $true)][string]$Family
+    )
+
+    if ($ExpectedRows.Count -ne $ActualRows.Count) {
+        throw "G2-D API '$Family' row count does not match Doris."
+    }
+    for ($index = 0; $index -lt $ExpectedRows.Count; $index++) {
+        Assert-G2dVerifierProperties $ActualRows[$index] $Fields "$Family row"
+        foreach ($field in $Fields) {
+            Assert-G2dVerifierFieldEqual `
+                (Get-G2dVerifierValue $ExpectedRows[$index] $field) `
+                (Get-G2dVerifierValue $ActualRows[$index] $field) $field $Family
+        }
+    }
+}
+
+function Assert-G2dApiMeta {
+    param(
+        [Parameter(Mandatory = $true)]$Meta,
+        [Parameter(Mandatory = $true)]$Identity,
+        [Parameter(Mandatory = $true)]$Publication,
+        [Parameter(Mandatory = $true)][string]$Name
+    )
+
+    $fields = @(
+        'dataset_id', 'metric_version', 'metric_run_id', 'source_snapshot_id',
+        'window_start', 'window_end', 'calculated_at', 'data_scope',
+        'source_event_count', 'warnings'
+    )
+    Assert-G2dVerifierProperties $Meta $fields "$Name meta"
+    $expected = [ordered]@{
+        dataset_id = [string]$Identity.DatasetId
+        metric_version = [string]$Identity.MetricVersion
+        metric_run_id = [string]$Identity.MetricRunId
+        source_snapshot_id = [string]$Identity.SourceSnapshotId
+        window_start = Get-G2dVerifierValue $Publication 'window_start'
+        window_end = Get-G2dVerifierValue $Publication 'window_end'
+        calculated_at = Get-G2dVerifierValue $Publication 'calculated_at'
+        data_scope = [string]$Identity.DataScope
+        source_event_count = [long]$Identity.SourceEventCount
+    }
+    foreach ($field in $expected.Keys) {
+        Assert-G2dVerifierFieldEqual $expected[$field] (Get-G2dVerifierValue $Meta $field) `
+            $field "$Name meta"
+    }
+    $warnings = @(Get-G2dVerifierValue $Meta 'warnings')
+    $expectedWarnings = if ([string]$Identity.DataScope -ceq 'g2c-correctness-subset') {
+        @($script:G2dSubsetWarning)
+    } else {
+        @()
+    }
+    if (($warnings -join "`u{001F}") -cne ($expectedWarnings -join "`u{001F}")) {
+        throw "G2-D API '$Name' warnings do not match its data scope."
+    }
+}
+
+function Assert-G2dDefinitionContracts {
+    param(
+        [Parameter(Mandatory = $true)]$Actual,
+        [Parameter(Mandatory = $true)]$Expected,
+        [Parameter(Mandatory = $true)]$Identity
+    )
+
+    $documentFields = @('domain', 'dataset_id', 'metric_version', 'definitions')
+    Assert-G2dVerifierProperties $Actual $documentFields 'definitions'
+    Assert-G2dVerifierProperties $Expected $documentFields 'expected definitions'
+    foreach ($field in @('domain', 'dataset_id', 'metric_version')) {
+        Assert-G2dVerifierFieldEqual (Get-G2dVerifierValue $Expected $field) `
+            (Get-G2dVerifierValue $Actual $field) $field 'definitions'
+    }
+    if ([string](Get-G2dVerifierValue $Actual 'domain') -cne 'behavior' -or
+            [string](Get-G2dVerifierValue $Actual 'dataset_id') -cne [string]$Identity.DatasetId -or
+            [string](Get-G2dVerifierValue $Actual 'metric_version') -cne [string]$Identity.MetricVersion) {
+        throw 'G2-D definitions API identity is invalid.'
+    }
+
+    $expectedDefinitions = @(Get-G2dVerifierValue $Expected 'definitions')
+    $actualDefinitions = @(Get-G2dVerifierValue $Actual 'definitions')
+    if ($expectedDefinitions.Count -ne $script:G2dExpectedMetricNames.Count -or
+            $actualDefinitions.Count -ne $script:G2dExpectedMetricNames.Count) {
+        throw 'G2-D definitions API must contain exactly 25 definitions.'
+    }
+    $definitionFields = @(
+        'metric_name', 'display_name', 'formula', 'numerator', 'denominator',
+        'source_fields', 'allowed_windows', 'additive', 'null_policy',
+        'limitations', 'forbidden_claims'
+    )
+    $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    for ($index = 0; $index -lt $expectedDefinitions.Count; $index++) {
+        $expectedDefinition = $expectedDefinitions[$index]
+        $actualDefinition = $actualDefinitions[$index]
+        Assert-G2dVerifierProperties $actualDefinition $definitionFields 'definition item'
+        Assert-G2dVerifierProperties $expectedDefinition $definitionFields 'expected definition item'
+        $name = [string](Get-G2dVerifierValue $actualDefinition 'metric_name')
+        if (-not $seen.Add($name) -or $name -cne $script:G2dExpectedMetricNames[$index]) {
+            throw 'G2-D definitions API metric identities are duplicated or out of order.'
+        }
+        foreach ($field in @(
+                'metric_name', 'display_name', 'formula', 'numerator', 'denominator',
+                'additive', 'null_policy')) {
+            Assert-G2dVerifierFieldEqual (Get-G2dVerifierValue $expectedDefinition $field) `
+                (Get-G2dVerifierValue $actualDefinition $field) $field 'definitions'
+        }
+        foreach ($field in @(
+                'source_fields', 'allowed_windows', 'limitations', 'forbidden_claims')) {
+            $expectedValues = @(Get-G2dVerifierValue $expectedDefinition $field)
+            $actualValues = @(Get-G2dVerifierValue $actualDefinition $field)
+            if (($expectedValues -join "`u{001F}") -cne ($actualValues -join "`u{001F}")) {
+                throw "G2-D definitions API mismatch for '$field'."
+            }
+        }
+        foreach ($limitation in @(Get-G2dVerifierValue $actualDefinition 'limitations')) {
+            if ([string]::IsNullOrWhiteSpace([string]$limitation)) {
+                throw 'G2-D definitions API contains a blank limitation.'
+            }
+        }
+    }
+}
+
+function Assert-G2dApiResponseContracts {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]$Identity,
+        [Parameter(Mandatory = $true)]$Publication,
+        [Parameter(Mandatory = $true)][object[]]$Overview,
+        [Parameter(Mandatory = $true)][object[]]$Funnel,
+        [Parameter(Mandatory = $true)][object[]]$Dimension,
+        [Parameter(Mandatory = $true)]$Quality,
+        [Parameter(Mandatory = $true)]$ApiPayloads,
+        [Parameter(Mandatory = $true)]$ExpectedDefinitions
+    )
+
+    foreach ($name in @('publication', 'overview', 'funnel', 'rankings', 'quality')) {
+        $payload = Get-G2dVerifierValue $ApiPayloads $name
+        Assert-G2dVerifierProperties $payload @('meta', 'data') $name
+        Assert-G2dApiMeta (Get-G2dVerifierValue $payload 'meta') $Identity $Publication $name
+    }
+
+    $publicationFields = @(
+        'published_at', 'overview_row_count', 'overview_sha256', 'funnel_row_count',
+        'funnel_sha256', 'dimension_row_count', 'dimension_sha256',
+        'quality_row_count', 'quality_sha256', 'status'
+    )
+    $apiPublication = Get-G2dVerifierValue `
+        (Get-G2dVerifierValue $ApiPayloads 'publication') 'data'
+    Assert-G2dVerifierProperties $apiPublication $publicationFields 'publication data'
+    foreach ($field in $publicationFields) {
+        Assert-G2dVerifierFieldEqual (Get-G2dVerifierValue $Publication $field) `
+            (Get-G2dVerifierValue $apiPublication $field) $field 'publication'
+    }
+
+    $overviewFields = @(
+        'window_type', 'window_start', 'window_end', 'event_count', 'view_count',
+        'cart_count', 'purchase_count', 'unique_user_count', 'session_count',
+        'product_count', 'purchase_amount_proxy'
+    )
+    $fullOverview = @($Overview | Where-Object { $_.window_type -ceq 'FULL' })
+    Assert-G2dApiRowsEqual $fullOverview `
+        @(Get-G2dVerifierValue (Get-G2dVerifierValue $ApiPayloads 'overview') 'data') `
+        $overviewFields 'overview'
+
+    $funnelFields = @(
+        'window_type', 'window_start', 'window_end', 'missing_session_event_count',
+        'view_sessions', 'view_to_cart_sessions', 'completed_sessions',
+        'view_to_cart_rate', 'cart_to_purchase_rate', 'full_conversion_rate'
+    )
+    $fullFunnelRows = @($Funnel | Where-Object { $_.window_type -ceq 'FULL' })
+    $expectedFunnel = foreach ($row in $fullFunnelRows) {
+        [pscustomobject][ordered]@{
+            window_type = $row.window_type
+            window_start = $row.window_start
+            window_end = $row.window_end
+            missing_session_event_count = $row.missing_session_event_count
+            view_sessions = $row.view_sessions
+            view_to_cart_sessions = $row.view_to_cart_sessions
+            completed_sessions = $row.completed_sessions
+            view_to_cart_rate = Format-G2dVerifierRate $row.view_to_cart_sessions $row.view_sessions
+            cart_to_purchase_rate = Format-G2dVerifierRate $row.completed_sessions $row.view_to_cart_sessions
+            full_conversion_rate = Format-G2dVerifierRate $row.completed_sessions $row.view_sessions
+        }
+    }
+    Assert-G2dApiRowsEqual @($expectedFunnel) `
+        @(Get-G2dVerifierValue (Get-G2dVerifierValue $ApiPayloads 'funnel') 'data') `
+        $funnelFields 'funnel'
+
+    $rankingFields = @(
+        'window_type', 'window_start', 'window_end', 'dimension_type', 'dimension_id',
+        'dimension_name', 'is_unknown', 'view_count', 'cart_count', 'purchase_count',
+        'unique_user_count', 'purchase_amount_proxy'
+    )
+    $expectedRankings = @(
+        $Dimension |
+            Where-Object { $_.window_type -ceq 'FULL' -and $_.dimension_type -ceq 'product' } |
+            Sort-Object `
+                @{ Expression = { [long]$_.purchase_count }; Descending = $true }, `
+                @{ Expression = { [string]$_.dimension_id }; Descending = $false }, `
+                @{ Expression = { [string]$_.window_start }; Descending = $false } |
+            Select-Object -First 20
+    )
+    Assert-G2dApiRowsEqual $expectedRankings `
+        @(Get-G2dVerifierValue (Get-G2dVerifierValue $ApiPayloads 'rankings') 'data') `
+        $rankingFields 'rankings'
+
+    $qualityFields = @(
+        'window_type', 'window_start', 'window_end', 'source_event_count',
+        'clean_event_count', 'late_event_count', 'clean_event_rate', 'late_event_rate',
+        'distinct_event_count', 'duplicate_event_count', 'missing_session_count',
+        'unknown_category_count', 'unknown_brand_count', 'invalid_event_type_count',
+        'empty_key_id_count', 'invalid_price_count', 'invalid_derived_date_count',
+        'overview_event_count', 'reconciliation_status'
+    )
+    $qualityRows = @($Quality)
+    if ($qualityRows.Count -ne 1) { throw 'G2-D quality truth must contain one row.' }
+    $qualityRow = $qualityRows[0]
+    $expectedQuality = [pscustomobject][ordered]@{}
+    foreach ($field in $qualityFields) {
+        $value = if ($field -ceq 'clean_event_rate') {
+            Format-G2dVerifierStoredRate $qualityRow.clean_event_rate
+        } elseif ($field -ceq 'late_event_rate') {
+            Format-G2dVerifierStoredRate $qualityRow.late_event_rate
+        } else {
+            Get-G2dVerifierValue $qualityRow $field
+        }
+        Add-Member -InputObject $expectedQuality -NotePropertyName $field -NotePropertyValue $value
+    }
+    Assert-G2dApiRowsEqual @($expectedQuality) `
+        @((Get-G2dVerifierValue (Get-G2dVerifierValue $ApiPayloads 'quality') 'data')) `
+        $qualityFields 'quality'
+
+    Assert-G2dDefinitionContracts `
+        (Get-G2dVerifierValue $ApiPayloads 'definitions') $ExpectedDefinitions $Identity
+    return @($script:G2dApiContracts)
+}
 
 function Assert-G2dVerificationEvidence {
     [CmdletBinding()]
@@ -300,97 +709,15 @@ LIMIT 1;
         })
     }
 
-    foreach ($name in @('publication', 'overview', 'funnel', 'rankings', 'quality')) {
-        $meta = $apiPayloads[$name].meta
-        $warnings = @($meta.warnings)
-        if ([string]$meta.dataset_id -cne [string]$identity.DatasetId -or
-                [string]$meta.metric_version -cne [string]$identity.MetricVersion -or
-                [string]$meta.metric_run_id -cne [string]$identity.MetricRunId -or
-                [string]$meta.source_snapshot_id -cne [string]$identity.SourceSnapshotId -or
-                [string]$meta.data_scope -cne [string]$identity.DataScope -or
-                [long]$meta.source_event_count -ne [long]$identity.SourceEventCount -or
-                $warnings.Count -ne 1 -or $warnings[0] -cne $script:G2dSubsetWarning) {
-            throw "G2-D API contract '$name' does not match the published identity."
-        }
-    }
-
-    $apiPublication = $apiPayloads.publication.data
-    if ([string]$apiPublication.status -cne 'PUBLISHED') {
-        throw 'G2-D publication API did not return PUBLISHED.'
-    }
-    foreach ($name in $script:G2dMetricTables) {
-        $countField = "${name}_row_count"
-        $hashField = "${name}_sha256"
-        if ([long]$apiPublication.$countField -ne [long]$publication.$countField -or
-                [string]$apiPublication.$hashField -cne [string]$publication.$hashField) {
-            throw "G2-D publication API evidence mismatch for '$name'."
-        }
-    }
-
-    $apiOverviewRows = @($apiPayloads.overview.data)
-    if ($apiOverviewRows.Count -ne 1) { throw 'G2-D FULL overview API must return one row.' }
-    $apiOverview = $apiOverviewRows[0]
-    foreach ($column in @(
-            'window_type', 'window_start', 'window_end', 'event_count', 'view_count',
-            'cart_count', 'purchase_count', 'unique_user_count', 'session_count',
-            'product_count', 'purchase_amount_proxy')) {
-        if ([string]$apiOverview.$column -cne [string]$fullOverview.$column) {
-            throw "G2-D overview API mismatch for '$column'."
-        }
-    }
-
-    $apiFunnelRows = @($apiPayloads.funnel.data)
-    if ($apiFunnelRows.Count -ne 1) { throw 'G2-D FULL funnel API must return one row.' }
-    $apiFunnel = $apiFunnelRows[0]
-    foreach ($column in @(
-            'window_type', 'window_start', 'window_end', 'missing_session_event_count',
-            'view_sessions', 'view_to_cart_sessions', 'completed_sessions')) {
-        if ([string]$apiFunnel.$column -cne [string]$fullFunnel.$column) {
-            throw "G2-D funnel API mismatch for '$column'."
-        }
-    }
-
-    $fullProducts = @(
-        $metricRows.dimension | Where-Object {
-            $_.window_type -ceq 'FULL' -and $_.dimension_type -ceq 'product'
-        }
-    )
-    $apiRankings = @($apiPayloads.rankings.data)
-    if ($apiRankings.Count -ne [Math]::Min(20, $fullProducts.Count)) {
-        throw 'G2-D rankings API returned an unexpected row count.'
-    }
-    foreach ($ranking in $apiRankings) {
-        $matches = @($fullProducts | Where-Object { $_.dimension_id -ceq $ranking.dimension_id })
-        if ($matches.Count -ne 1) { throw 'G2-D rankings API returned an unknown product.' }
-        foreach ($column in @(
-                'window_type', 'window_start', 'window_end', 'dimension_type', 'dimension_id',
-                'dimension_name', 'view_count', 'cart_count', 'purchase_count',
-                'unique_user_count', 'purchase_amount_proxy')) {
-            if ([string]$ranking.$column -cne [string]$matches[0].$column) {
-                throw "G2-D rankings API mismatch for '$column'."
-            }
-        }
-    }
-
-    $apiQuality = $apiPayloads.quality.data
-    foreach ($column in @(
-            'window_type', 'window_start', 'window_end', 'source_event_count',
-            'clean_event_count', 'late_event_count', 'distinct_event_count',
-            'duplicate_event_count', 'missing_session_count', 'unknown_category_count',
-            'unknown_brand_count', 'invalid_event_type_count', 'empty_key_id_count',
-            'invalid_price_count', 'invalid_derived_date_count', 'overview_event_count',
-            'reconciliation_status')) {
-        if ([string]$apiQuality.$column -cne [string]$quality.$column) {
-            throw "G2-D quality API mismatch for '$column'."
-        }
-    }
+    $definitionsPath = Join-Path $verifierProjectRoot 'configs/metrics/behavior-v1.json'
+    $expectedDefinitions = [IO.File]::ReadAllText($definitionsPath, [Text.Encoding]::UTF8) |
+        ConvertFrom-Json
+    $null = Assert-G2dApiResponseContracts -Identity $identity -Publication $publication `
+        -Overview $metricRows.overview -Funnel $metricRows.funnel `
+        -Dimension $metricRows.dimension -Quality $metricRows.quality `
+        -ApiPayloads $apiPayloads -ExpectedDefinitions $expectedDefinitions
 
     $definitions = $apiPayloads.definitions
-    if ([string]$definitions.domain -cne 'behavior' -or
-            [string]$definitions.dataset_id -cne [string]$identity.DatasetId -or
-            [string]$definitions.metric_version -cne [string]$identity.MetricVersion) {
-        throw 'G2-D definitions API identity is invalid.'
-    }
     $proxyDefinitions = @(
         $definitions.definitions | Where-Object { $_.metric_name -ceq 'purchase_amount_proxy' }
     )

@@ -6,6 +6,8 @@
 
 这是正确性验收，不是容量证据。1,002 条子集不是 2,199,938 条稳定用户 2% 全量样本，也不能用于推断吞吐、峰值延迟、长时稳定性或故障恢复容量。G2-D 据此关闭，下一阶段是 G2-E 独立 Olist 订单域。
 
+2026-09-21 最终加固后，上述 `PASS` 作为加固前的历史证据保留。SQL 已收紧维度 ID 编码、品类别名归并和派生日期一致性，verifier 已改为逐字段对照 API、Doris 与 25 项本地定义目录；由于这些更改可能改变同一 Snapshot 的候选摘要，本轮没有对既有 PUBLISHED run 执行 refresh、覆盖或重新发布。完成加固后的动态发布验收必须等待自然产生的新 Iceberg Snapshot。
+
 ## 执行命令
 
 当前 PowerShell 进程仅使用以下 Docker CLI 回退路径，Python 临时目录固定为 `D:\EcommerceDev\temp`：
@@ -87,6 +89,7 @@ definitions 公共契约实测：精确 query 返回 HTTP 200；缺少 `domain`�
 - verifier 输出位于被 Git 忽略的 `tmp/graduation/g2d/behavior-v1-s881836466779140976/verification.json`。
 - 验收故障对应的八项聚焦回归全部通过，耗时 `5.368 s`；G2-D/API 离线组合回归通过 `67` 项，耗时 `21.909 s`。
 - 最终完整回归 `python -m unittest discover -s tests -q` 通过 `552` 项，耗时 `302.152 s`。
+- 2026-09-21 最终加固复验：G2-D/API 聚焦回归通过 `73` 项，耗时 `16.414 s`；完整回归通过 `558` 项，耗时 `186.763 s`。Docker Desktop Linux engine 当时未运行，因此没有启动依赖、执行 refresh 或追加动态验收，只保留上述历史运行证据。
 
 ## 实际故障与恢复
 
@@ -103,4 +106,4 @@ Fix Round 1 只重启了挂载源码但未开启 reload 的 `ecom-api`，未重�
 
 ## 重跑边界
 
-重跑 refresh 会使用最新正 Snapshot 派生固定 run ID。已发布 run 必须在身份、四组行数和 SHA-256 全部一致时才可复用；未发布部分候选不删除，以新 attempt ID 继续并在发布前重算完整证据。verifier 只在所有断言通过后写入 `verification.json`，任何身份、计数、摘要、窗口、漏斗、API 警告或定义限制不一致都失败关闭。
+重跑 refresh 会使用最新正 Snapshot 派生固定 run ID。已发布 run 必须在身份、四组行数和 SHA-256 全部一致时才可复用；若 SQL 或规范更改可能使同一 run 的摘要变化，则禁止对该 Snapshot 执行 refresh，必须等待自然产生的新 Snapshot。未发布部分候选不删除，以新 attempt ID 继续并在发布前重算完整证据。verifier 只在所有断言通过后写入 `verification.json`；任何身份、逐字段指标值、计数、摘要、窗口、重算比率、排名顺序/唯一性、条件警告或 25 项定义目录不一致都失败关闭。有效的 `remove_from_cart` 会计入 `event_count`，但不会计入公开的 view/cart/purchase 三项，因此只禁止三项之和超过事件总数，不要求两者相等。
