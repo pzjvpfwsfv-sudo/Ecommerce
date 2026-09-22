@@ -1,0 +1,136 @@
+-- result:hard_gate
+WITH
+orders AS (SELECT * FROM lakehouse.olist.orders_src_v1 FOR VERSION AS OF __ORDERS_SRC_SNAPSHOT__),
+items AS (SELECT * FROM lakehouse.olist.order_items_src_v1 FOR VERSION AS OF __ORDER_ITEMS_SRC_SNAPSHOT__),
+payments AS (SELECT * FROM lakehouse.olist.order_payments_src_v1 FOR VERSION AS OF __ORDER_PAYMENTS_SRC_SNAPSHOT__),
+reviews AS (SELECT * FROM lakehouse.olist.order_reviews_src_v1 FOR VERSION AS OF __ORDER_REVIEWS_SRC_SNAPSHOT__),
+customers AS (SELECT * FROM lakehouse.olist.customers_src_v1 FOR VERSION AS OF __CUSTOMERS_SRC_SNAPSHOT__),
+products AS (SELECT * FROM lakehouse.olist.products_src_v1 FOR VERSION AS OF __PRODUCTS_SRC_SNAPSHOT__),
+sellers AS (SELECT * FROM lakehouse.olist.sellers_src_v1 FOR VERSION AS OF __SELLERS_SRC_SNAPSHOT__),
+geolocation AS (SELECT * FROM lakehouse.olist.geolocation_src_v1 FOR VERSION AS OF __GEOLOCATION_SRC_SNAPSHOT__),
+categories AS (SELECT * FROM lakehouse.olist.category_translation_src_v1 FOR VERSION AS OF __CATEGORY_TRANSLATION_SRC_SNAPSHOT__)
+SELECT
+    (SELECT count(*) FROM (SELECT order_id FROM orders GROUP BY order_id HAVING count(*) > 1)) AS duplicate_order_key_count,
+    (SELECT count(*) FROM (SELECT customer_id FROM customers GROUP BY customer_id HAVING count(*) > 1)) AS duplicate_customer_key_count,
+    (SELECT count(*) FROM (SELECT product_id FROM products GROUP BY product_id HAVING count(*) > 1)) AS duplicate_product_key_count,
+    (SELECT count(*) FROM (SELECT seller_id FROM sellers GROUP BY seller_id HAVING count(*) > 1)) AS duplicate_seller_key_count,
+    (SELECT count(*) FROM (SELECT product_category_name FROM categories GROUP BY product_category_name HAVING count(*) > 1)) AS duplicate_category_key_count,
+    (SELECT count(*) FROM (SELECT order_id, order_item_id FROM items GROUP BY order_id, order_item_id HAVING count(*) > 1)) AS duplicate_item_key_count,
+    (SELECT count(*) FROM (SELECT order_id, payment_sequential FROM payments GROUP BY order_id, payment_sequential HAVING count(*) > 1)) AS duplicate_payment_key_count,
+    (SELECT count(*) FROM orders o LEFT JOIN customers c ON o.customer_id = c.customer_id WHERE c.customer_id IS NULL) AS orphan_order_customer_count,
+    (SELECT count(*) FROM items i LEFT JOIN orders o ON i.order_id = o.order_id WHERE o.order_id IS NULL) AS orphan_item_order_count,
+    (SELECT count(*) FROM items i LEFT JOIN products p ON i.product_id = p.product_id WHERE p.product_id IS NULL) AS orphan_item_product_count,
+    (SELECT count(*) FROM items i LEFT JOIN sellers s ON i.seller_id = s.seller_id WHERE s.seller_id IS NULL) AS orphan_item_seller_count,
+    (SELECT count(*) FROM payments p LEFT JOIN orders o ON p.order_id = o.order_id WHERE o.order_id IS NULL) AS orphan_payment_order_count,
+    (SELECT count(*) FROM reviews r LEFT JOIN orders o ON r.order_id = o.order_id WHERE o.order_id IS NULL) AS orphan_review_order_count,
+    (
+        (SELECT count(*) FROM orders WHERE trim(order_id) = '' OR trim(customer_id) = '')
+        + (SELECT count(*) FROM customers WHERE trim(customer_id) = '' OR trim(customer_unique_id) = '')
+        + (SELECT count(*) FROM products WHERE trim(product_id) = '')
+        + (SELECT count(*) FROM sellers WHERE trim(seller_id) = '')
+        + (SELECT count(*) FROM categories WHERE trim(product_category_name) = '')
+        + (SELECT count(*) FROM items WHERE trim(order_id) = '' OR trim(product_id) = '' OR trim(seller_id) = '')
+        + (SELECT count(*) FROM payments WHERE trim(order_id) = '')
+        + (SELECT count(*) FROM reviews WHERE trim(order_id) = '')
+    ) AS blank_required_id_count,
+    (
+        SELECT count(*) FROM (
+            SELECT source_bundle_sha256 FROM orders UNION ALL
+            SELECT source_bundle_sha256 FROM items UNION ALL
+            SELECT source_bundle_sha256 FROM payments UNION ALL
+            SELECT source_bundle_sha256 FROM reviews UNION ALL
+            SELECT source_bundle_sha256 FROM customers UNION ALL
+            SELECT source_bundle_sha256 FROM products UNION ALL
+            SELECT source_bundle_sha256 FROM sellers UNION ALL
+            SELECT source_bundle_sha256 FROM geolocation UNION ALL
+            SELECT source_bundle_sha256 FROM categories
+        ) bundles WHERE source_bundle_sha256 <> '__SOURCE_BUNDLE_SHA256__'
+    ) AS mixed_bundle_table_count,
+    (
+        (SELECT count(*) FROM items WHERE price < DECIMAL '0.00' OR freight_value < DECIMAL '0.00')
+        + (SELECT count(*) FROM payments WHERE payment_value < DECIMAL '0.00')
+    ) AS negative_amount_count,
+    (SELECT count(*) FROM orders WHERE order_purchase_timestamp IS NULL) AS invalid_purchase_time_count,
+    CAST(0 AS bigint) AS invalid_optional_time_count;
+
+-- result:reportable_quality
+WITH
+orders AS (SELECT * FROM lakehouse.olist.orders_src_v1 FOR VERSION AS OF __ORDERS_SRC_SNAPSHOT__ WHERE source_bundle_sha256 = '__SOURCE_BUNDLE_SHA256__'),
+items AS (SELECT * FROM lakehouse.olist.order_items_src_v1 FOR VERSION AS OF __ORDER_ITEMS_SRC_SNAPSHOT__ WHERE source_bundle_sha256 = '__SOURCE_BUNDLE_SHA256__'),
+payments AS (SELECT * FROM lakehouse.olist.order_payments_src_v1 FOR VERSION AS OF __ORDER_PAYMENTS_SRC_SNAPSHOT__ WHERE source_bundle_sha256 = '__SOURCE_BUNDLE_SHA256__'),
+reviews AS (SELECT * FROM lakehouse.olist.order_reviews_src_v1 FOR VERSION AS OF __ORDER_REVIEWS_SRC_SNAPSHOT__ WHERE source_bundle_sha256 = '__SOURCE_BUNDLE_SHA256__'),
+products AS (SELECT * FROM lakehouse.olist.products_src_v1 FOR VERSION AS OF __PRODUCTS_SRC_SNAPSHOT__ WHERE source_bundle_sha256 = '__SOURCE_BUNDLE_SHA256__'),
+categories AS (SELECT * FROM lakehouse.olist.category_translation_src_v1 FOR VERSION AS OF __CATEGORY_TRANSLATION_SRC_SNAPSHOT__ WHERE source_bundle_sha256 = '__SOURCE_BUNDLE_SHA256__'),
+item_totals AS (SELECT order_id, sum(price + freight_value) AS item_total FROM items GROUP BY order_id),
+payment_totals AS (SELECT order_id, sum(payment_value) AS payment_total FROM payments GROUP BY order_id)
+SELECT
+    (SELECT count(*) FROM (SELECT review_id FROM reviews WHERE review_id IS NOT NULL GROUP BY review_id HAVING count(*) > 1)) AS duplicate_review_id_count,
+    (SELECT count(*) FROM orders WHERE order_status NOT IN ('created', 'approved', 'invoiced', 'processing', 'shipped', 'delivered', 'unavailable', 'canceled')) AS unknown_order_status_count,
+    (SELECT count(*) FROM payments WHERE payment_type NOT IN ('credit_card', 'boleto', 'voucher', 'debit_card', 'not_defined')) AS unknown_payment_type_count,
+    (SELECT count(*) FROM products WHERE product_category_name IS NULL) AS missing_product_category_count,
+    (SELECT count(*) FROM products p LEFT JOIN categories c ON p.product_category_name = c.product_category_name WHERE p.product_category_name IS NOT NULL AND c.product_category_name IS NULL) AS missing_category_translation_count,
+    (SELECT count(*) FROM (SELECT order_id FROM reviews GROUP BY order_id HAVING count(*) > 1)) AS multi_review_order_count,
+    (SELECT count(*) FROM orders WHERE order_approved_at IS NULL OR order_delivered_carrier_date IS NULL OR order_delivered_customer_date IS NULL OR order_estimated_delivery_date IS NULL) AS missing_optional_time_count,
+    (SELECT count(*) FROM orders WHERE (order_approved_at IS NOT NULL AND order_approved_at < order_purchase_timestamp) OR (order_delivered_carrier_date IS NOT NULL AND order_approved_at IS NOT NULL AND order_delivered_carrier_date < order_approved_at) OR (order_delivered_customer_date IS NOT NULL AND order_delivered_carrier_date IS NOT NULL AND order_delivered_customer_date < order_delivered_carrier_date)) AS lifecycle_order_anomaly_count,
+    (SELECT count(*) FROM item_totals i JOIN payment_totals p ON i.order_id = p.order_id WHERE i.item_total <> p.payment_total) AS payment_item_total_mismatch_count;
+
+-- result:grain_reconciliation
+SELECT
+    (SELECT count(*) FROM lakehouse.olist.customers_src_v1 FOR VERSION AS OF __CUSTOMERS_SRC_SNAPSHOT__) AS customer_dim_expected_count,
+    (SELECT count(*) FROM lakehouse.olist.customer_dim_v1 FOR VERSION AS OF __CUSTOMER_DIM_SNAPSHOT__) AS customer_dim_row_count,
+    (SELECT count(DISTINCT customer_id) FROM lakehouse.olist.customer_dim_v1 FOR VERSION AS OF __CUSTOMER_DIM_SNAPSHOT__) AS customer_dim_distinct_key_count,
+    (SELECT count(*) FROM lakehouse.olist.category_translation_src_v1 FOR VERSION AS OF __CATEGORY_TRANSLATION_SRC_SNAPSHOT__) AS category_dim_expected_count,
+    (SELECT count(*) FROM lakehouse.olist.category_dim_v1 FOR VERSION AS OF __CATEGORY_DIM_SNAPSHOT__) AS category_dim_row_count,
+    (SELECT count(DISTINCT product_category_name) FROM lakehouse.olist.category_dim_v1 FOR VERSION AS OF __CATEGORY_DIM_SNAPSHOT__) AS category_dim_distinct_key_count,
+    (SELECT count(*) FROM lakehouse.olist.products_src_v1 FOR VERSION AS OF __PRODUCTS_SRC_SNAPSHOT__) AS product_dim_expected_count,
+    (SELECT count(*) FROM lakehouse.olist.product_dim_v1 FOR VERSION AS OF __PRODUCT_DIM_SNAPSHOT__) AS product_dim_row_count,
+    (SELECT count(DISTINCT product_id) FROM lakehouse.olist.product_dim_v1 FOR VERSION AS OF __PRODUCT_DIM_SNAPSHOT__) AS product_dim_distinct_key_count,
+    (SELECT count(*) FROM lakehouse.olist.sellers_src_v1 FOR VERSION AS OF __SELLERS_SRC_SNAPSHOT__) AS seller_dim_expected_count,
+    (SELECT count(*) FROM lakehouse.olist.seller_dim_v1 FOR VERSION AS OF __SELLER_DIM_SNAPSHOT__) AS seller_dim_row_count,
+    (SELECT count(DISTINCT seller_id) FROM lakehouse.olist.seller_dim_v1 FOR VERSION AS OF __SELLER_DIM_SNAPSHOT__) AS seller_dim_distinct_key_count,
+    (SELECT count(DISTINCT geolocation_zip_code_prefix) FROM lakehouse.olist.geolocation_src_v1 FOR VERSION AS OF __GEOLOCATION_SRC_SNAPSHOT__) AS geolocation_dim_expected_count,
+    (SELECT count(*) FROM lakehouse.olist.geolocation_dim_v1 FOR VERSION AS OF __GEOLOCATION_DIM_SNAPSHOT__) AS geolocation_dim_row_count,
+    (SELECT count(DISTINCT geolocation_zip_code_prefix) FROM lakehouse.olist.geolocation_dim_v1 FOR VERSION AS OF __GEOLOCATION_DIM_SNAPSHOT__) AS geolocation_dim_distinct_key_count,
+    (SELECT count(*) FROM lakehouse.olist.orders_src_v1 FOR VERSION AS OF __ORDERS_SRC_SNAPSHOT__) AS order_fact_expected_count,
+    (SELECT count(*) FROM lakehouse.olist.order_fact_v1 FOR VERSION AS OF __ORDER_FACT_SNAPSHOT__) AS order_fact_row_count,
+    (SELECT count(DISTINCT order_id) FROM lakehouse.olist.order_fact_v1 FOR VERSION AS OF __ORDER_FACT_SNAPSHOT__) AS order_fact_distinct_key_count,
+    (SELECT count(*) FROM lakehouse.olist.order_items_src_v1 FOR VERSION AS OF __ORDER_ITEMS_SRC_SNAPSHOT__) AS order_item_fact_expected_count,
+    (SELECT count(*) FROM lakehouse.olist.order_item_fact_v1 FOR VERSION AS OF __ORDER_ITEM_FACT_SNAPSHOT__) AS order_item_fact_row_count,
+    (SELECT count(DISTINCT ROW(order_id, order_item_id)) FROM lakehouse.olist.order_item_fact_v1 FOR VERSION AS OF __ORDER_ITEM_FACT_SNAPSHOT__) AS order_item_fact_distinct_key_count,
+    (SELECT count(*) FROM lakehouse.olist.order_payments_src_v1 FOR VERSION AS OF __ORDER_PAYMENTS_SRC_SNAPSHOT__) AS payment_fact_expected_count,
+    (SELECT count(*) FROM lakehouse.olist.payment_fact_v1 FOR VERSION AS OF __PAYMENT_FACT_SNAPSHOT__) AS payment_fact_row_count,
+    (SELECT count(DISTINCT ROW(order_id, payment_sequential)) FROM lakehouse.olist.payment_fact_v1 FOR VERSION AS OF __PAYMENT_FACT_SNAPSHOT__) AS payment_fact_distinct_key_count,
+    (SELECT count(*) FROM lakehouse.olist.order_reviews_src_v1 FOR VERSION AS OF __ORDER_REVIEWS_SRC_SNAPSHOT__) AS review_fact_expected_count,
+    (SELECT count(*) FROM lakehouse.olist.review_fact_v1 FOR VERSION AS OF __REVIEW_FACT_SNAPSHOT__) AS review_fact_row_count,
+    (SELECT count(DISTINCT source_row_id) FROM lakehouse.olist.review_fact_v1 FOR VERSION AS OF __REVIEW_FACT_SNAPSHOT__) AS review_fact_distinct_key_count;
+
+-- result:anti_fanout
+SELECT
+    (SELECT count(*) FROM lakehouse.olist.orders_src_v1 FOR VERSION AS OF __ORDERS_SRC_SNAPSHOT__) AS source_order_count,
+    (SELECT count(*) FROM lakehouse.olist.order_fact_v1 FOR VERSION AS OF __ORDER_FACT_SNAPSHOT__) AS fact_order_count,
+    (SELECT count(*) FROM lakehouse.olist.order_items_src_v1 FOR VERSION AS OF __ORDER_ITEMS_SRC_SNAPSHOT__) AS source_item_count,
+    (SELECT count(*) FROM lakehouse.olist.order_item_fact_v1 FOR VERSION AS OF __ORDER_ITEM_FACT_SNAPSHOT__) AS fact_item_count,
+    (SELECT count(*) FROM lakehouse.olist.order_payments_src_v1 FOR VERSION AS OF __ORDER_PAYMENTS_SRC_SNAPSHOT__) AS source_payment_count,
+    (SELECT count(*) FROM lakehouse.olist.payment_fact_v1 FOR VERSION AS OF __PAYMENT_FACT_SNAPSHOT__) AS fact_payment_count,
+    (SELECT count(*) FROM lakehouse.olist.order_reviews_src_v1 FOR VERSION AS OF __ORDER_REVIEWS_SRC_SNAPSHOT__) AS source_review_count,
+    (SELECT count(*) FROM lakehouse.olist.review_fact_v1 FOR VERSION AS OF __REVIEW_FACT_SNAPSHOT__) AS fact_review_count,
+    (SELECT coalesce(sum(price), DECIMAL '0.00') FROM lakehouse.olist.order_items_src_v1 FOR VERSION AS OF __ORDER_ITEMS_SRC_SNAPSHOT__) AS source_item_value_sum,
+    (SELECT coalesce(sum(item_value), DECIMAL '0.00') FROM lakehouse.olist.order_item_fact_v1 FOR VERSION AS OF __ORDER_ITEM_FACT_SNAPSHOT__) AS fact_item_value_sum,
+    (SELECT coalesce(sum(freight_value), DECIMAL '0.00') FROM lakehouse.olist.order_items_src_v1 FOR VERSION AS OF __ORDER_ITEMS_SRC_SNAPSHOT__) AS source_freight_value_sum,
+    (SELECT coalesce(sum(freight_value), DECIMAL '0.00') FROM lakehouse.olist.order_item_fact_v1 FOR VERSION AS OF __ORDER_ITEM_FACT_SNAPSHOT__) AS fact_freight_value_sum,
+    (SELECT coalesce(sum(payment_value), DECIMAL '0.00') FROM lakehouse.olist.order_payments_src_v1 FOR VERSION AS OF __ORDER_PAYMENTS_SRC_SNAPSHOT__) AS source_payment_value_sum,
+    (SELECT coalesce(sum(payment_value), DECIMAL '0.00') FROM lakehouse.olist.payment_fact_v1 FOR VERSION AS OF __PAYMENT_FACT_SNAPSHOT__) AS fact_payment_value_sum;
+
+-- result:snapshot_identity
+SELECT
+    '__SOURCE_BUNDLE_SHA256__' AS source_bundle_sha256,
+    '__SOURCE_SNAPSHOT_SET_SHA256__' AS source_snapshot_set_sha256,
+    json_format(CAST(map(
+        ARRAY['category_translation_src_v1','customers_src_v1','geolocation_src_v1','order_items_src_v1','order_payments_src_v1','order_reviews_src_v1','orders_src_v1','products_src_v1','sellers_src_v1'],
+        ARRAY[CAST(__CATEGORY_TRANSLATION_SRC_SNAPSHOT__ AS varchar),CAST(__CUSTOMERS_SRC_SNAPSHOT__ AS varchar),CAST(__GEOLOCATION_SRC_SNAPSHOT__ AS varchar),CAST(__ORDER_ITEMS_SRC_SNAPSHOT__ AS varchar),CAST(__ORDER_PAYMENTS_SRC_SNAPSHOT__ AS varchar),CAST(__ORDER_REVIEWS_SRC_SNAPSHOT__ AS varchar),CAST(__ORDERS_SRC_SNAPSHOT__ AS varchar),CAST(__PRODUCTS_SRC_SNAPSHOT__ AS varchar),CAST(__SELLERS_SRC_SNAPSHOT__ AS varchar)]
+    ) AS json)) AS source_snapshots_json,
+    json_format(CAST(map(
+        ARRAY['category_dim_v1','customer_dim_v1','geolocation_dim_v1','order_fact_v1','order_item_fact_v1','payment_fact_v1','product_dim_v1','review_fact_v1','seller_dim_v1'],
+        ARRAY[CAST(__CATEGORY_DIM_SNAPSHOT__ AS varchar),CAST(__CUSTOMER_DIM_SNAPSHOT__ AS varchar),CAST(__GEOLOCATION_DIM_SNAPSHOT__ AS varchar),CAST(__ORDER_FACT_SNAPSHOT__ AS varchar),CAST(__ORDER_ITEM_FACT_SNAPSHOT__ AS varchar),CAST(__PAYMENT_FACT_SNAPSHOT__ AS varchar),CAST(__PRODUCT_DIM_SNAPSHOT__ AS varchar),CAST(__REVIEW_FACT_SNAPSHOT__ AS varchar),CAST(__SELLER_DIM_SNAPSHOT__ AS varchar)]
+    ) AS json)) AS curated_snapshots_json,
+    (SELECT lower(to_hex(sha256(to_utf8(array_join(array_agg(source_row_id ORDER BY source_row_number), chr(10)) || chr(10))))) FROM lakehouse.olist.orders_src_v1 FOR VERSION AS OF __ORDERS_SRC_SNAPSHOT__) AS orders_source_row_id_sequence_sha256;

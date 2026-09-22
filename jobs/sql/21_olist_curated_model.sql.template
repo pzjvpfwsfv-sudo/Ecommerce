@@ -1,0 +1,188 @@
+-- stage:customer_dim
+CREATE TABLE IF NOT EXISTS lakehouse.olist.customer_dim_v1 AS
+SELECT
+    customer_id,
+    customer_unique_id,
+    customer_zip_code_prefix,
+    customer_city,
+    customer_state,
+    source_bundle_sha256,
+    '__SOURCE_SNAPSHOT_SET_SHA256__' AS source_snapshot_set_sha256
+FROM lakehouse.olist.customers_src_v1 FOR VERSION AS OF __CUSTOMERS_SRC_SNAPSHOT__
+WHERE source_bundle_sha256 = '__SOURCE_BUNDLE_SHA256__';
+
+-- stage:category_dim
+CREATE TABLE IF NOT EXISTS lakehouse.olist.category_dim_v1 AS
+SELECT
+    product_category_name,
+    product_category_name_english,
+    false AS is_translation_unknown,
+    source_bundle_sha256,
+    '__SOURCE_SNAPSHOT_SET_SHA256__' AS source_snapshot_set_sha256
+FROM lakehouse.olist.category_translation_src_v1 FOR VERSION AS OF __CATEGORY_TRANSLATION_SRC_SNAPSHOT__
+WHERE source_bundle_sha256 = '__SOURCE_BUNDLE_SHA256__';
+
+-- stage:product_dim
+CREATE TABLE IF NOT EXISTS lakehouse.olist.product_dim_v1 AS
+SELECT
+    p.product_id,
+    p.product_category_name,
+    c.product_category_name_english,
+    p.product_name_lenght,
+    p.product_description_lenght,
+    p.product_photos_qty,
+    p.product_weight_g,
+    p.product_length_cm,
+    p.product_height_cm,
+    p.product_width_cm,
+    p.product_category_name IS NULL AS is_category_unknown,
+    p.product_category_name IS NOT NULL AND c.product_category_name IS NULL AS is_translation_unknown,
+    p.source_bundle_sha256,
+    '__SOURCE_SNAPSHOT_SET_SHA256__' AS source_snapshot_set_sha256
+FROM lakehouse.olist.products_src_v1 FOR VERSION AS OF __PRODUCTS_SRC_SNAPSHOT__ AS p
+LEFT JOIN lakehouse.olist.category_dim_v1 FOR VERSION AS OF __CATEGORY_DIM_SNAPSHOT__ AS c
+  ON p.product_category_name = c.product_category_name
+WHERE p.source_bundle_sha256 = '__SOURCE_BUNDLE_SHA256__';
+
+-- stage:seller_dim
+CREATE TABLE IF NOT EXISTS lakehouse.olist.seller_dim_v1 AS
+SELECT
+    seller_id,
+    seller_zip_code_prefix,
+    seller_city,
+    seller_state,
+    source_bundle_sha256,
+    '__SOURCE_SNAPSHOT_SET_SHA256__' AS source_snapshot_set_sha256
+FROM lakehouse.olist.sellers_src_v1 FOR VERSION AS OF __SELLERS_SRC_SNAPSHOT__
+WHERE source_bundle_sha256 = '__SOURCE_BUNDLE_SHA256__';
+
+-- stage:geolocation_dim
+CREATE TABLE IF NOT EXISTS lakehouse.olist.geolocation_dim_v1 AS
+WITH city_state_counts AS (
+    SELECT
+        geolocation_zip_code_prefix,
+        geolocation_city,
+        geolocation_state,
+        count(*) AS city_state_count
+    FROM lakehouse.olist.geolocation_src_v1 FOR VERSION AS OF __GEOLOCATION_SRC_SNAPSHOT__
+    WHERE source_bundle_sha256 = '__SOURCE_BUNDLE_SHA256__'
+    GROUP BY geolocation_zip_code_prefix, geolocation_city, geolocation_state
+), ranked_city_state AS (
+    SELECT
+        geolocation_zip_code_prefix,
+        geolocation_city,
+        geolocation_state,
+        row_number() OVER (
+            PARTITION BY geolocation_zip_code_prefix
+            ORDER BY city_state_count DESC, geolocation_city, geolocation_state
+        ) AS representative_rank
+    FROM city_state_counts
+), coordinate_summary AS (
+    SELECT
+        geolocation_zip_code_prefix,
+        avg(geolocation_lat) AS aggregate_center_lat,
+        avg(geolocation_lng) AS aggregate_center_lng,
+        count(*) AS source_point_count,
+        count(DISTINCT geolocation_city) AS city_variant_count,
+        count(DISTINCT geolocation_state) AS state_variant_count,
+        min(source_bundle_sha256) AS source_bundle_sha256
+    FROM lakehouse.olist.geolocation_src_v1 FOR VERSION AS OF __GEOLOCATION_SRC_SNAPSHOT__
+    WHERE source_bundle_sha256 = '__SOURCE_BUNDLE_SHA256__'
+    GROUP BY geolocation_zip_code_prefix
+)
+SELECT
+    s.geolocation_zip_code_prefix,
+    s.aggregate_center_lat,
+    s.aggregate_center_lng,
+    s.source_point_count,
+    s.city_variant_count,
+    s.state_variant_count,
+    r.geolocation_city AS representative_city,
+    r.geolocation_state AS representative_state,
+    s.source_bundle_sha256,
+    '__SOURCE_SNAPSHOT_SET_SHA256__' AS source_snapshot_set_sha256
+FROM coordinate_summary AS s
+JOIN ranked_city_state AS r
+  ON s.geolocation_zip_code_prefix = r.geolocation_zip_code_prefix
+ AND r.representative_rank = 1;
+
+-- stage:order_fact
+CREATE TABLE IF NOT EXISTS lakehouse.olist.order_fact_v1 AS
+SELECT
+    o.order_id,
+    o.customer_id,
+    c.customer_unique_id,
+    c.customer_zip_code_prefix,
+    c.customer_city,
+    c.customer_state,
+    o.order_status,
+    o.order_purchase_timestamp,
+    o.order_approved_at,
+    o.order_delivered_carrier_date,
+    o.order_delivered_customer_date,
+    o.order_estimated_delivery_date,
+    CAST(o.order_purchase_timestamp AS date) AS purchase_date,
+    date_trunc('month', o.order_purchase_timestamp) AS purchase_month,
+    o.order_status IN ('created', 'approved', 'invoiced', 'processing', 'shipped', 'delivered', 'unavailable', 'canceled') AS is_known_status,
+    o.order_status = 'delivered' AS is_delivered,
+    (
+        (o.order_approved_at IS NULL OR o.order_approved_at >= o.order_purchase_timestamp)
+        AND (o.order_delivered_carrier_date IS NULL OR o.order_approved_at IS NULL OR o.order_delivered_carrier_date >= o.order_approved_at)
+        AND (o.order_delivered_customer_date IS NULL OR o.order_delivered_carrier_date IS NULL OR o.order_delivered_customer_date >= o.order_delivered_carrier_date)
+    ) AS is_lifecycle_order_valid,
+    o.source_bundle_sha256,
+    '__SOURCE_SNAPSHOT_SET_SHA256__' AS source_snapshot_set_sha256
+FROM lakehouse.olist.orders_src_v1 FOR VERSION AS OF __ORDERS_SRC_SNAPSHOT__ AS o
+JOIN lakehouse.olist.customer_dim_v1 FOR VERSION AS OF __CUSTOMER_DIM_SNAPSHOT__ AS c
+  ON o.customer_id = c.customer_id
+WHERE o.source_bundle_sha256 = '__SOURCE_BUNDLE_SHA256__';
+
+-- stage:order_item_fact
+CREATE TABLE IF NOT EXISTS lakehouse.olist.order_item_fact_v1 AS
+SELECT
+    i.order_id,
+    i.order_item_id,
+    i.product_id,
+    i.seller_id,
+    p.product_category_name,
+    p.product_category_name_english,
+    p.is_category_unknown,
+    p.is_translation_unknown,
+    i.shipping_limit_date,
+    i.price AS item_value,
+    i.freight_value,
+    i.source_bundle_sha256,
+    '__SOURCE_SNAPSHOT_SET_SHA256__' AS source_snapshot_set_sha256
+FROM lakehouse.olist.order_items_src_v1 FOR VERSION AS OF __ORDER_ITEMS_SRC_SNAPSHOT__ AS i
+JOIN lakehouse.olist.product_dim_v1 FOR VERSION AS OF __PRODUCT_DIM_SNAPSHOT__ AS p
+  ON i.product_id = p.product_id
+WHERE i.source_bundle_sha256 = '__SOURCE_BUNDLE_SHA256__';
+
+-- stage:payment_fact
+CREATE TABLE IF NOT EXISTS lakehouse.olist.payment_fact_v1 AS
+SELECT
+    order_id,
+    payment_sequential,
+    payment_type,
+    payment_installments,
+    payment_value,
+    payment_type IN ('credit_card', 'boleto', 'voucher', 'debit_card', 'not_defined') AS is_known_payment_type,
+    source_bundle_sha256,
+    '__SOURCE_SNAPSHOT_SET_SHA256__' AS source_snapshot_set_sha256
+FROM lakehouse.olist.order_payments_src_v1 FOR VERSION AS OF __ORDER_PAYMENTS_SRC_SNAPSHOT__
+WHERE source_bundle_sha256 = '__SOURCE_BUNDLE_SHA256__';
+
+-- stage:review_fact
+CREATE TABLE IF NOT EXISTS lakehouse.olist.review_fact_v1 AS
+SELECT
+    source_row_id,
+    review_id,
+    order_id,
+    review_score,
+    review_creation_date,
+    review_answer_timestamp,
+    review_score BETWEEN 1 AND 5 AS valid_review_score,
+    source_bundle_sha256,
+    '__SOURCE_SNAPSHOT_SET_SHA256__' AS source_snapshot_set_sha256
+FROM lakehouse.olist.order_reviews_src_v1 FOR VERSION AS OF __ORDER_REVIEWS_SRC_SNAPSHOT__
+WHERE source_bundle_sha256 = '__SOURCE_BUNDLE_SHA256__';
