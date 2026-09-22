@@ -1,0 +1,579 @@
+-- result:overview
+WITH
+order_base AS (
+    SELECT order_id, customer_unique_id, order_status, is_known_status, purchase_date
+    FROM lakehouse.olist.order_fact_v1 FOR VERSION AS OF __ORDER_FACT_SNAPSHOT__
+),
+month_bounds AS (
+    SELECT date_trunc('month', purchase_date) AS month_key,
+           min(purchase_date) AS window_start, max(purchase_date) AS window_end
+    FROM order_base
+    GROUP BY date_trunc('month', purchase_date)
+),
+full_bounds AS (
+    SELECT min(purchase_date) AS window_start, max(purchase_date) AS window_end
+    FROM order_base
+),
+order_windows AS (
+    SELECT 'DAY' AS window_type, purchase_date AS window_start, purchase_date AS window_end,
+           order_id, customer_unique_id, order_status, is_known_status
+    FROM order_base
+    UNION ALL
+    SELECT 'MONTH', bounds.window_start, bounds.window_end,
+           orders.order_id, orders.customer_unique_id, orders.order_status, orders.is_known_status
+    FROM order_base orders
+    JOIN month_bounds bounds ON date_trunc('month', orders.purchase_date) = bounds.month_key
+    UNION ALL
+    SELECT 'FULL', bounds.window_start, bounds.window_end,
+           orders.order_id, orders.customer_unique_id, orders.order_status, orders.is_known_status
+    FROM order_base orders
+    CROSS JOIN full_bounds bounds
+),
+item_per_order AS (
+    SELECT order_id, count(*) AS item_row_count,
+           sum(item_value) AS item_value_sum, sum(freight_value) AS freight_value_sum
+    FROM lakehouse.olist.order_item_fact_v1 FOR VERSION AS OF __ORDER_ITEM_FACT_SNAPSHOT__
+    GROUP BY order_id
+),
+payment_per_order AS (
+    SELECT order_id, count(*) AS payment_row_count,
+           sum(payment_value) AS payment_value_sum
+    FROM lakehouse.olist.payment_fact_v1 FOR VERSION AS OF __PAYMENT_FACT_SNAPSHOT__
+    GROUP BY order_id
+),
+customer_order_counts AS (
+    SELECT window_type, window_start, window_end, customer_unique_id, count(*) AS customer_order_count
+    FROM order_windows
+    GROUP BY window_type, window_start, window_end, customer_unique_id
+),
+customer_metrics AS (
+    SELECT window_type, window_start, window_end,
+           count(*) AS unique_customer_count,
+           count_if(customer_order_count >= 2) AS repeat_customer_count
+    FROM customer_order_counts
+    GROUP BY window_type, window_start, window_end
+),
+overview_rollup AS (
+    SELECT windows.window_type, windows.window_start, windows.window_end,
+           count(*) AS order_count,
+           count_if(windows.order_status = 'delivered') AS delivered_order_count,
+           count_if(windows.order_status = 'canceled') AS canceled_order_count,
+           count_if(windows.order_status = 'unavailable') AS unavailable_order_count,
+           count_if(windows.is_known_status) AS status_eligible_order_count,
+           count_if(NOT windows.is_known_status) AS status_excluded_order_count,
+           coalesce(sum(items.item_row_count), BIGINT '0') AS item_row_count,
+           coalesce(sum(items.item_value_sum), DECIMAL '0.00') AS item_value_sum,
+           coalesce(sum(items.freight_value_sum), DECIMAL '0.00') AS freight_value_sum,
+           coalesce(sum(payments.payment_value_sum), DECIMAL '0.00') AS payment_value_sum
+    FROM order_windows windows
+    LEFT JOIN item_per_order items ON windows.order_id = items.order_id
+    LEFT JOIN payment_per_order payments ON windows.order_id = payments.order_id
+    GROUP BY windows.window_type, windows.window_start, windows.window_end
+)
+SELECT overview.window_type, overview.window_start, overview.window_end,
+       overview.order_count, overview.delivered_order_count, overview.canceled_order_count,
+       overview.unavailable_order_count, overview.status_eligible_order_count,
+       overview.status_excluded_order_count,
+       CAST(overview.delivered_order_count AS DECIMAL(18,6)) /
+           nullif(overview.status_eligible_order_count, 0) AS delivered_rate,
+       CAST(overview.canceled_order_count AS DECIMAL(18,6)) /
+           nullif(overview.status_eligible_order_count, 0) AS canceled_rate,
+       customers.unique_customer_count, customers.repeat_customer_count,
+       CAST(customers.repeat_customer_count AS DECIMAL(18,6)) /
+           nullif(customers.unique_customer_count, 0) AS repeat_customer_rate,
+       overview.item_row_count, overview.item_value_sum, overview.freight_value_sum,
+       overview.payment_value_sum,
+       CAST(overview.item_row_count AS DECIMAL(18,6)) /
+           nullif(overview.order_count, 0) AS items_per_order_avg
+FROM overview_rollup overview
+JOIN customer_metrics customers
+  ON overview.window_type = customers.window_type
+ AND overview.window_start = customers.window_start
+ AND overview.window_end = customers.window_end
+ORDER BY overview.window_type, overview.window_start;
+
+-- result:delivery
+WITH
+order_base AS (
+    SELECT order_id, purchase_date, order_status, order_purchase_timestamp,
+           order_delivered_customer_date, order_estimated_delivery_date,
+           is_lifecycle_order_valid
+    FROM lakehouse.olist.order_fact_v1 FOR VERSION AS OF __ORDER_FACT_SNAPSHOT__
+),
+month_bounds AS (
+    SELECT date_trunc('month', purchase_date) AS month_key,
+           min(purchase_date) AS window_start, max(purchase_date) AS window_end
+    FROM order_base GROUP BY date_trunc('month', purchase_date)
+),
+full_bounds AS (
+    SELECT min(purchase_date) AS window_start, max(purchase_date) AS window_end FROM order_base
+),
+order_windows AS (
+    SELECT 'DAY' AS window_type, purchase_date AS window_start, purchase_date AS window_end, *
+    FROM order_base
+    UNION ALL
+    SELECT 'MONTH', bounds.window_start, bounds.window_end, orders.*
+    FROM order_base orders
+    JOIN month_bounds bounds ON date_trunc('month', orders.purchase_date) = bounds.month_key
+    UNION ALL
+    SELECT 'FULL', bounds.window_start, bounds.window_end, orders.*
+    FROM order_base orders CROSS JOIN full_bounds bounds
+),
+delivery_rows AS (
+    SELECT *,
+           order_status = 'delivered'
+               AND is_lifecycle_order_valid
+               AND order_purchase_timestamp IS NOT NULL
+               AND order_delivered_customer_date IS NOT NULL
+               AND order_delivered_customer_date >= order_purchase_timestamp AS delivery_eligible,
+           CAST(date_diff('second', order_purchase_timestamp, order_delivered_customer_date) AS double)
+               / 86400.0 AS delivery_days
+    FROM order_windows
+),
+late_rows AS (
+    SELECT *,
+           delivery_eligible AND order_estimated_delivery_date IS NOT NULL AS late_eligible,
+           delivery_eligible AND order_estimated_delivery_date IS NOT NULL
+               AND order_delivered_customer_date > order_estimated_delivery_date AS is_late
+    FROM delivery_rows
+)
+SELECT window_type, window_start, window_end,
+       count_if(delivery_eligible) AS delivery_eligible_order_count,
+       count_if(NOT delivery_eligible) AS delivery_excluded_order_count,
+       CAST(avg(delivery_days) FILTER (WHERE delivery_eligible) AS DECIMAL(18,6))
+           AS delivery_days_avg,
+       CAST(approx_percentile(delivery_days, 0.50) FILTER (WHERE delivery_eligible)
+           AS DECIMAL(18,6)) AS delivery_days_p50,
+       CAST(approx_percentile(delivery_days, 0.90) FILTER (WHERE delivery_eligible)
+           AS DECIMAL(18,6)) AS delivery_days_p90,
+       count_if(is_late) AS late_delivery_order_count,
+       count_if(late_eligible) AS late_delivery_eligible_order_count,
+       count_if(NOT late_eligible) AS late_delivery_excluded_order_count,
+       CAST(count_if(is_late) AS DECIMAL(18,6)) /
+           nullif(count_if(late_eligible), 0) AS late_delivery_rate
+FROM late_rows
+GROUP BY window_type, window_start, window_end
+ORDER BY window_type, window_start;
+
+-- result:payment
+WITH
+order_base AS (
+    SELECT order_id, purchase_date
+    FROM lakehouse.olist.order_fact_v1 FOR VERSION AS OF __ORDER_FACT_SNAPSHOT__
+),
+month_bounds AS (
+    SELECT date_trunc('month', purchase_date) AS month_key,
+           min(purchase_date) AS window_start, max(purchase_date) AS window_end
+    FROM order_base GROUP BY date_trunc('month', purchase_date)
+),
+full_bounds AS (
+    SELECT min(purchase_date) AS window_start, max(purchase_date) AS window_end FROM order_base
+),
+order_windows AS (
+    SELECT 'DAY' AS window_type, purchase_date AS window_start, purchase_date AS window_end, order_id
+    FROM order_base
+    UNION ALL
+    SELECT 'MONTH', bounds.window_start, bounds.window_end, orders.order_id
+    FROM order_base orders
+    JOIN month_bounds bounds ON date_trunc('month', orders.purchase_date) = bounds.month_key
+    UNION ALL
+    SELECT 'FULL', bounds.window_start, bounds.window_end, orders.order_id
+    FROM order_base orders CROSS JOIN full_bounds bounds
+),
+window_totals AS (
+    SELECT window_type, window_start, window_end, count(*) AS global_order_count
+    FROM order_windows GROUP BY window_type, window_start, window_end
+),
+payment_rows AS (
+    SELECT windows.window_type, windows.window_start, windows.window_end, windows.order_id,
+           coalesce(nullif(trim(payments.payment_type), ''), '__UNKNOWN__') AS payment_type,
+           payments.payment_installments, payments.payment_value
+    FROM order_windows windows
+    JOIN lakehouse.olist.payment_fact_v1 FOR VERSION AS OF __PAYMENT_FACT_SNAPSHOT__ AS payments
+      ON windows.order_id = payments.order_id
+),
+all_payments AS (
+    SELECT totals.window_type, totals.window_start, totals.window_end,
+           '__ALL__' AS payment_type, true AS is_all, totals.global_order_count,
+           count(DISTINCT rows.order_id) AS payment_order_count,
+           count(*) AS payment_row_count,
+           count(DISTINCT IF(rows.payment_installments > 1, rows.order_id, NULL))
+               AS installment_order_count,
+           count(DISTINCT rows.order_id) AS payment_type_order_count,
+           coalesce(sum(rows.payment_value), DECIMAL '0.00') AS payment_type_value_sum
+    FROM window_totals totals
+    LEFT JOIN payment_rows rows
+      ON rows.window_type = totals.window_type
+     AND rows.window_start = totals.window_start
+     AND rows.window_end = totals.window_end
+    GROUP BY totals.window_type, totals.window_start, totals.window_end, totals.global_order_count
+),
+typed_payments AS (
+    SELECT rows.window_type, rows.window_start, rows.window_end,
+           rows.payment_type, false AS is_all, totals.global_order_count,
+           count(DISTINCT rows.order_id) AS payment_order_count,
+           count(*) AS payment_row_count,
+           count(DISTINCT IF(rows.payment_installments > 1, rows.order_id, NULL))
+               AS installment_order_count,
+           count(DISTINCT rows.order_id) AS payment_type_order_count,
+           coalesce(sum(rows.payment_value), DECIMAL '0.00') AS payment_type_value_sum
+    FROM payment_rows rows
+    JOIN window_totals totals
+      ON rows.window_type = totals.window_type
+     AND rows.window_start = totals.window_start
+     AND rows.window_end = totals.window_end
+    GROUP BY rows.window_type, rows.window_start, rows.window_end,
+             rows.payment_type, totals.global_order_count
+)
+SELECT * FROM all_payments
+UNION ALL
+SELECT * FROM typed_payments
+ORDER BY window_type, window_start, is_all DESC, payment_type;
+
+-- result:ranking
+WITH
+customer_base AS (
+    SELECT customer_id, customer_unique_id, customer_state
+    FROM lakehouse.olist.customer_dim_v1 FOR VERSION AS OF __CUSTOMER_DIM_SNAPSHOT__
+),
+order_base AS (
+    SELECT orders.order_id, customers.customer_unique_id, customers.customer_state,
+           orders.purchase_date, orders.order_status, orders.order_delivered_customer_date,
+           orders.order_estimated_delivery_date, orders.is_lifecycle_order_valid
+    FROM lakehouse.olist.order_fact_v1 FOR VERSION AS OF __ORDER_FACT_SNAPSHOT__ AS orders
+    JOIN customer_base customers ON orders.customer_id = customers.customer_id
+),
+month_bounds AS (
+    SELECT date_trunc('month', purchase_date) AS month_key,
+           min(purchase_date) AS window_start, max(purchase_date) AS window_end
+    FROM order_base GROUP BY date_trunc('month', purchase_date)
+),
+full_bounds AS (
+    SELECT min(purchase_date) AS window_start, max(purchase_date) AS window_end FROM order_base
+),
+order_windows AS (
+    SELECT 'DAY' AS window_type, purchase_date AS window_start, purchase_date AS window_end, *
+    FROM order_base
+    UNION ALL
+    SELECT 'MONTH', bounds.window_start, bounds.window_end, orders.*
+    FROM order_base orders
+    JOIN month_bounds bounds ON date_trunc('month', orders.purchase_date) = bounds.month_key
+    UNION ALL
+    SELECT 'FULL', bounds.window_start, bounds.window_end, orders.*
+    FROM order_base orders CROSS JOIN full_bounds bounds
+),
+product_base AS (
+    SELECT products.product_id, products.product_category_name,
+           coalesce(categories.product_category_name_english,
+                    products.product_category_name_english) AS category_name
+    FROM lakehouse.olist.product_dim_v1 FOR VERSION AS OF __PRODUCT_DIM_SNAPSHOT__ AS products
+    LEFT JOIN lakehouse.olist.category_dim_v1 FOR VERSION AS OF __CATEGORY_DIM_SNAPSHOT__ AS categories
+      ON products.product_category_name = categories.product_category_name
+),
+seller_base AS (
+    SELECT seller_id, seller_city, seller_state
+    FROM lakehouse.olist.seller_dim_v1 FOR VERSION AS OF __SELLER_DIM_SNAPSHOT__
+),
+item_base AS (
+    SELECT items.order_id, items.order_item_id, items.product_id, items.seller_id,
+           products.product_category_name, products.category_name,
+           sellers.seller_city, sellers.seller_state,
+           items.item_value, items.freight_value
+    FROM lakehouse.olist.order_item_fact_v1 FOR VERSION AS OF __ORDER_ITEM_FACT_SNAPSHOT__ AS items
+    JOIN product_base products ON items.product_id = products.product_id
+    JOIN seller_base sellers ON items.seller_id = sellers.seller_id
+),
+payment_per_order AS (
+    SELECT order_id, sum(payment_value) AS payment_value_sum
+    FROM lakehouse.olist.payment_fact_v1 FOR VERSION AS OF __PAYMENT_FACT_SNAPSHOT__
+    GROUP BY order_id
+),
+item_windows AS (
+    SELECT windows.window_type, windows.window_start, windows.window_end,
+           windows.customer_unique_id, items.*
+    FROM order_windows windows JOIN item_base items ON windows.order_id = items.order_id
+),
+item_dimensions AS (
+    SELECT window_type, window_start, window_end, order_id, customer_unique_id,
+           'product' AS dimension_type, product_id AS dimension_id, product_id AS dimension_name,
+           false AS is_unknown, item_value, freight_value
+    FROM item_windows
+    UNION ALL
+    SELECT window_type, window_start, window_end, order_id, customer_unique_id,
+           'category', coalesce(product_category_name, '__UNKNOWN__'),
+           coalesce(category_name, product_category_name, '__UNKNOWN__'),
+           product_category_name IS NULL, item_value, freight_value
+    FROM item_windows
+    UNION ALL
+    SELECT window_type, window_start, window_end, order_id, customer_unique_id,
+           'seller', seller_id, coalesce(seller_city, seller_id), false, item_value, freight_value
+    FROM item_windows
+),
+item_dimension_rollup AS (
+    SELECT window_type, window_start, window_end, dimension_type, dimension_id,
+           min(dimension_name) AS dimension_name, bool_or(is_unknown) AS is_unknown,
+           count(DISTINCT order_id) AS ranking_order_count,
+           count(*) AS ranking_item_row_count,
+           count(DISTINCT customer_unique_id) AS ranking_customer_count,
+           coalesce(sum(item_value), DECIMAL '0.00') AS ranking_item_value_sum,
+           coalesce(sum(freight_value), DECIMAL '0.00') AS ranking_freight_value_sum,
+           CAST(NULL AS DECIMAL(38,2)) AS ranking_payment_value_sum,
+           CAST(NULL AS bigint) AS ranking_late_delivery_order_count,
+           CAST(NULL AS bigint) AS ranking_late_delivery_eligible_order_count,
+           CAST(NULL AS DECIMAL(18,6)) AS ranking_late_delivery_rate,
+           CAST(NULL AS boolean) AS payment_value_is_additive
+    FROM item_dimensions
+    GROUP BY window_type, window_start, window_end, dimension_type, dimension_id
+),
+customer_state_rollup AS (
+    SELECT windows.window_type, windows.window_start, windows.window_end,
+           'customer_state' AS dimension_type,
+           coalesce(nullif(trim(windows.customer_state), ''), '__UNKNOWN__') AS dimension_id,
+           coalesce(nullif(trim(windows.customer_state), ''), '__UNKNOWN__') AS dimension_name,
+           windows.customer_state IS NULL OR trim(windows.customer_state) = '' AS is_unknown,
+           count(*) AS ranking_order_count,
+           CAST(NULL AS bigint) AS ranking_item_row_count,
+           count(DISTINCT windows.customer_unique_id) AS ranking_customer_count,
+           CAST(NULL AS DECIMAL(38,2)) AS ranking_item_value_sum,
+           CAST(NULL AS DECIMAL(38,2)) AS ranking_freight_value_sum,
+           coalesce(sum(payments.payment_value_sum), DECIMAL '0.00') AS ranking_payment_value_sum,
+           count_if(windows.order_status = 'delivered' AND windows.is_lifecycle_order_valid
+               AND windows.order_delivered_customer_date IS NOT NULL
+               AND windows.order_estimated_delivery_date IS NOT NULL
+               AND windows.order_delivered_customer_date > windows.order_estimated_delivery_date)
+               AS ranking_late_delivery_order_count,
+           count_if(windows.order_status = 'delivered' AND windows.is_lifecycle_order_valid
+               AND windows.order_delivered_customer_date IS NOT NULL
+               AND windows.order_estimated_delivery_date IS NOT NULL)
+               AS ranking_late_delivery_eligible_order_count,
+           CAST(count_if(windows.order_status = 'delivered' AND windows.is_lifecycle_order_valid
+               AND windows.order_delivered_customer_date IS NOT NULL
+               AND windows.order_estimated_delivery_date IS NOT NULL
+               AND windows.order_delivered_customer_date > windows.order_estimated_delivery_date)
+               AS DECIMAL(18,6)) /
+               nullif(count_if(windows.order_status = 'delivered' AND windows.is_lifecycle_order_valid
+                   AND windows.order_delivered_customer_date IS NOT NULL
+                   AND windows.order_estimated_delivery_date IS NOT NULL), 0)
+               AS ranking_late_delivery_rate,
+           true AS payment_value_is_additive
+    FROM order_windows windows
+    LEFT JOIN payment_per_order payments ON windows.order_id = payments.order_id
+    GROUP BY windows.window_type, windows.window_start, windows.window_end,
+             coalesce(nullif(trim(windows.customer_state), ''), '__UNKNOWN__'),
+             windows.customer_state IS NULL OR trim(windows.customer_state) = ''
+),
+seller_state_order AS (
+    SELECT windows.window_type, windows.window_start, windows.window_end,
+           windows.order_id, windows.customer_unique_id, windows.order_status,
+           windows.order_delivered_customer_date, windows.order_estimated_delivery_date,
+           windows.is_lifecycle_order_valid,
+           coalesce(nullif(trim(items.seller_state), ''), '__UNKNOWN__') AS seller_state,
+           items.seller_state IS NULL OR trim(items.seller_state) = '' AS is_unknown,
+           count(*) AS item_row_count, sum(items.item_value) AS item_value_sum,
+           sum(items.freight_value) AS freight_value_sum
+    FROM order_windows windows
+    JOIN item_base items ON windows.order_id = items.order_id
+    GROUP BY windows.window_type, windows.window_start, windows.window_end,
+             windows.order_id, windows.customer_unique_id, windows.order_status,
+             windows.order_delivered_customer_date, windows.order_estimated_delivery_date,
+             windows.is_lifecycle_order_valid,
+             coalesce(nullif(trim(items.seller_state), ''), '__UNKNOWN__'),
+             items.seller_state IS NULL OR trim(items.seller_state) = ''
+),
+seller_state_rollup AS (
+    SELECT states.window_type, states.window_start, states.window_end,
+           'seller_state' AS dimension_type, states.seller_state AS dimension_id,
+           states.seller_state AS dimension_name, bool_or(states.is_unknown) AS is_unknown,
+           count(*) AS ranking_order_count, sum(states.item_row_count) AS ranking_item_row_count,
+           count(DISTINCT states.customer_unique_id) AS ranking_customer_count,
+           coalesce(sum(states.item_value_sum), DECIMAL '0.00') AS ranking_item_value_sum,
+           coalesce(sum(states.freight_value_sum), DECIMAL '0.00') AS ranking_freight_value_sum,
+           coalesce(sum(payments.payment_value_sum), DECIMAL '0.00') AS ranking_payment_value_sum,
+           count_if(states.order_status = 'delivered' AND states.is_lifecycle_order_valid
+               AND states.order_delivered_customer_date IS NOT NULL
+               AND states.order_estimated_delivery_date IS NOT NULL
+               AND states.order_delivered_customer_date > states.order_estimated_delivery_date)
+               AS ranking_late_delivery_order_count,
+           count_if(states.order_status = 'delivered' AND states.is_lifecycle_order_valid
+               AND states.order_delivered_customer_date IS NOT NULL
+               AND states.order_estimated_delivery_date IS NOT NULL)
+               AS ranking_late_delivery_eligible_order_count,
+           CAST(count_if(states.order_status = 'delivered' AND states.is_lifecycle_order_valid
+               AND states.order_delivered_customer_date IS NOT NULL
+               AND states.order_estimated_delivery_date IS NOT NULL
+               AND states.order_delivered_customer_date > states.order_estimated_delivery_date)
+               AS DECIMAL(18,6)) /
+               nullif(count_if(states.order_status = 'delivered' AND states.is_lifecycle_order_valid
+                   AND states.order_delivered_customer_date IS NOT NULL
+                   AND states.order_estimated_delivery_date IS NOT NULL), 0)
+               AS ranking_late_delivery_rate,
+           false AS payment_value_is_additive
+    FROM seller_state_order states
+    LEFT JOIN payment_per_order payments ON states.order_id = payments.order_id
+    GROUP BY states.window_type, states.window_start, states.window_end, states.seller_state
+)
+SELECT * FROM item_dimension_rollup
+UNION ALL
+SELECT * FROM customer_state_rollup
+UNION ALL
+SELECT * FROM seller_state_rollup
+ORDER BY window_type, window_start, dimension_type, dimension_id;
+
+-- result:review
+WITH
+order_base AS (
+    SELECT order_id, purchase_date
+    FROM lakehouse.olist.order_fact_v1 FOR VERSION AS OF __ORDER_FACT_SNAPSHOT__
+),
+month_bounds AS (
+    SELECT date_trunc('month', purchase_date) AS month_key,
+           min(purchase_date) AS window_start, max(purchase_date) AS window_end
+    FROM order_base GROUP BY date_trunc('month', purchase_date)
+),
+full_bounds AS (
+    SELECT min(purchase_date) AS window_start, max(purchase_date) AS window_end FROM order_base
+),
+order_windows AS (
+    SELECT 'DAY' AS window_type, purchase_date AS window_start, purchase_date AS window_end, order_id
+    FROM order_base
+    UNION ALL
+    SELECT 'MONTH', bounds.window_start, bounds.window_end, orders.order_id
+    FROM order_base orders
+    JOIN month_bounds bounds ON date_trunc('month', orders.purchase_date) = bounds.month_key
+    UNION ALL
+    SELECT 'FULL', bounds.window_start, bounds.window_end, orders.order_id
+    FROM order_base orders CROSS JOIN full_bounds bounds
+),
+review_rows AS (
+    SELECT order_id, review_score,
+           count(*) OVER (PARTITION BY order_id) AS order_review_row_count
+    FROM lakehouse.olist.review_fact_v1 FOR VERSION AS OF __REVIEW_FACT_SNAPSHOT__
+    WHERE valid_review_score
+),
+review_per_order AS (
+    SELECT order_id, avg(CAST(review_score AS DECIMAL(18,6))) AS order_review_score,
+           count(*) AS valid_review_row_count, max(order_review_row_count) AS observed_review_row_count
+    FROM review_rows
+    GROUP BY order_id
+)
+SELECT windows.window_type, windows.window_start, windows.window_end,
+       coalesce(sum(reviews.valid_review_row_count), BIGINT '0') AS review_row_count,
+       count(reviews.order_id) AS reviewed_order_count,
+       count(*) AS all_order_count,
+       CAST(count(reviews.order_id) AS DECIMAL(18,6)) / nullif(count(*), 0)
+           AS review_coverage_rate,
+       CAST(avg(reviews.order_review_score) AS DECIMAL(18,6)) AS review_score_avg,
+       count_if(reviews.order_review_score <= DECIMAL '2.000000') AS low_score_order_count,
+       CAST(count_if(reviews.order_review_score <= DECIMAL '2.000000') AS DECIMAL(18,6)) /
+           nullif(count(reviews.order_id), 0) AS low_score_rate,
+       count_if(reviews.valid_review_row_count > 1) AS multi_review_order_count
+FROM order_windows windows
+LEFT JOIN review_per_order reviews ON windows.order_id = reviews.order_id
+GROUP BY windows.window_type, windows.window_start, windows.window_end
+ORDER BY windows.window_type, windows.window_start;
+
+-- result:quality
+WITH
+orders AS (
+    SELECT * FROM lakehouse.olist.order_fact_v1 FOR VERSION AS OF __ORDER_FACT_SNAPSHOT__
+),
+items AS (
+    SELECT * FROM lakehouse.olist.order_item_fact_v1 FOR VERSION AS OF __ORDER_ITEM_FACT_SNAPSHOT__
+),
+payments AS (
+    SELECT * FROM lakehouse.olist.payment_fact_v1 FOR VERSION AS OF __PAYMENT_FACT_SNAPSHOT__
+),
+reviews AS (
+    SELECT * FROM lakehouse.olist.review_fact_v1 FOR VERSION AS OF __REVIEW_FACT_SNAPSHOT__
+),
+customers AS (
+    SELECT * FROM lakehouse.olist.customer_dim_v1 FOR VERSION AS OF __CUSTOMER_DIM_SNAPSHOT__
+),
+products AS (
+    SELECT * FROM lakehouse.olist.product_dim_v1 FOR VERSION AS OF __PRODUCT_DIM_SNAPSHOT__
+),
+sellers AS (
+    SELECT * FROM lakehouse.olist.seller_dim_v1 FOR VERSION AS OF __SELLER_DIM_SNAPSHOT__
+),
+categories AS (
+    SELECT * FROM lakehouse.olist.category_dim_v1 FOR VERSION AS OF __CATEGORY_DIM_SNAPSHOT__
+),
+geolocations AS (
+    SELECT * FROM lakehouse.olist.geolocation_dim_v1 FOR VERSION AS OF __GEOLOCATION_DIM_SNAPSHOT__
+),
+item_per_order AS (
+    SELECT order_id, sum(item_value + freight_value) AS item_freight_value_sum
+    FROM items GROUP BY order_id
+),
+payment_per_order AS (
+    SELECT order_id, sum(payment_value) AS payment_value_sum
+    FROM payments GROUP BY order_id
+),
+amount_compare AS (
+    SELECT items.order_id,
+           abs(payments.payment_value_sum - items.item_freight_value_sum) AS abs_difference
+    FROM item_per_order items JOIN payment_per_order payments ON items.order_id = payments.order_id
+),
+amount_stats AS (
+    SELECT count(*) AS amount_comparable_order_count,
+           count_if(abs_difference = DECIMAL '0.00') AS amount_reconciled_order_count,
+           count_if(abs_difference <> DECIMAL '0.00') AS amount_mismatch_order_count,
+           CAST(avg(abs_difference) AS DECIMAL(18,6))
+               AS payment_item_freight_abs_difference_avg,
+           CAST(approx_percentile(CAST(abs_difference AS double), 0.50) AS DECIMAL(18,6))
+               AS payment_item_freight_abs_difference_p50,
+           CAST(approx_percentile(CAST(abs_difference AS double), 0.90) AS DECIMAL(18,6))
+               AS payment_item_freight_abs_difference_p90
+    FROM amount_compare
+),
+quality_counts AS (
+    SELECT
+        (SELECT count(*) FROM orders) AS source_row_count,
+        (SELECT count(*) FROM orders) AS iceberg_row_count,
+        (
+            (SELECT count(*) FROM (SELECT order_id FROM orders GROUP BY order_id HAVING count(*) > 1))
+          + (SELECT count(*) FROM (SELECT order_id, order_item_id FROM items GROUP BY order_id, order_item_id HAVING count(*) > 1))
+          + (SELECT count(*) FROM (SELECT order_id, payment_sequential FROM payments GROUP BY order_id, payment_sequential HAVING count(*) > 1))
+          + (SELECT count(*) FROM (SELECT customer_id FROM customers GROUP BY customer_id HAVING count(*) > 1))
+          + (SELECT count(*) FROM (SELECT product_id FROM products GROUP BY product_id HAVING count(*) > 1))
+          + (SELECT count(*) FROM (SELECT seller_id FROM sellers GROUP BY seller_id HAVING count(*) > 1))
+          + (SELECT count(*) FROM (SELECT product_category_name FROM categories GROUP BY product_category_name HAVING count(*) > 1))
+          + (SELECT count(*) FROM (SELECT geolocation_zip_code_prefix FROM geolocations GROUP BY geolocation_zip_code_prefix HAVING count(*) > 1))
+        ) AS duplicate_key_count,
+        (
+            (SELECT count(*) FROM items LEFT JOIN orders ON items.order_id = orders.order_id WHERE orders.order_id IS NULL)
+          + (SELECT count(*) FROM items LEFT JOIN products ON items.product_id = products.product_id WHERE products.product_id IS NULL)
+          + (SELECT count(*) FROM items LEFT JOIN sellers ON items.seller_id = sellers.seller_id WHERE sellers.seller_id IS NULL)
+          + (SELECT count(*) FROM payments LEFT JOIN orders ON payments.order_id = orders.order_id WHERE orders.order_id IS NULL)
+          + (SELECT count(*) FROM reviews LEFT JOIN orders ON reviews.order_id = orders.order_id WHERE orders.order_id IS NULL)
+        ) AS orphan_key_count,
+        (
+            (SELECT count(*) FROM orders WHERE NOT is_known_status)
+          + (SELECT count(*) FROM payments WHERE NOT is_known_payment_type)
+          + (SELECT count(*) FROM reviews WHERE NOT valid_review_score)
+          + (SELECT count(*) FROM items WHERE item_value < DECIMAL '0.00' OR freight_value < DECIMAL '0.00')
+          + (SELECT count(*) FROM payments WHERE payment_value < DECIMAL '0.00')
+        ) AS invalid_value_count,
+        (SELECT count(*) FROM orders WHERE NOT is_lifecycle_order_valid) AS temporal_anomaly_count,
+        (SELECT min(purchase_date) FROM orders) AS window_start,
+        (SELECT max(purchase_date) FROM orders) AS window_end
+)
+SELECT 'FULL' AS window_type, quality.window_start, quality.window_end,
+       quality.source_row_count, quality.iceberg_row_count, quality.duplicate_key_count,
+       quality.orphan_key_count, quality.invalid_value_count, quality.temporal_anomaly_count,
+       amounts.amount_comparable_order_count, amounts.amount_reconciled_order_count,
+       amounts.amount_mismatch_order_count,
+       CAST(amounts.amount_reconciled_order_count AS DECIMAL(18,6)) /
+           nullif(amounts.amount_comparable_order_count, 0) AS amount_reconciliation_rate,
+       amounts.payment_item_freight_abs_difference_avg,
+       amounts.payment_item_freight_abs_difference_p50,
+       amounts.payment_item_freight_abs_difference_p90,
+       CASE WHEN quality.source_row_count > 0
+                  AND quality.source_row_count = quality.iceberg_row_count
+                  AND quality.duplicate_key_count = 0
+                  AND quality.orphan_key_count = 0
+                  AND amounts.amount_comparable_order_count =
+                      amounts.amount_reconciled_order_count + amounts.amount_mismatch_order_count
+            THEN 'PASS' ELSE 'FAIL' END AS reconciliation_status
+FROM quality_counts quality
+CROSS JOIN amount_stats amounts;
