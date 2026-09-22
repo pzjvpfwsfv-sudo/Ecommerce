@@ -7,6 +7,7 @@ from app.behavior_service import BehaviorMetricsService
 from app.config import ApiSettings
 from app.flink_quality_repository import FlinkQualityRepository
 from app.metric_definitions import MetricDefinitionCatalog
+from app.order_metric_definitions import OrderMetricDefinitionCatalog
 from app.readiness_service import ReadinessService
 from app.repository import RealtimeMetricsRepository
 from app.tool_analysis_service import ToolAnalysisService
@@ -47,6 +48,15 @@ def build_behavior_metrics_service(settings: ApiSettings) -> BehaviorMetricsServ
     catalog = MetricDefinitionCatalog.load(settings.behavior_metric_definitions_path)
     repository = BehaviorMetricsRepository.from_settings(settings)
     return BehaviorMetricsService(repository, catalog)
+
+
+def build_order_metrics_service(settings: ApiSettings):
+    from app.order_repository import OrderMetricsRepository
+    from app.order_service import OrderMetricsService
+
+    catalog = OrderMetricDefinitionCatalog.load(settings.order_metric_definitions_path)
+    repository = OrderMetricsRepository.from_settings(settings)
+    return OrderMetricsService(repository, catalog)
 
 
 def build_tool_analysis_service(

@@ -10,10 +10,18 @@ _CONFIG_PATH = Path(__file__).resolve()
 _DEFAULT_BEHAVIOR_METRIC_DEFINITIONS_PATH = (
     _CONFIG_PATH.parent.parent / "configs" / "metrics" / "behavior-v1.json"
 )
+_DEFAULT_ORDER_METRIC_DEFINITIONS_PATH = (
+    _CONFIG_PATH.parent.parent / "configs" / "metrics" / "orders-v1.json"
+)
 for _parent in _CONFIG_PATH.parents:
-    _candidate = _parent / "configs" / "metrics" / "behavior-v1.json"
-    if _candidate.is_file():
-        _DEFAULT_BEHAVIOR_METRIC_DEFINITIONS_PATH = _candidate
+    _metrics = _parent / "configs" / "metrics"
+    _behavior_candidate = _metrics / "behavior-v1.json"
+    _order_candidate = _metrics / "orders-v1.json"
+    if _behavior_candidate.is_file():
+        _DEFAULT_BEHAVIOR_METRIC_DEFINITIONS_PATH = _behavior_candidate
+    if _order_candidate.is_file():
+        _DEFAULT_ORDER_METRIC_DEFINITIONS_PATH = _order_candidate
+    if _behavior_candidate.is_file() and _order_candidate.is_file():
         break
 
 
@@ -44,6 +52,7 @@ class ApiSettings:
     ai_tool_total_timeout_seconds: float = 20
     ai_tool_max_event_types: int = 20
     behavior_metric_definitions_path: Path = _DEFAULT_BEHAVIOR_METRIC_DEFINITIONS_PATH
+    order_metric_definitions_path: Path = _DEFAULT_ORDER_METRIC_DEFINITIONS_PATH
 
     def __post_init__(self) -> None:
         raw_definitions_path = self.behavior_metric_definitions_path
@@ -53,6 +62,13 @@ class ApiSettings:
         if definitions_path == Path(""):
             raise ValueError("BEHAVIOR_METRIC_DEFINITIONS_PATH must not be empty")
         object.__setattr__(self, "behavior_metric_definitions_path", definitions_path)
+        raw_order_definitions_path = self.order_metric_definitions_path
+        if isinstance(raw_order_definitions_path, str) and not raw_order_definitions_path.strip():
+            raise ValueError("ORDER_METRIC_DEFINITIONS_PATH must not be empty")
+        order_definitions_path = Path(raw_order_definitions_path)
+        if order_definitions_path == Path(""):
+            raise ValueError("ORDER_METRIC_DEFINITIONS_PATH must not be empty")
+        object.__setattr__(self, "order_metric_definitions_path", order_definitions_path)
         if self.ai_tool_planner_mode not in {"rule_based", "openai_compatible"}:
             raise ValueError(f"unsupported AI_TOOL_PLANNER_MODE: {self.ai_tool_planner_mode}")
         if not 1 <= self.ai_tool_max_calls <= 3:
@@ -104,6 +120,12 @@ def load_settings(environ: Mapping[str, str] | None = None) -> ApiSettings:
             values.get(
                 "BEHAVIOR_METRIC_DEFINITIONS_PATH",
                 str(_DEFAULT_BEHAVIOR_METRIC_DEFINITIONS_PATH),
+            )
+        ),
+        order_metric_definitions_path=Path(
+            values.get(
+                "ORDER_METRIC_DEFINITIONS_PATH",
+                str(_DEFAULT_ORDER_METRIC_DEFINITIONS_PATH),
             )
         ),
     )
