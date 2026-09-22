@@ -180,6 +180,38 @@ function Test-Rejected([scriptblock]$Action) {
 '''
 
 
+REFRESH_POWERSHELL_FIXTURE = POWERSHELL_FIXTURE + r'''
+. (Resolve-Path './scripts/refresh_g2e_order_metrics.ps1') -FunctionsOnly
+
+function New-TestEvidence {
+    $result = [ordered]@{}; $index = 1
+    foreach ($name in @('overview','delivery','payment','ranking','review','quality')) {
+        $result[$name] = [pscustomobject][ordered]@{
+            RowCount = [long]$index
+            Sha256 = ([string]$index * 64)
+        }
+        $index++
+    }
+    return $result
+}
+
+function New-StoredOverviewRows {
+    $identity = New-Identity
+    return @([pscustomobject][ordered]@{
+        metric_run_id=$identity.MetricRunId; dataset_id=$identity.DatasetId
+        metric_version=$identity.MetricVersion; window_type='FULL'
+        window_start='2017-01-01'; window_end='2017-01-01'; order_count='2'
+        delivered_order_count='2'; canceled_order_count='0'; unavailable_order_count='0'
+        status_eligible_order_count='2'; status_excluded_order_count='0'
+        delivered_rate='1.000000'; canceled_rate='0.000000'; unique_customer_count='1'
+        repeat_customer_count='1'; repeat_customer_rate='1.000000'; item_row_count='2'
+        item_value_sum='30.00'; freight_value_sum='0.00'; payment_value_sum='35.00'
+        items_per_order_avg='1.000000'
+    })
+}
+'''
+
+
 class PowerShellTestCase(unittest.TestCase):
     def run_powershell(self, command: str, timeout: int = 30):
         executable = shutil.which("pwsh") or shutil.which("powershell")
@@ -544,6 +576,249 @@ $wrongSeller=@($ranking | ForEach-Object { $_.PSObject.Copy() }); ($wrongSeller 
         self.assertTrue(payload["inflated"] and payload["delivery_rollup"])
         self.assertTrue(payload["review_rollup"] and payload["duplicate"])
         self.assertTrue(payload["additive_seller"])
+
+
+class G2eRefreshTests(PowerShellTestCase):
+    def refresh_payload(self, body: str):
+        result = self.run_powershell(REFRESH_POWERSHELL_FIXTURE + body)
+        self.assertEqual(0, result.returncode, result.stderr or result.stdout)
+        return json.loads(result.stdout.strip().splitlines()[-1])
+
+    def test_refresh_plan_and_publication_sequence_are_fixed_and_fail_closed(self):
+        payload = self.refresh_payload(
+            r'''
+$identity = New-Identity
+$plan = @(Get-G2eRefreshPlan -MetricRunId $identity.MetricRunId)
+$events = [Collections.Generic.List[string]]::new()
+$verify = {
+    param($Name)
+    $events.Add($Name)
+    return [pscustomobject]@{ RowCount=1; Sha256=('a' * 64) }
+}
+$publish = { param($Evidence) $events.Add('publication'); return $Evidence }
+$null = Invoke-G2ePublicationSequence -VerifyAction $verify -PublishAction $publish
+$failures = [ordered]@{}
+foreach ($family in @('overview','delivery','payment','ranking','review','quality')) {
+    $failedFamily = $family
+    $seen = [Collections.Generic.List[string]]::new()
+    $verifyFailure = {
+        param($Name)
+        $seen.Add($Name)
+        if ($Name -ceq $failedFamily) { throw "simulated $Name failure" }
+        return [pscustomobject]@{ RowCount=1; Sha256=('b' * 64) }
+    }.GetNewClosure()
+    $publishFailure = { param($Evidence) $seen.Add('publication') }.GetNewClosure()
+    try {
+        $null = Invoke-G2ePublicationSequence -VerifyAction $verifyFailure `
+            -PublishAction $publishFailure
+    } catch {}
+    $failures[$family] = @($seen)
+}
+[ordered]@{
+    names=@($plan.Name); targets=@($plan.Target); success=@($events)
+    failures=$failures
+    unsafe=Test-Rejected { Get-G2eRefreshPlan -MetricRunId 'orders-v1-bad' }
+} | ConvertTo-Json -Depth 8 -Compress
+'''
+        )
+        expected = FAMILIES + ["publication"]
+        self.assertEqual(expected, payload["names"])
+        self.assertEqual(
+            [
+                "order_metric_overview", "order_metric_delivery", "order_metric_payment",
+                "order_metric_ranking", "order_metric_review", "order_metric_quality",
+                "order_metric_publications",
+            ],
+            payload["targets"],
+        )
+        self.assertEqual(expected, payload["success"])
+        for family, events in payload["failures"].items():
+            self.assertIn(family, events)
+            self.assertNotIn("publication", events)
+        self.assertTrue(payload["unsafe"])
+
+    def test_run_lock_is_exclusive_until_the_owner_releases_it(self):
+        with tempfile.TemporaryDirectory(dir=ROOT / "tmp") as temporary:
+            lock_path = str(Path(temporary) / ".refresh.lock").replace("'", "''")
+            payload = self.refresh_payload(
+                rf'''
+$path = '{lock_path}'
+$first = Enter-G2eRunLock -Path $path
+$blocked = Test-Rejected {{ Enter-G2eRunLock -Path $path }}
+$first.Dispose(); [IO.File]::Delete($path)
+$second = Enter-G2eRunLock -Path $path
+$reacquired = $null -ne $second
+$second.Dispose(); [IO.File]::Delete($path)
+[ordered]@{{ blocked=$blocked; reacquired=$reacquired }} | ConvertTo-Json -Compress
+'''
+            )
+            self.assertTrue(payload["blocked"])
+            self.assertTrue(payload["reacquired"])
+
+    def test_candidate_readback_and_stream_load_response_are_exact(self):
+        payload = self.refresh_payload(
+            r'''
+$identity = New-Identity
+$candidate = @(New-StoredOverviewRows)
+$stored = @($candidate | ForEach-Object { $_.PSObject.Copy() })
+$evidence = Assert-G2eStoredCandidate -Family overview -Identity $identity `
+    -CandidateRows $candidate -StoredRows $stored
+$changed = @($stored | ForEach-Object { $_.PSObject.Copy() }); $changed[0].order_count='3'
+$wrongIdentity = @($stored | ForEach-Object { $_.PSObject.Copy() }); $wrongIdentity[0].metric_run_id='orders-v1-bwrong'
+$success = [pscustomobject]@{ Status='Success'; NumberLoadedRows=1; NumberFilteredRows=0 }
+[ordered]@{
+    rows=$evidence.RowCount; hash=$evidence.Sha256
+    changed=Test-Rejected { Assert-G2eStoredCandidate -Family overview -Identity $identity -CandidateRows $candidate -StoredRows $changed }
+    identity=Test-Rejected { Assert-G2eStoredCandidate -Family overview -Identity $identity -CandidateRows $candidate -StoredRows $wrongIdentity }
+    stream_ok=(-not (Test-Rejected { Assert-G2eStreamLoadResponse -Response $success -ExpectedRows 1 -TableName 'order_metric_overview' }))
+    filtered=Test-Rejected { Assert-G2eStreamLoadResponse -Response ([pscustomobject]@{ Status='Success'; NumberLoadedRows=1; NumberFilteredRows=1 }) -ExpectedRows 1 -TableName 'order_metric_overview' }
+    short=Test-Rejected { Assert-G2eStreamLoadResponse -Response ([pscustomobject]@{ Status='Success'; NumberLoadedRows=0; NumberFilteredRows=0 }) -ExpectedRows 1 -TableName 'order_metric_overview' }
+} | ConvertTo-Json -Compress
+'''
+        )
+        self.assertEqual(1, payload["rows"])
+        self.assertRegex(payload["hash"], r"^[0-9a-f]{64}$")
+        self.assertTrue(payload["changed"] and payload["identity"])
+        self.assertTrue(payload["stream_ok"] and payload["filtered"] and payload["short"])
+
+    def test_unpublished_partial_candidates_require_exact_evidence(self):
+        payload = self.refresh_payload(
+            r'''
+$expected = New-TestEvidence
+$partial = [ordered]@{}
+foreach ($name in @('overview','delivery','payment','ranking','review','quality')) {
+    $partial[$name] = if ($name -in @('overview','payment')) { $expected[$name] } else { $null }
+}
+$state = Assert-G2eUnpublishedCandidateState -ExpectedEvidence $expected -StoredEvidence $partial
+$bad = [ordered]@{}; foreach ($name in $partial.Keys) { $bad[$name]=$partial[$name] }
+$bad.overview = [pscustomobject]@{ RowCount=1; Sha256=('f' * 64) }
+$unknown = [ordered]@{}; foreach ($name in $partial.Keys) { $unknown[$name]=$partial[$name] }; $unknown.other=$null
+[ordered]@{
+    status=$state.status; reuse=@($state.reuse); load=@($state.load)
+    mismatch=Test-Rejected { Assert-G2eUnpublishedCandidateState -ExpectedEvidence $expected -StoredEvidence $bad }
+    unknown=Test-Rejected { Assert-G2eUnpublishedCandidateState -ExpectedEvidence $expected -StoredEvidence $unknown }
+} | ConvertTo-Json -Compress
+'''
+        )
+        self.assertEqual("continue", payload["status"])
+        self.assertEqual(["overview", "payment"], payload["reuse"])
+        self.assertEqual(["delivery", "ranking", "review", "quality"], payload["load"])
+        self.assertTrue(payload["mismatch"] and payload["unknown"])
+
+    def test_publication_record_retry_and_insert_are_fail_closed(self):
+        payload = self.refresh_payload(
+            r'''
+$identity = New-Identity; $evidence = New-TestEvidence
+$record = New-G2ePublicationRecord -Identity $identity -Evidence $evidence `
+    -PublishedAt '2026-09-22T08:01:00Z'
+$candidates = [ordered]@{}
+foreach ($name in $evidence.Keys) {
+    $candidates[$name] = [pscustomobject]@{
+        RowCount=$evidence[$name].RowCount; CanonicalSha256=$evidence[$name].Sha256
+    }
+}
+$candidateRecord = New-G2ePublicationRecord -Identity $identity -Candidates $candidates `
+    -PublishedAt '2026-09-22T08:01:00Z'
+$already = Assert-G2eExistingPublication -Identity $identity -Publication $record `
+    -StoredEvidence $evidence
+$badHash = $record.PSObject.Copy(); $badHash.ranking_sha256=('f' * 64)
+$badRevision = $record.PSObject.Copy(); $badRevision.implementation_revision=('2' * 40)
+$badRange = $record.PSObject.Copy(); $badRange.window_end='2017-01-02'
+$sql = New-G2ePublicationInsertSql -Publication $record
+[ordered]@{
+    status=$already.status; publication_status=$record.status
+    candidates_alias=($candidateRecord.ranking_sha256 -ceq $record.ranking_sha256)
+    source_keys=@(($record.source_snapshots_json | ConvertFrom-Json).PSObject.Properties.Name)
+    curated_keys=@(($record.curated_snapshots_json | ConvertFrom-Json).PSObject.Properties.Name)
+    hash=Test-Rejected { Assert-G2eExistingPublication -Identity $identity -Publication $badHash -StoredEvidence $evidence }
+    revision=Test-Rejected { Assert-G2eExistingPublication -Identity $identity -Publication $badRevision -StoredEvidence $evidence }
+    range=Test-Rejected { Assert-G2eExistingPublication -Identity $identity -Publication $badRange -StoredEvidence $evidence }
+    insert=($sql -match '^INSERT INTO analytics\.order_metric_publications \(')
+    unsafe=($sql -match '(?im)\b(UPDATE|DELETE|DROP|TRUNCATE|REPLACE)\b')
+} | ConvertTo-Json -Depth 5 -Compress
+'''
+        )
+        self.assertEqual("already_published", payload["status"])
+        self.assertEqual("PUBLISHED", payload["publication_status"])
+        self.assertTrue(payload["candidates_alias"])
+        self.assertEqual(sorted(SOURCE_TABLES.values()), sorted(payload["source_keys"]))
+        self.assertEqual(sorted(CURATED_TABLES), sorted(payload["curated_keys"]))
+        self.assertTrue(payload["hash"] and payload["revision"] and payload["range"])
+        self.assertTrue(payload["insert"])
+        self.assertFalse(payload["unsafe"])
+
+    def test_metrics_paths_and_report_path_are_fixed_to_the_d_drive_workspace(self):
+        payload = self.refresh_payload(
+            r'''
+$paths = Get-G2eMetricsPaths -SourceBundleSha256 ('a' * 64)
+$accepted = Assert-G2eReportPath -SourceBundleSha256 ('a' * 64) -Path $paths.ReportPath
+[ordered]@{
+    directory=$paths.MetricsDirectory; report=$paths.ReportPath; accepted=$accepted
+    c_drive=Test-Rejected { Assert-G2eReportPath -SourceBundleSha256 ('a' * 64) -Path 'C:\temp\refresh.json' }
+    outside=Test-Rejected { Assert-G2eReportPath -SourceBundleSha256 ('a' * 64) -Path (Join-Path $script:G2eProjectRoot 'tmp\refresh.json') }
+    wrong_name=Test-Rejected { Assert-G2eReportPath -SourceBundleSha256 ('a' * 64) -Path (Join-Path $paths.MetricsDirectory 'other.json') }
+    unresolved=Test-Rejected { Assert-G2eRenderedMetricSql -Sql 'SELECT * FROM x FOR VERSION AS OF __ORDER_FACT_SNAPSHOT__;' }
+} | ConvertTo-Json -Compress
+'''
+        )
+        self.assertTrue(payload["directory"].lower().startswith("d:\\"))
+        self.assertTrue(payload["report"].endswith("metrics\\refresh.json"))
+        self.assertEqual(payload["report"].lower(), payload["accepted"].lower())
+        self.assertTrue(payload["c_drive"] and payload["outside"])
+        self.assertTrue(payload["wrong_name"] and payload["unresolved"])
+
+    def test_refresh_transport_is_fixed_strict_and_process_local(self):
+        script = (ROOT / "scripts/refresh_g2e_order_metrics.ps1").read_text(
+            encoding="utf-8"
+        )
+        for function_name in (
+            "Get-G2eRefreshPlan", "Enter-G2eRunLock", "Invoke-G2ePublicationSequence",
+            "New-G2ePublicationRecord", "Invoke-G2eRefresh",
+        ):
+            self.assertRegex(script, rf"(?m)^function {function_name} \{{$")
+        for required in (
+            "CSV_HEADER_UNQUOTED", "TERM=dumb", "Expect:100-continue",
+            "strict_mode:true", "max_filter_ratio:0", "skip_lines:1",
+            'enclose:"', "trim_double_quotes:true",
+        ):
+            self.assertIn(required, script)
+        self.assertNotIn("$env:PATH =", script)
+        self.assertNotIn("setx", script.lower())
+
+    def test_metric_output_rejects_physical_link_escape_when_supported(self):
+        payload = self.refresh_payload(
+            r'''
+$base = Join-Path ([IO.Path]::GetTempPath()) ('g2e-link-' + [guid]::NewGuid().ToString('N'))
+$project = Join-Path $base 'project'; $outside = Join-Path $base 'outside'
+$link = Join-Path $project 'tmp'; $supported = $true; $rejected = $false
+$null = New-Item -ItemType Directory -Path $project
+$null = New-Item -ItemType Directory -Path $outside
+try {
+    try { $null = New-Item -ItemType SymbolicLink -Path $link -Target $outside -ErrorAction Stop }
+    catch { $supported = $false }
+    if ($supported) {
+        $candidate = Join-Path $link 'graduation/g2e/file.txt'
+        $rejected = Test-Rejected {
+            Assert-G2eRefreshNoReparsePoint -RootPath $project -CandidatePath $candidate
+        }
+    }
+    [ordered]@{ supported=$supported; rejected=$rejected } | ConvertTo-Json -Compress
+} finally {
+    if (Test-Path -LiteralPath $link) { Remove-Item -LiteralPath $link -Force }
+    if (Test-Path -LiteralPath $base) {
+        $tempRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath())
+        $safeBase = [IO.Path]::GetFullPath($base)
+        if (-not $safeBase.StartsWith($tempRoot, [StringComparison]::OrdinalIgnoreCase)) {
+            throw 'Refusing unsafe test cleanup.'
+        }
+        Remove-Item -LiteralPath $base -Recurse -Force
+    }
+}
+'''
+        )
+        if not payload["supported"]:
+            self.skipTest("Symbolic links are unavailable on this Windows host")
+        self.assertTrue(payload["rejected"])
 
 
 class IndependentBusinessSemanticsTests(unittest.TestCase):
