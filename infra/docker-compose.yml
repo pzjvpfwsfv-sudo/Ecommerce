@@ -142,6 +142,10 @@ services:
     volumes:
       - ../:/workspace
       - ./compose/flink/conf:/opt/hadoop-conf:ro
+      - type: bind
+        source: ${OLIST_DATA_DIR}
+        target: /data/olist
+        read_only: true
       - ./compose/flink/lib/flink-sql-connector-kafka-3.3.0-1.19.jar:/opt/flink/lib/flink-sql-connector-kafka-3.3.0-1.19.jar:ro
       - ./compose/flink/lib/flink-sql-connector-hive-3.1.3_2.12-1.19.2.jar:/opt/flink/lib/flink-sql-connector-hive-3.1.3_2.12-1.19.2.jar:ro
       - ./compose/flink/lib/flink-doris-connector-1.19-25.1.0.jar:/opt/flink/lib/flink-doris-connector-1.19-25.1.0.jar:ro
@@ -184,6 +188,10 @@ services:
     volumes:
       - ../:/workspace
       - ./compose/flink/conf:/opt/hadoop-conf:ro
+      - type: bind
+        source: ${OLIST_DATA_DIR}
+        target: /data/olist
+        read_only: true
       - ./compose/flink/lib/flink-sql-connector-kafka-3.3.0-1.19.jar:/opt/flink/lib/flink-sql-connector-kafka-3.3.0-1.19.jar:ro
       - ./compose/flink/lib/flink-sql-connector-hive-3.1.3_2.12-1.19.2.jar:/opt/flink/lib/flink-sql-connector-hive-3.1.3_2.12-1.19.2.jar:ro
       - ./compose/flink/lib/flink-doris-connector-1.19-25.1.0.jar:/opt/flink/lib/flink-doris-connector-1.19-25.1.0.jar:ro
@@ -226,6 +234,10 @@ services:
     volumes:
       - ../:/workspace
       - ./compose/flink/conf:/opt/hadoop-conf:ro
+      - type: bind
+        source: ${OLIST_DATA_DIR}
+        target: /data/olist
+        read_only: true
       - ./compose/flink/lib/flink-sql-connector-kafka-3.3.0-1.19.jar:/opt/flink/lib/flink-sql-connector-kafka-3.3.0-1.19.jar:ro
       - ./compose/flink/lib/flink-sql-connector-hive-3.1.3_2.12-1.19.2.jar:/opt/flink/lib/flink-sql-connector-hive-3.1.3_2.12-1.19.2.jar:ro
       - ./compose/flink/lib/flink-doris-connector-1.19-25.1.0.jar:/opt/flink/lib/flink-doris-connector-1.19-25.1.0.jar:ro

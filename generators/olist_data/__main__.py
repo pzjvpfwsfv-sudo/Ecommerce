@@ -8,6 +8,7 @@ import sys
 import zipfile
 
 from .bundle import Acquisition, prepare_bundle
+from .flink_sql import render_flink_ingest_sql
 
 
 def _d_drive(path: Path) -> bool:
@@ -29,9 +30,18 @@ def main(argv: list[str] | None = None) -> int:
     prepare.add_argument("--acquired-at", required=True)
     prepare.add_argument("--license-name", required=True)
     prepare.add_argument("--license-url", required=True)
+    render = commands.add_parser(
+        "render-flink-sql",
+        help="Render one fixed-registry bounded Olist-to-Iceberg statement.",
+    )
+    render.add_argument("--entity", required=True)
+    render.add_argument("--source-bundle-sha256", required=True)
     args = parser.parse_args(argv)
 
     try:
+        if args.command == "render-flink-sql":
+            print(render_flink_ingest_sql(args.entity, args.source_bundle_sha256), end="")
+            return 0
         paths = (args.archive, args.input_dir, args.output_root)
         if not all(path.is_absolute() and _d_drive(path) for path in paths):
             raise ValueError("paths_must_be_on_d_drive")

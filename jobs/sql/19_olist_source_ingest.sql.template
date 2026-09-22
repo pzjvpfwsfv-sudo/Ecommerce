@@ -1,0 +1,39 @@
+SET 'pipeline.name' = '__PIPELINE_NAME__';
+SET 'execution.runtime-mode' = 'batch';
+SET 'parallelism.default' = '1';
+SET 'table.local-time-zone' = 'UTC';
+
+CREATE CATALOG lakehouse WITH (
+    'type' = 'iceberg',
+    'catalog-type' = 'hive',
+    'uri' = 'thrift://hive-metastore:9083',
+    'warehouse' = 's3a://warehouse/iceberg',
+    'property-version' = '1'
+);
+
+CREATE DATABASE IF NOT EXISTS lakehouse.olist;
+
+CREATE TEMPORARY TABLE olist_source (
+    __SOURCE_COLUMNS__
+) WITH (
+    'connector' = 'filesystem',
+    'path' = '__SOURCE_PATH__',
+    'format' = 'json',
+    'json.fail-on-missing-field' = 'true',
+    'json.ignore-parse-errors' = 'false'
+);
+
+CREATE TABLE IF NOT EXISTS lakehouse.olist.__TARGET_TABLE__ (
+    __TARGET_COLUMNS__
+) WITH (
+    'format-version' = '2',
+    'write.format.default' = 'parquet'
+);
+
+INSERT INTO lakehouse.olist.__TARGET_TABLE__
+SELECT
+    __SELECT_COLUMNS__
+FROM olist_source
+WHERE source_bundle_sha256 = '__SOURCE_BUNDLE_SHA256__'
+  AND dataset_id = 'olist-brazilian-ecommerce-v2'
+  AND schema_version = 1;

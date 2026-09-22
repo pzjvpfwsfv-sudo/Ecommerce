@@ -1,0 +1,40 @@
+-- result:table_exists
+SELECT count(*) AS table_exists
+FROM lakehouse.information_schema.tables
+WHERE table_schema = 'olist'
+  AND table_name = '__TARGET_TABLE__';
+
+-- result:row_summary
+SELECT
+    count(*) AS row_count,
+    count(DISTINCT source_row_id) AS distinct_source_row_id_count,
+    min(source_row_number) AS min_source_row_number,
+    max(source_row_number) AS max_source_row_number,
+    lower(to_hex(sha256(to_utf8(
+        array_join(array_agg(source_row_id ORDER BY source_row_number), chr(10)) || chr(10)
+    )))) AS source_row_id_sequence_sha256
+FROM lakehouse.olist.__TARGET_TABLE__;
+
+-- result:identity
+SELECT
+    count(DISTINCT source_bundle_sha256) AS bundle_count,
+    min(source_bundle_sha256) AS source_bundle_sha256,
+    count(DISTINCT source_file) AS source_file_count,
+    min(source_file) AS source_file
+FROM lakehouse.olist.__TARGET_TABLE__;
+
+-- result:key_uniqueness
+SELECT count(*) AS duplicate_key_count
+FROM (
+    SELECT __KEY_COLUMNS__
+    FROM lakehouse.olist.__TARGET_TABLE__
+    GROUP BY __KEY_COLUMNS__
+    HAVING count(*) > 1
+) duplicated_keys;
+
+-- result:snapshot
+SELECT
+    count(*) AS snapshot_count,
+    cast(max_by(snapshot_id, committed_at) AS varchar) AS latest_snapshot_id,
+    max(committed_at) AS latest_snapshot_committed_at
+FROM lakehouse.olist."__TARGET_TABLE__$snapshots";
