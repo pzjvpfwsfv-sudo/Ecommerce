@@ -693,12 +693,18 @@ function Invoke-G2eComposeCommand {
     if ([string]::IsNullOrWhiteSpace([string]$script:G2eDockerExecutable)) {
         throw 'G2-E Docker executable was not initialized.'
     }
+    $nativeArguments = $Arguments
+    if ($PSVersionTable.PSVersion.Major -lt 7) {
+        $nativeArguments = [string[]]@($Arguments | ForEach-Object {
+            $_.Replace('"', '\"')
+        })
+    }
     $previousErrorActionPreference = $ErrorActionPreference
     try {
         # Windows PowerShell 5.1 wraps native stderr as ErrorRecord objects.
         $ErrorActionPreference = 'Continue'
         $captured = @(& $script:G2eDockerExecutable compose --env-file $EnvFile `
-            -f $script:G2eComposeFile @Arguments 2>&1)
+            -f $script:G2eComposeFile @nativeArguments 2>&1)
         $exitCode = $LASTEXITCODE
     } finally {
         $ErrorActionPreference = $previousErrorActionPreference

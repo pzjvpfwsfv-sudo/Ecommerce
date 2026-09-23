@@ -4,6 +4,7 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -910,6 +911,34 @@ catch {{ $failure = $_.Exception.Message }}
             self.assertEqual("Stop", payload["preference"])
             self.assertIn("partial output", payload["failure"])
             self.assertIn("ERROR: real failure", payload["failure"])
+
+    def test_compose_preserves_literal_quotes_in_windows_powershell(self):
+        executable = shutil.which("powershell")
+        if executable is None:
+            self.skipTest("Windows PowerShell is unavailable")
+        with tempfile.TemporaryDirectory(dir=ROOT / "tmp") as temporary:
+            fixture = Path(temporary) / "compose"
+            fixture.write_text("import sys\nprint(sys.argv[-1])\n", encoding="ascii")
+            python_executable = sys.executable.replace("'", "''")
+            temporary_path = str(temporary).replace("'", "''")
+            payload = self.refresh_payload(
+                rf'''
+$script:G2eDockerExecutable = '{python_executable}'
+$sql = 'SELECT * FROM lakehouse.olist."orders_src_v1$snapshots"'
+Push-Location '{temporary_path}'
+try {{
+    $lines = @(Invoke-G2eComposeCommand -EnvFile 'fixture.env' -Arguments @(
+        'exec', '-T', '--execute', $sql
+    ))
+}} finally {{ Pop-Location }}
+[ordered]@{{ sql=$lines[0] }} | ConvertTo-Json -Compress
+''',
+                executable=executable,
+            )
+            self.assertEqual(
+                'SELECT * FROM lakehouse.olist."orders_src_v1$snapshots"',
+                payload["sql"],
+            )
 
     def test_trino_transport_maps_its_quoted_empty_null_encoding_to_null(self):
         payload = self.refresh_payload(
