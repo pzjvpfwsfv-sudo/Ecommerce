@@ -213,8 +213,10 @@ function New-StoredOverviewRows {
 
 
 class PowerShellTestCase(unittest.TestCase):
-    def run_powershell(self, command: str, timeout: int = 30):
-        executable = shutil.which("pwsh") or shutil.which("powershell")
+    def run_powershell(
+        self, command: str, timeout: int = 30, executable: str | None = None
+    ):
+        executable = executable or shutil.which("pwsh") or shutil.which("powershell")
         if executable is None:
             self.skipTest("PowerShell is required for G2-E metric coverage")
         return subprocess.run(
@@ -608,8 +610,10 @@ $wrongSeller=@($ranking | ForEach-Object { $_.PSObject.Copy() }); ($wrongSeller 
 
 
 class G2eRefreshTests(PowerShellTestCase):
-    def refresh_payload(self, body: str):
-        result = self.run_powershell(REFRESH_POWERSHELL_FIXTURE + body)
+    def refresh_payload(self, body: str, executable: str | None = None):
+        result = self.run_powershell(
+            REFRESH_POWERSHELL_FIXTURE + body, executable=executable
+        )
         self.assertEqual(0, result.returncode, result.stderr or result.stdout)
         return json.loads(result.stdout.strip().splitlines()[-1])
 
@@ -861,6 +865,51 @@ $rows = @(Invoke-G2eMetricTrinoStatement -Name ranking -Sql 'SELECT 1;' -EnvFile
             )
             self.assertEqual(1, payload["count"])
             self.assertEqual("sao paulo, sp", payload["value"])
+
+    def test_compose_success_stderr_is_nonterminating_in_windows_powershell(self):
+        executable = shutil.which("powershell")
+        if executable is None:
+            self.skipTest("Windows PowerShell is unavailable")
+        with tempfile.TemporaryDirectory(dir=ROOT / "tmp") as temporary:
+            fixture = Path(temporary) / "docker-fixture.cmd"
+            failure_fixture = Path(temporary) / "docker-failure-fixture.cmd"
+            fixture.write_text(
+                '@echo off\n'
+                '>&2 echo WARNING: diagnostic only\n'
+                'echo ready\n'
+                'exit /b 0\n',
+                encoding="ascii",
+            )
+            failure_fixture.write_text(
+                '@echo off\n'
+                'echo partial output\n'
+                '>&2 echo ERROR: real failure\n'
+                'exit /b 9\n',
+                encoding="ascii",
+            )
+            escaped = str(fixture).replace("'", "''")
+            failure_escaped = str(failure_fixture).replace("'", "''")
+            payload = self.refresh_payload(
+                rf'''
+$script:G2eDockerExecutable = '{escaped}'
+$lines = @(Invoke-G2eComposeCommand -EnvFile 'fixture.env' -Arguments @('config'))
+$script:G2eDockerExecutable = '{failure_escaped}'
+$failure = ''
+try {{ $null = Invoke-G2eComposeCommand -EnvFile 'fixture.env' -Arguments @('config') }}
+catch {{ $failure = $_.Exception.Message }}
+[ordered]@{{
+    lines=$lines
+    preference=[string]$ErrorActionPreference
+    failure=$failure
+}} |
+    ConvertTo-Json -Compress
+''',
+                executable=executable,
+            )
+            self.assertEqual(["ready"], payload["lines"])
+            self.assertEqual("Stop", payload["preference"])
+            self.assertIn("partial output", payload["failure"])
+            self.assertIn("ERROR: real failure", payload["failure"])
 
     def test_trino_transport_maps_its_quoted_empty_null_encoding_to_null(self):
         payload = self.refresh_payload(
