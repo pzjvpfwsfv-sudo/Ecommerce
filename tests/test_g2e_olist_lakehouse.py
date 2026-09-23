@@ -1,4 +1,5 @@
 import json
+import hashlib
 from pathlib import Path
 import re
 import shutil
@@ -204,6 +205,30 @@ class OlistComposeContractTest(unittest.TestCase):
 
 
 class OlistPowerShellContractTest(PowerShellTestCase):
+    def test_trino_csv_parser_ignores_native_stderr_records(self):
+        command = r'''
+$ErrorActionPreference = 'Stop'
+. (Resolve-Path 'scripts/run_g2e_olist_source.ps1') -FunctionsOnly
+$warning = [Management.Automation.ErrorRecord]::new(
+    [Exception]::new('JLine terminal warning'),
+    'NativeCommandError',
+    [Management.Automation.ErrorCategory]::NotSpecified,
+    $null
+)
+function docker {
+    $global:LASTEXITCODE = 0
+    Write-Output $warning
+    Write-Output '"table_exists"'
+    Write-Output '"0"'
+}
+$row = Invoke-G2eTrinoStatement -Sql 'SELECT 0' -ComposeFile 'compose.yml' -EnvFile '.env'
+[ordered]@{ table_exists = [string]$row.table_exists } | ConvertTo-Json -Compress
+'''
+        result = self.run_powershell(command)
+        self.assertEqual(0, result.returncode, result.stderr or result.stdout)
+        payload = json.loads(result.stdout.strip().splitlines()[-1])
+        self.assertEqual("0", payload["table_exists"])
+
     def test_powershell_registry_matches_the_python_source_of_truth(self):
         from generators.olist_data.schemas import TABLE_SPECS
 
@@ -394,6 +419,22 @@ $deployment = Get-G2eSourceDeployment -Manifest (New-TestManifest) -Entity 'orde
 $template = Get-Content -LiteralPath 'jobs/sql/20_olist_source_verify.sql.template' -Raw -Encoding UTF8
 $sql = Render-G2eVerificationSql -Template $template -Deployment $deployment
 $parts = @(Split-G2eNamedSql -Sql $sql)
+$warning = [Management.Automation.ErrorRecord]::new(
+    [Exception]::new('JLine terminal warning'),
+    'NativeCommandError',
+    [Management.Automation.ErrorCategory]::NotSpecified,
+    $null
+)
+function docker {
+    $script:dockerArguments = $args -join ' '
+    $global:LASTEXITCODE = 0
+    Write-Output $warning
+    Write-Output ('a' * 64)
+    Write-Output ('b' * 64)
+    Write-Output ('c' * 64)
+}
+$sequence = Get-G2eTrinoRowIdSequenceEvidence -Deployment $deployment `
+    -ComposeFile 'compose.yml' -EnvFile '.env'
 $jobs = @(
     [pscustomobject]@{ jid = ('1' * 32); name = $deployment.PipelineName; state = 'FAILED' },
     [pscustomobject]@{ jid = ('2' * 32); name = $deployment.PipelineName; state = 'FINISHED' }
@@ -402,7 +443,11 @@ $finished = Assert-G2eFinishedJob -PipelineName $deployment.PipelineName -JobId 
 [ordered]@{
     names = @($parts.Name)
     jid = $finished.jid
-    exact_digest = [bool]($sql -match 'array_agg\(source_row_id ORDER BY source_row_number\)')
+    bounded_summary = [bool]($sql -notmatch 'array_agg\(')
+    sequence_rows = $sequence.RowCount
+    sequence_sha256 = $sequence.Sha256
+    ordered_stream = [bool]($script:dockerArguments -match 'ORDER BY source_row_number')
+    tsv_stream = [bool]($script:dockerArguments -match '--output-format TSV')
     snapshot_table = [bool]($sql -match 'orders_src_v1\$snapshots')
     unresolved = [bool]($sql -match '__[A-Z0-9_]+__')
     wrong_job = Test-Rejected {
@@ -425,7 +470,12 @@ $finished = Assert-G2eFinishedJob -PipelineName $deployment.PipelineName -JobId 
             payload["names"],
         )
         self.assertEqual("2" * 32, payload["jid"])
-        self.assertTrue(payload["exact_digest"])
+        self.assertTrue(payload["bounded_summary"])
+        self.assertEqual(3, payload["sequence_rows"])
+        expected_sequence = "".join(f"{value * 64}\n" for value in "abc").encode("ascii")
+        self.assertEqual(hashlib.sha256(expected_sequence).hexdigest(), payload["sequence_sha256"])
+        self.assertTrue(payload["ordered_stream"])
+        self.assertTrue(payload["tsv_stream"])
         self.assertTrue(payload["snapshot_table"])
         self.assertFalse(payload["unresolved"])
         self.assertTrue(payload["wrong_job"])

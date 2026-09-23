@@ -9,10 +9,7 @@ SELECT
     count(*) AS row_count,
     count(DISTINCT source_row_id) AS distinct_source_row_id_count,
     min(source_row_number) AS min_source_row_number,
-    max(source_row_number) AS max_source_row_number,
-    lower(to_hex(sha256(to_utf8(
-        array_join(array_agg(source_row_id ORDER BY source_row_number), chr(10)) || chr(10)
-    )))) AS source_row_id_sequence_sha256
+    max(source_row_number) AS max_source_row_number
 FROM lakehouse.olist.__TARGET_TABLE__;
 
 -- result:identity

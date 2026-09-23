@@ -367,9 +367,12 @@ function Split-G2eNamedSql {
 }
 
 function ConvertFrom-G2eCsvResult {
-    param([Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$Lines)
+    param([Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$Lines)
 
-    $content = @($Lines | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    $content = @($Lines | Where-Object {
+        $_ -isnot [Management.Automation.ErrorRecord] -and
+        -not [string]::IsNullOrWhiteSpace([string]$_)
+    } | ForEach-Object { [string]$_ })
     if ($content.Count -lt 2) { throw 'G2-E Trino query returned no data row.' }
     try { $rows = @($content -join "`n" | ConvertFrom-Csv) } catch { throw 'G2-E Trino returned malformed CSV.' }
     if ($rows.Count -ne 1) { throw 'G2-E Trino query must return exactly one data row.' }
@@ -544,7 +547,62 @@ function Invoke-G2eTrinoStatement {
         --server http://localhost:8080 --catalog lakehouse --schema olist `
         --output-format CSV_HEADER --execute $Sql 2>&1)
     if ($LASTEXITCODE -ne 0) { throw 'G2-E Trino verification statement failed.' }
-    return ConvertFrom-G2eCsvResult -Lines ([string[]]$lines)
+    return ConvertFrom-G2eCsvResult -Lines $lines
+}
+
+function Get-G2eTrinoRowIdSequenceEvidence {
+    param(
+        [Parameter(Mandatory = $true)]$Deployment,
+        [Parameter(Mandatory = $true)][string]$ComposeFile,
+        [Parameter(Mandatory = $true)][string]$EnvFile
+    )
+
+    $registry = Get-G2eRegistry
+    $entity = [string]$Deployment.Entity
+    $targetTable = [string]$Deployment.TargetTable
+    if (-not $registry.Contains($entity) -or
+            [string]$registry[$entity].TargetTable -cne $targetTable) {
+        throw 'G2-E row identity stream is outside the fixed registry.'
+    }
+
+    $sql = "SELECT source_row_id FROM lakehouse.olist.$targetTable ORDER BY source_row_number"
+    $sha256 = [Security.Cryptography.SHA256]::Create()
+    $buffer = [Text.StringBuilder]::new(1048576)
+    [long]$rowCount = 0
+    try {
+        & docker compose --env-file $EnvFile -f $ComposeFile exec -T trino trino `
+            --server http://localhost:8080 --catalog lakehouse --schema olist `
+            --output-format TSV --execute $sql 2>&1 | ForEach-Object {
+            if ($_ -is [Management.Automation.ErrorRecord]) { return }
+            $rowId = [string]$_
+            if ([string]::IsNullOrWhiteSpace($rowId)) { return }
+            if ($rowId -cnotmatch '^[0-9a-f]{64}$') {
+                throw 'G2-E Trino row identity stream returned an invalid row ID.'
+            }
+            [void]$buffer.Append($rowId).Append("`n")
+            $rowCount++
+            if ($buffer.Length -ge 1048576) {
+                $bytes = [Text.Encoding]::UTF8.GetBytes($buffer.ToString())
+                [void]$sha256.TransformBlock($bytes, 0, $bytes.Length, $bytes, 0)
+                [void]$buffer.Clear()
+            }
+        }
+        $exitCode = $LASTEXITCODE
+        if ($exitCode -ne 0) { throw 'G2-E Trino row identity stream failed.' }
+
+        if ($buffer.Length -gt 0) {
+            $bytes = [Text.Encoding]::UTF8.GetBytes($buffer.ToString())
+            [void]$sha256.TransformBlock($bytes, 0, $bytes.Length, $bytes, 0)
+        }
+        [void]$sha256.TransformFinalBlock([byte[]]@(), 0, 0)
+        $digest = ([BitConverter]::ToString($sha256.Hash)).Replace('-', '').ToLowerInvariant()
+    } finally {
+        $sha256.Dispose()
+    }
+
+    $expectedRows = ConvertTo-G2eCount $Deployment.ExpectedRowCount 'expected row identity count'
+    if ($rowCount -ne $expectedRows) { throw 'G2-E Trino row identity stream count differs.' }
+    return [pscustomobject][ordered]@{ RowCount = $rowCount; Sha256 = $digest }
 }
 
 function Get-G2eSourceState {
@@ -562,6 +620,7 @@ function Get-G2eSourceState {
     if ($exists -eq 0) { return [pscustomobject][ordered]@{ table_exists = 0 } }
     if ($exists -ne 1) { throw 'G2-E table existence query is ambiguous.' }
     $summary = Invoke-G2eTrinoStatement $parts[1].Sql $ComposeFile $EnvFile
+    $sequence = Get-G2eTrinoRowIdSequenceEvidence $Deployment $ComposeFile $EnvFile
     $identity = Invoke-G2eTrinoStatement $parts[2].Sql $ComposeFile $EnvFile
     $keys = Invoke-G2eTrinoStatement $parts[3].Sql $ComposeFile $EnvFile
     $snapshot = Invoke-G2eTrinoStatement $parts[4].Sql $ComposeFile $EnvFile
@@ -571,7 +630,7 @@ function Get-G2eSourceState {
         distinct_source_row_id_count = Get-G2ePropertyValue $summary 'distinct_source_row_id_count'
         min_source_row_number = Get-G2ePropertyValue $summary 'min_source_row_number'
         max_source_row_number = Get-G2ePropertyValue $summary 'max_source_row_number'
-        source_row_id_sequence_sha256 = Get-G2ePropertyValue $summary 'source_row_id_sequence_sha256'
+        source_row_id_sequence_sha256 = $sequence.Sha256
         bundle_count = Get-G2ePropertyValue $identity 'bundle_count'
         source_bundle_sha256 = Get-G2ePropertyValue $identity 'source_bundle_sha256'
         source_file_count = Get-G2ePropertyValue $identity 'source_file_count'

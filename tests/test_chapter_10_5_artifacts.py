@@ -287,6 +287,8 @@ function powershell { $script:nativeCalls++; throw "powershell must not run" }
         self.assertEqual("hive", services["metastore-postgres"]["environment"]["POSTGRES_USER"])
         self.assertEqual("hive", services["metastore-postgres"]["environment"]["POSTGRES_PASSWORD"])
         self.assertEqual("postgres", services["hive-metastore"]["environment"]["DB_DRIVER"])
+        self.assertEqual("false", services["hive-metastore"]["environment"]["IS_RESUME"])
+        self.assertIn("IS_RESUME: ${HIVE_METASTORE_IS_RESUME:-false}", compose_text)
         self.assertIn(
             "jdbc:postgresql://metastore-postgres:5432/metastore",
             services["hive-metastore"]["environment"]["SERVICE_OPTS"],

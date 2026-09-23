@@ -371,6 +371,7 @@ services:
     environment:
       SERVICE_NAME: metastore
       DB_DRIVER: postgres
+      IS_RESUME: ${HIVE_METASTORE_IS_RESUME:-false}
       HADOOP_CONF_DIR: /opt/hadoop/etc/hadoop
       HADOOP_OPTIONAL_TOOLS: hadoop-aws
       MINIO_ROOT_USER: ${MINIO_ROOT_USER}
