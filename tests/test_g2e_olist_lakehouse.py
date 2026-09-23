@@ -160,7 +160,11 @@ class OlistFlinkSqlTest(unittest.TestCase):
         product_sql = render_flink_ingest_sql("products", BUNDLE)
         self.assertIn("product_weight_g DECIMAL(38, 6)", product_sql)
         geo_sql = render_flink_ingest_sql("geolocation", BUNDLE)
-        self.assertIn("geolocation_lat DECIMAL(38, 12)", geo_sql)
+        self.assertIn("geolocation_lat DECIMAL(38, 20)", geo_sql)
+        self.assertIn(
+            "CAST(geolocation_lng AS DECIMAL(38, 20)) AS geolocation_lng",
+            geo_sql,
+        )
 
     def test_ingest_template_has_only_the_closed_token_set(self):
         template = (ROOT / "jobs/sql/19_olist_source_ingest.sql.template").read_text(

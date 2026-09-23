@@ -60,7 +60,7 @@ def _target_columns(fields: tuple[FieldSpec, ...]) -> list[str]:
         elif field.kind == "decimal":
             columns.append(f"{field.name} DECIMAL(38, 6)")
         elif field.kind == "coordinate":
-            columns.append(f"{field.name} DECIMAL(38, 12)")
+            columns.append(f"{field.name} DECIMAL(38, 20)")
         elif field.kind == "timestamp":
             columns.append(f"{field.name} TIMESTAMP(3)")
         else:  # pragma: no cover - the frozen registry makes this unreachable.
@@ -97,7 +97,7 @@ def _select_columns(fields: tuple[FieldSpec, ...]) -> list[str]:
             )
         elif field.kind == "coordinate":
             columns.append(
-                f"CAST({field.name} AS DECIMAL(38, 12)) AS {field.name}"
+                f"CAST({field.name} AS DECIMAL(38, 20)) AS {field.name}"
             )
         elif field.kind == "timestamp":
             columns.append(

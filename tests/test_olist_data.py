@@ -247,6 +247,28 @@ class OlistSchemaAndNormalizationTest(unittest.TestCase):
         self.assertEqual("2017-01-04 12:00:00", item["shipping_limit_date"])
         self.assertNotIn("Z", item["shipping_limit_date"])
 
+    def test_official_coordinate_precision_is_preserved_with_strict_world_bounds(self):
+        spec = TABLE_SPECS["geolocation"]
+        source = dict(zip(EXPECTED_HEADERS["geolocation"], VALID_ROWS["geolocation"]))
+        normalized = normalize_row(
+            spec,
+            source
+            | {
+                "geolocation_lat": "-0.00004367379244740171",
+                "geolocation_lng": "-6.8985590510710155",
+            },
+            row_number=1,
+        )
+        self.assertEqual("-0.00004367379244740171", normalized["geolocation_lat"])
+        self.assertEqual("-6.8985590510710155", normalized["geolocation_lng"])
+        for field, value in (
+            ("geolocation_lat", "90.00000000000000000001"),
+            ("geolocation_lng", "-180.00000000000000000001"),
+        ):
+            with self.subTest(field=field):
+                with self.assertRaisesRegex(RowValidationError, f"invalid_{field}"):
+                    normalize_row(spec, source | {field: value}, row_number=1)
+
     def test_identity_is_stable_and_changes_with_record_number_or_content(self):
         spec = TABLE_SPECS["order_items"]
         source = dict(zip(EXPECTED_HEADERS["order_items"], VALID_ROWS["order_items"]))

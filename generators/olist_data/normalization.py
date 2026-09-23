@@ -13,7 +13,7 @@ from .schemas import DATASET_ID, MONEY_FIELDS, SCHEMA_VERSION, FieldSpec, TableS
 _UINT = re.compile(r"[0-9]+\Z")
 _MONEY = re.compile(r"[0-9]{1,18}(?:\.[0-9]{1,2})?\Z")
 _NONNEGATIVE_DECIMAL = re.compile(r"[0-9]{1,18}(?:\.[0-9]{1,6})?\Z")
-_COORDINATE = re.compile(r"-?[0-9]{1,3}(?:\.[0-9]{1,12})?\Z")
+_COORDINATE = re.compile(r"-?[0-9]{1,3}(?:\.[0-9]{1,20})?\Z")
 _TIMESTAMP_FORMAT = "%Y-%m-%d %H:%M:%S"
 
 
