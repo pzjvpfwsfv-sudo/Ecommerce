@@ -345,6 +345,49 @@ class OrderMetricArtifactTests(unittest.TestCase):
 
 
 class OrderMetricPureFunctionTests(PowerShellTestCase):
+    def test_hot_property_access_avoids_per_call_pipeline_allocation(self):
+        source = (ROOT / "scripts/lib/G2e.OrderMetrics.psm1").read_text(
+            encoding="utf-8"
+        )
+        hot_path = source.split("function Get-G2eOrderProperty {", 1)[1].split(
+            "function Get-G2eOrderMapKeys {", 1
+        )[0]
+        self.assertNotIn("Where-Object", hot_path)
+
+        executable = shutil.which("powershell")
+        if executable is None:
+            self.skipTest("Windows PowerShell is unavailable")
+        result = self.run_powershell(
+            POWERSHELL_FIXTURE
+            + r'''
+$module = Get-Module G2e.OrderMetrics
+$elapsed = & $module {
+    $row = [pscustomobject][ordered]@{
+        metric_run_id='run'; dataset_id='data'; metric_version='v1'
+        window_type='DAY'; window_start='2017-01-01'; window_end='2017-01-01'
+        dimension_type='product'; dimension_id='p'; dimension_name='p'; is_unknown='false'
+        ranking_order_count='1'; ranking_item_row_count='1'; ranking_customer_count='1'
+        ranking_item_value_sum='1.00'; ranking_freight_value_sum='1.00'
+        ranking_payment_value_sum=$null; ranking_late_delivery_order_count=$null
+        ranking_late_delivery_eligible_order_count=$null; ranking_late_delivery_rate=$null
+        payment_value_is_additive=$null
+    }
+    (Measure-Command {
+        for ($index = 0; $index -lt 5000; $index++) {
+            $null = Get-G2eOrderProperty $row 'dimension_type'
+            $null = Test-G2eOrderProperty $row 'metric_run_id'
+        }
+    }).TotalSeconds
+}
+[ordered]@{ elapsed_seconds=$elapsed } | ConvertTo-Json -Compress
+''',
+            timeout=20,
+            executable=executable,
+        )
+        self.assertEqual(0, result.returncode, result.stderr or result.stdout)
+        payload = json.loads(result.stdout.strip().splitlines()[-1])
+        self.assertLess(payload["elapsed_seconds"], 1.5)
+
     def test_identity_requires_exact_bundle_snapshots_counts_range_and_revision(self):
         payload = self.payload(
             r'''

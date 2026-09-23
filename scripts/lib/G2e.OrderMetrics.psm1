@@ -83,22 +83,36 @@ function Get-G2eOrderProperty {
     )
 
     if ($Value -is [Collections.IDictionary]) {
-        $matches = @($Value.Keys | Where-Object { [string]$_ -ceq $Name })
-        if ($matches.Count -ne 1) { throw "Required property '$Name' is missing or has wrong casing." }
-        return $Value[$matches[0]]
+        $matchingKey = $null
+        $matchCount = 0
+        foreach ($key in $Value.Keys) {
+            if ([string]$key -ceq $Name) {
+                $matchingKey = $key
+                $matchCount++
+            }
+        }
+        if ($matchCount -ne 1) { throw "Required property '$Name' is missing or has wrong casing." }
+        return $Value[$matchingKey]
     }
-    $matches = @($Value.PSObject.Properties | Where-Object { $_.Name -ceq $Name })
-    if ($matches.Count -ne 1) { throw "Required property '$Name' is missing or has wrong casing." }
-    return $matches[0].Value
+    $property = $Value.PSObject.Properties[$Name]
+    if ($null -eq $property -or $property.Name -cne $Name) {
+        throw "Required property '$Name' is missing or has wrong casing."
+    }
+    return $property.Value
 }
 
 function Test-G2eOrderProperty {
     param($Value, [string]$Name)
     if ($null -eq $Value) { return $false }
     if ($Value -is [Collections.IDictionary]) {
-        return @($Value.Keys | Where-Object { [string]$_ -ceq $Name }).Count -eq 1
+        $matchCount = 0
+        foreach ($key in $Value.Keys) {
+            if ([string]$key -ceq $Name) { $matchCount++ }
+        }
+        return $matchCount -eq 1
     }
-    return @($Value.PSObject.Properties | Where-Object { $_.Name -ceq $Name }).Count -eq 1
+    $property = $Value.PSObject.Properties[$Name]
+    return $null -ne $property -and $property.Name -ceq $Name
 }
 
 function Get-G2eOrderMapKeys {
@@ -677,9 +691,12 @@ function Get-G2eOrderWindowKey {
 function Assert-G2eOrderOptionalIdentity {
     param($Row, $Identity, [string]$Family)
     $fields = [string[]]@('metric_run_id', 'dataset_id', 'metric_version')
-    $present = @($fields | Where-Object { Test-G2eOrderProperty $Row $_ })
-    if ($present.Count -eq 0) { return }
-    if ($present.Count -ne 3) { throw "$Family row identity is incomplete." }
+    $presentCount = 0
+    foreach ($field in $fields) {
+        if (Test-G2eOrderProperty $Row $field) { $presentCount++ }
+    }
+    if ($presentCount -eq 0) { return }
+    if ($presentCount -ne 3) { throw "$Family row identity is incomplete." }
     $expected = @($Identity.MetricRunId, $Identity.DatasetId, $Identity.MetricVersion)
     for ($index = 0; $index -lt 3; $index++) {
         if ([string](Get-G2eOrderProperty $Row $fields[$index]) -cne [string]$expected[$index]) {
