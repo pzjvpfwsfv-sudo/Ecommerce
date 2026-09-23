@@ -883,6 +883,28 @@ $rows = @(Invoke-G2eMetricTrinoStatement -Name ranking -Sql 'SELECT 1;' -EnvFile
         self.assertEqual("seller", payload["name"])
         self.assertTrue(payload["value_is_null"])
 
+    def test_trino_transport_maps_its_backslash_n_null_encoding_to_null(self):
+        payload = self.refresh_payload(
+            r'''
+$script:G2eDockerExecutable = 'docker-fixture'
+function Invoke-G2eComposeCommand {
+    param([string]$EnvFile, [string[]]$Arguments)
+    return @(
+        'window_type,delivery_days_avg',
+        'DAY,\N'
+    )
+}
+$raw = @(ConvertFrom-G2eCsv "window_type,delivery_days_avg`nDAY,\N`n")
+$rows = @(Invoke-G2eMetricTrinoStatement -Name delivery -Sql 'SELECT 1;' -EnvFile 'fixture.env')
+[ordered]@{
+    generic_value=$raw[0].delivery_days_avg
+    metric_value_is_null=($null -eq $rows[0].delivery_days_avg)
+} | ConvertTo-Json -Compress
+'''
+        )
+        self.assertEqual(r"\N", payload["generic_value"])
+        self.assertTrue(payload["metric_value_is_null"])
+
     def test_trino_readiness_requires_a_successful_query_not_only_http_info(self):
         payload = self.refresh_payload(
             r'''

@@ -447,7 +447,7 @@ function ConvertFrom-G2eCsv {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)][AllowEmptyString()][string]$CsvText,
-        [switch]$TreatEmptyAsNull
+        [switch]$TreatTrinoNulls
     )
 
     $headers = $null
@@ -529,10 +529,13 @@ function ConvertFrom-G2eCsv {
             }
             $row = [ordered]@{}
             for ($column = 0; $column -lt $headers.Count; $column++) {
-                $row[$headers[$column]] = if (
-                    $values[$column].Length -eq 0 -and
-                    ($TreatEmptyAsNull -or -not $quoted[$column])
-                ) {
+                $isEmptyNull = $values[$column].Length -eq 0 -and (
+                    $TreatTrinoNulls -or -not $quoted[$column]
+                )
+                $isTrinoNull = $TreatTrinoNulls -and -not $quoted[$column] -and (
+                    $values[$column] -ceq '\N'
+                )
+                $row[$headers[$column]] = if ($isEmptyNull -or $isTrinoNull) {
                     $null
                 } else {
                     $values[$column]

@@ -743,7 +743,7 @@ function Invoke-G2eMetricTrinoStatement {
         'CSV_HEADER', '--execute', $Sql
     )
     $lines = @(Invoke-G2eComposeCommand -EnvFile $EnvFile -Arguments $arguments)
-    return @(ConvertFrom-G2eCsv -CsvText ($lines -join "`n") -TreatEmptyAsNull)
+    return @(ConvertFrom-G2eCsv -CsvText ($lines -join "`n") -TreatTrinoNulls)
 }
 
 function Invoke-G2eDorisSql {
