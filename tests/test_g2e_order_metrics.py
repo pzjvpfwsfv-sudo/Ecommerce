@@ -297,6 +297,22 @@ class OrderMetricArtifactTests(unittest.TestCase):
         self.assertIn("seller_state_order", sql)
         self.assertIn("payment_value_is_additive", sql)
 
+    def test_payment_rollup_does_not_count_a_left_join_placeholder_as_a_payment(self):
+        sql = (ROOT / "jobs/sql/23_g2e_order_metrics.sql.template").read_text(
+            encoding="utf-8"
+        )
+        all_payments = re.search(
+            r"(?s)all_payments AS \((.*?)\),\s*typed_payments AS \(", sql
+        )
+        self.assertIsNotNone(all_payments)
+        self.assertRegex(
+            all_payments.group(1),
+            r"count\(rows\.order_id\)\s+AS payment_row_count",
+        )
+        self.assertNotRegex(
+            all_payments.group(1), r"count\(\*\)\s+AS payment_row_count"
+        )
+
     def test_doris_ddl_defines_seven_immutable_run_scoped_tables(self):
         ddl = (ROOT / "infra/compose/doris/init/03_create_order_metrics.sql").read_text(
             encoding="utf-8"

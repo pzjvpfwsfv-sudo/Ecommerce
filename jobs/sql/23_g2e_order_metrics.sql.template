@@ -196,7 +196,7 @@ all_payments AS (
     SELECT totals.window_type, totals.window_start, totals.window_end,
            '__ALL__' AS payment_type, true AS is_all, totals.global_order_count,
            count(DISTINCT rows.order_id) AS payment_order_count,
-           count(*) AS payment_row_count,
+           count(rows.order_id) AS payment_row_count,
            count(DISTINCT IF(rows.payment_installments > 1, rows.order_id, NULL))
                AS installment_order_count,
            count(DISTINCT rows.order_id) AS payment_type_order_count,
