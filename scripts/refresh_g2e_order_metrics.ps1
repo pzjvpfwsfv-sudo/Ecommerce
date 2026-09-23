@@ -834,14 +834,16 @@ function Invoke-G2eDorisQuery {
 function Wait-G2eTrinoDependency {
     [CmdletBinding()]
     param(
+        [Parameter(Mandatory = $true)][string]$EnvFile,
         [int]$TimeoutSeconds = 300
     )
 
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
     do {
         try {
-            $null = Invoke-RestMethod -Method Get -Uri 'http://localhost:8088/v1/info' -TimeoutSec 5
-            return
+            $probe = @(Invoke-G2eMetricTrinoStatement -Name live_snapshots `
+                -Sql 'SELECT 1 AS ready;' -EnvFile $EnvFile)
+            if ($probe.Count -eq 1 -and [string]$probe[0].ready -ceq '1') { return }
         } catch {
         }
         Start-Sleep -Seconds 2
@@ -1334,7 +1336,7 @@ function Invoke-G2eRefresh {
             throw 'Docker Engine is unavailable for G2-E metric refresh.'
         }
         Start-G2eMetricServices -EnvFile $envFile
-        Wait-G2eTrinoDependency -TimeoutSeconds $TimeoutSeconds
+        Wait-G2eTrinoDependency -EnvFile $envFile -TimeoutSeconds $TimeoutSeconds
         $null = Get-G2eLiveSnapshotMap -Evidence $evidence -EnvFile $envFile
         $window = Get-G2eMetricWindow -Evidence $evidence -EnvFile $envFile
         $calculatedAt = [datetimeoffset]::UtcNow.ToString(

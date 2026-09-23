@@ -883,6 +883,23 @@ $rows = @(Invoke-G2eMetricTrinoStatement -Name ranking -Sql 'SELECT 1;' -EnvFile
         self.assertEqual("seller", payload["name"])
         self.assertTrue(payload["value_is_null"])
 
+    def test_trino_readiness_requires_a_successful_query_not_only_http_info(self):
+        payload = self.refresh_payload(
+            r'''
+$script:attempts = 0
+function Invoke-RestMethod { return [pscustomobject]@{ starting=$true } }
+function Invoke-G2eMetricTrinoStatement {
+    param([string]$Name, [string]$Sql, [string]$EnvFile)
+    $script:attempts++
+    if ($script:attempts -eq 1) { throw 'Trino server is still initializing' }
+    return @([pscustomobject]@{ ready='1' })
+}
+Wait-G2eTrinoDependency -EnvFile 'fixture.env' -TimeoutSeconds 5
+[ordered]@{ attempts=$script:attempts } | ConvertTo-Json -Compress
+'''
+        )
+        self.assertEqual(2, payload["attempts"])
+
     def test_metric_output_rejects_physical_link_escape_when_supported(self):
         payload = self.refresh_payload(
             r'''
