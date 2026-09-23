@@ -780,13 +780,35 @@ $accepted = Assert-G2eReportPath -SourceBundleSha256 ('a' * 64) -Path $paths.Rep
         ):
             self.assertRegex(script, rf"(?m)^function {function_name} \{{$")
         for required in (
-            "CSV_HEADER_UNQUOTED", "TERM=dumb", "Expect:100-continue",
+            "TERM=dumb", "Expect:100-continue",
             "strict_mode:true", "max_filter_ratio:0", "skip_lines:1",
             'enclose:"', "trim_double_quotes:true",
         ):
             self.assertIn(required, script)
         self.assertNotIn("$env:PATH =", script)
         self.assertNotIn("setx", script.lower())
+
+    def test_trino_transport_preserves_a_dimension_name_containing_a_comma(self):
+        payload = self.refresh_payload(
+            r'''
+$script:G2eDockerExecutable = 'docker-fixture'
+$capturedFormat = ''
+function Invoke-G2eComposeCommand {
+    param([string]$EnvFile, [string[]]$Arguments)
+    $formatIndex = [Array]::IndexOf($Arguments, '--output-format')
+    $script:capturedFormat = $Arguments[$formatIndex + 1]
+    if ($script:capturedFormat -ceq 'CSV_HEADER') {
+        return @('"dimension_name"', '"sao paulo, sp"')
+    }
+    return @('dimension_name', 'sao paulo", sp')
+}
+$rows = @(Invoke-G2eMetricTrinoStatement -Name ranking -Sql 'SELECT 1;' -EnvFile 'fixture.env')
+[ordered]@{ format=$script:capturedFormat; value=$rows[0].dimension_name } |
+    ConvertTo-Json -Compress
+'''
+        )
+        self.assertEqual("CSV_HEADER", payload["format"])
+        self.assertEqual("sao paulo, sp", payload["value"])
 
     def test_metric_output_rejects_physical_link_escape_when_supported(self):
         payload = self.refresh_payload(

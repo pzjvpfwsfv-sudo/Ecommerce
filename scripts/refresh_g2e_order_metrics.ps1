@@ -729,7 +729,7 @@ function Invoke-G2eMetricTrinoStatement {
     $arguments = [string[]]@(
         'exec', '-T', '-e', 'TERM=dumb', 'trino', 'trino', '--server', 'http://localhost:8080',
         '--catalog', 'lakehouse', '--schema', 'olist', '--output-format',
-        'CSV_HEADER_UNQUOTED', '--execute', $Sql
+        'CSV_HEADER', '--execute', $Sql
     )
     $lines = @(Invoke-G2eComposeCommand -EnvFile $EnvFile -Arguments $arguments)
     return @(ConvertFrom-G2eCsv -CsvText ($lines -join "`n"))
