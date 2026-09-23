@@ -354,27 +354,22 @@ function Assert-G2eAntiFanout {
         @('source_order_count', 'fact_order_count'), @('source_item_count', 'fact_item_count'),
         @('source_payment_count', 'fact_payment_count'), @('source_review_count', 'fact_review_count')
     )
-    $counts = [ordered]@{}
+    $evidence = [ordered]@{}
     foreach ($pair in $pairs) {
         $source = ConvertTo-G2eCount (Get-G2ePropertyValue $Row $pair[0]) $pair[0]
         $fact = ConvertTo-G2eCount (Get-G2ePropertyValue $Row $pair[1]) $pair[1]
         if ($source -ne $fact) { throw "G2-E anti-fanout row count differs: $($pair[0])." }
-        $counts[$pair[0]] = $source
+        $evidence[$pair[0]] = $source
+        $evidence[$pair[1]] = $fact
     }
     foreach ($prefix in @('item_value', 'freight_value', 'payment_value')) {
         $source = ConvertTo-G2eDecimal (Get-G2ePropertyValue $Row "source_${prefix}_sum") "source ${prefix} sum"
         $fact = ConvertTo-G2eDecimal (Get-G2ePropertyValue $Row "fact_${prefix}_sum") "fact ${prefix} sum"
         if ($source -ne $fact) { throw "G2-E anti-fanout amount differs: $prefix." }
+        $evidence["source_${prefix}_sum"] = $source.ToString('0.00', [Globalization.CultureInfo]::InvariantCulture)
+        $evidence["fact_${prefix}_sum"] = $fact.ToString('0.00', [Globalization.CultureInfo]::InvariantCulture)
     }
-    return [pscustomobject][ordered]@{
-        OrderCount = $counts.source_order_count
-        ItemRowCount = $counts.source_item_count
-        PaymentRowCount = $counts.source_payment_count
-        ReviewRowCount = $counts.source_review_count
-        ItemValueSum = (ConvertTo-G2eDecimal (Get-G2ePropertyValue $Row 'fact_item_value_sum') 'item sum').ToString('0.00', [Globalization.CultureInfo]::InvariantCulture)
-        FreightValueSum = (ConvertTo-G2eDecimal (Get-G2ePropertyValue $Row 'fact_freight_value_sum') 'freight sum').ToString('0.00', [Globalization.CultureInfo]::InvariantCulture)
-        PaymentValueSum = (ConvertTo-G2eDecimal (Get-G2ePropertyValue $Row 'fact_payment_value_sum') 'payment sum').ToString('0.00', [Globalization.CultureInfo]::InvariantCulture)
-    }
+    return [pscustomobject]$evidence
 }
 
 function Assert-G2eGrainReconciliation {

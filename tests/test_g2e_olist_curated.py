@@ -438,12 +438,19 @@ $evidence = Assert-G2eAntiFanout $valid
 $multiplied = $valid.PSObject.Copy(); $multiplied.fact_item_value_sum = '120.00'
 $lostReview = $valid.PSObject.Copy(); $lostReview.fact_review_count = 1
 [ordered]@{
-    order_count = $evidence.OrderCount
-    item_row_count = $evidence.ItemRowCount
-    payment_row_count = $evidence.PaymentRowCount
-    review_row_count = $evidence.ReviewRowCount
-    item_value_sum = $evidence.ItemValueSum
-    payment_value_sum = $evidence.PaymentValueSum
+    fields = @($evidence.PSObject.Properties.Name)
+    source_order_count = $evidence.source_order_count
+    fact_order_count = $evidence.fact_order_count
+    source_item_count = $evidence.source_item_count
+    fact_item_count = $evidence.fact_item_count
+    source_payment_count = $evidence.source_payment_count
+    fact_payment_count = $evidence.fact_payment_count
+    source_review_count = $evidence.source_review_count
+    fact_review_count = $evidence.fact_review_count
+    source_item_value_sum = $evidence.source_item_value_sum
+    fact_item_value_sum = $evidence.fact_item_value_sum
+    source_payment_value_sum = $evidence.source_payment_value_sum
+    fact_payment_value_sum = $evidence.fact_payment_value_sum
     multiplied_rejected = Test-Rejected { Assert-G2eAntiFanout $multiplied }
     lost_review_rejected = Test-Rejected { Assert-G2eAntiFanout $lostReview }
 } | ConvertTo-Json -Compress
@@ -452,12 +459,37 @@ $lostReview = $valid.PSObject.Copy(); $lostReview.fact_review_count = 1
         result = self.run_powershell(command)
         self.assertEqual(0, result.returncode, result.stderr or result.stdout)
         payload = json.loads(result.stdout.strip().splitlines()[-1])
-        self.assertEqual(1, payload["order_count"])
-        self.assertEqual(2, payload["item_row_count"])
-        self.assertEqual(2, payload["payment_row_count"])
-        self.assertEqual(2, payload["review_row_count"])
-        self.assertEqual("30.00", payload["item_value_sum"])
-        self.assertEqual("35.00", payload["payment_value_sum"])
+        self.assertEqual(
+            {
+                "source_order_count",
+                "fact_order_count",
+                "source_item_count",
+                "fact_item_count",
+                "source_payment_count",
+                "fact_payment_count",
+                "source_review_count",
+                "fact_review_count",
+                "source_item_value_sum",
+                "fact_item_value_sum",
+                "source_freight_value_sum",
+                "fact_freight_value_sum",
+                "source_payment_value_sum",
+                "fact_payment_value_sum",
+            },
+            set(payload["fields"]),
+        )
+        self.assertEqual(1, payload["source_order_count"])
+        self.assertEqual(1, payload["fact_order_count"])
+        self.assertEqual(2, payload["source_item_count"])
+        self.assertEqual(2, payload["fact_item_count"])
+        self.assertEqual(2, payload["source_payment_count"])
+        self.assertEqual(2, payload["fact_payment_count"])
+        self.assertEqual(2, payload["source_review_count"])
+        self.assertEqual(2, payload["fact_review_count"])
+        self.assertEqual("30.00", payload["source_item_value_sum"])
+        self.assertEqual("30.00", payload["fact_item_value_sum"])
+        self.assertEqual("35.00", payload["source_payment_value_sum"])
+        self.assertEqual("35.00", payload["fact_payment_value_sum"])
         self.assertTrue(payload["multiplied_rejected"])
         self.assertTrue(payload["lost_review_rejected"])
 
