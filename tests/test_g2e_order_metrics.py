@@ -758,6 +758,8 @@ $accepted = Assert-G2eReportPath -SourceBundleSha256 ('a' * 64) -Path $paths.Rep
     outside=Test-Rejected { Assert-G2eReportPath -SourceBundleSha256 ('a' * 64) -Path (Join-Path $script:G2eProjectRoot 'tmp\refresh.json') }
     wrong_name=Test-Rejected { Assert-G2eReportPath -SourceBundleSha256 ('a' * 64) -Path (Join-Path $paths.MetricsDirectory 'other.json') }
     unresolved=Test-Rejected { Assert-G2eRenderedMetricSql -Sql 'SELECT * FROM x FOR VERSION AS OF __ORDER_FACT_SNAPSHOT__;' }
+    sentinels=(-not (Test-Rejected { Assert-G2eRenderedMetricSql -Sql "SELECT '__ALL__', '__UNKNOWN__';" }))
+    unquoted_sentinel=Test-Rejected { Assert-G2eRenderedMetricSql -Sql 'SELECT __ALL__;' }
 } | ConvertTo-Json -Compress
 '''
         )
@@ -766,6 +768,7 @@ $accepted = Assert-G2eReportPath -SourceBundleSha256 ('a' * 64) -Path $paths.Rep
         self.assertEqual(payload["report"].lower(), payload["accepted"].lower())
         self.assertTrue(payload["c_drive"] and payload["outside"])
         self.assertTrue(payload["wrong_name"] and payload["unresolved"])
+        self.assertTrue(payload["sentinels"] and payload["unquoted_sentinel"])
 
     def test_refresh_transport_is_fixed_strict_and_process_local(self):
         script = (ROOT / "scripts/refresh_g2e_order_metrics.ps1").read_text(

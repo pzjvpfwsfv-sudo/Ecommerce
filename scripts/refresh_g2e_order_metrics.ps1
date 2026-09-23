@@ -268,7 +268,8 @@ function Assert-G2eRenderedMetricSql {
     [CmdletBinding()]
     param([Parameter(Mandatory = $true)][string]$Sql)
 
-    if ([string]::IsNullOrWhiteSpace($Sql) -or $Sql -match '__[A-Z0-9_]+__') {
+    $tokenScan = $Sql.Replace("'__ALL__'", '').Replace("'__UNKNOWN__'", '')
+    if ([string]::IsNullOrWhiteSpace($Sql) -or $tokenScan -match '__[A-Z0-9_]+__') {
         throw 'G2-E metric SQL contains an unresolved token.'
     }
     if ($Sql -match '(?im)^\s*(INSERT|UPDATE|DELETE|DROP|TRUNCATE|ALTER|REPLACE|CREATE)\b') {
