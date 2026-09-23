@@ -445,7 +445,10 @@ function Split-G2eNamedSql {
 
 function ConvertFrom-G2eCsv {
     [CmdletBinding()]
-    param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$CsvText)
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$CsvText,
+        [switch]$TreatEmptyAsNull
+    )
 
     $headers = $null
     $result = [Collections.Generic.List[object]]::new()
@@ -527,7 +530,8 @@ function ConvertFrom-G2eCsv {
             $row = [ordered]@{}
             for ($column = 0; $column -lt $headers.Count; $column++) {
                 $row[$headers[$column]] = if (
-                    -not $quoted[$column] -and $values[$column].Length -eq 0
+                    $values[$column].Length -eq 0 -and
+                    ($TreatEmptyAsNull -or -not $quoted[$column])
                 ) {
                     $null
                 } else {

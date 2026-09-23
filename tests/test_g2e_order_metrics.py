@@ -862,6 +862,27 @@ $rows = @(Invoke-G2eMetricTrinoStatement -Name ranking -Sql 'SELECT 1;' -EnvFile
             self.assertEqual(1, payload["count"])
             self.assertEqual("sao paulo, sp", payload["value"])
 
+    def test_trino_transport_maps_its_quoted_empty_null_encoding_to_null(self):
+        payload = self.refresh_payload(
+            r'''
+$script:G2eDockerExecutable = 'docker-fixture'
+function Invoke-G2eComposeCommand {
+    param([string]$EnvFile, [string[]]$Arguments)
+    return @(
+        '"dimension_name","ranking_payment_value_sum"',
+        '"seller",""'
+    )
+}
+$rows = @(Invoke-G2eMetricTrinoStatement -Name ranking -Sql 'SELECT 1;' -EnvFile 'fixture.env')
+[ordered]@{
+    name=$rows[0].dimension_name
+    value_is_null=($null -eq $rows[0].ranking_payment_value_sum)
+} | ConvertTo-Json -Compress
+'''
+        )
+        self.assertEqual("seller", payload["name"])
+        self.assertTrue(payload["value_is_null"])
+
     def test_metric_output_rejects_physical_link_escape_when_supported(self):
         payload = self.refresh_payload(
             r'''
