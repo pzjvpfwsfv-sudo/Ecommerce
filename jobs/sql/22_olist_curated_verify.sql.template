@@ -132,5 +132,4 @@ SELECT
     json_format(CAST(map(
         ARRAY['category_dim_v1','customer_dim_v1','geolocation_dim_v1','order_fact_v1','order_item_fact_v1','payment_fact_v1','product_dim_v1','review_fact_v1','seller_dim_v1'],
         ARRAY[CAST(__CATEGORY_DIM_SNAPSHOT__ AS varchar),CAST(__CUSTOMER_DIM_SNAPSHOT__ AS varchar),CAST(__GEOLOCATION_DIM_SNAPSHOT__ AS varchar),CAST(__ORDER_FACT_SNAPSHOT__ AS varchar),CAST(__ORDER_ITEM_FACT_SNAPSHOT__ AS varchar),CAST(__PAYMENT_FACT_SNAPSHOT__ AS varchar),CAST(__PRODUCT_DIM_SNAPSHOT__ AS varchar),CAST(__REVIEW_FACT_SNAPSHOT__ AS varchar),CAST(__SELLER_DIM_SNAPSHOT__ AS varchar)]
-    ) AS json)) AS curated_snapshots_json,
-    (SELECT lower(to_hex(sha256(to_utf8(array_join(array_agg(source_row_id ORDER BY source_row_number), chr(10)) || chr(10))))) FROM lakehouse.olist.orders_src_v1 FOR VERSION AS OF __ORDERS_SRC_SNAPSHOT__) AS orders_source_row_id_sequence_sha256;
+    ) AS json)) AS curated_snapshots_json;

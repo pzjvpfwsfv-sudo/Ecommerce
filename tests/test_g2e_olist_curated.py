@@ -211,10 +211,8 @@ class OlistCuratedSqlContractTest(unittest.TestCase):
             "payment_item_total_mismatch_count",
         ):
             self.assertIn(f"AS {alias}", sql)
-        self.assertIn(
-            "array_agg(source_row_id ORDER BY source_row_number)",
-            sql,
-        )
+        self.assertNotIn("array_agg(source_row_id ORDER BY source_row_number)", sql)
+        self.assertNotIn("orders_source_row_id_sequence_sha256", sql)
         self.assertNotRegex(sql, r"(?im)^\s*(DROP|DELETE|TRUNCATE|CREATE OR REPLACE)\b")
 
 
