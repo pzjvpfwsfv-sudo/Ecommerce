@@ -1,4 +1,6 @@
 from copy import deepcopy
+from datetime import UTC, date, datetime
+from decimal import Decimal
 import json
 import os
 from pathlib import Path
@@ -6,8 +8,9 @@ import sys
 import tempfile
 import types
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, Mock, patch
 
+from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
 
@@ -40,6 +43,13 @@ from app.order_models import (  # noqa: E402
     OrderReviewsResponse,
 )
 from app.dependencies import build_order_metrics_service  # noqa: E402
+from app.order_repository import OrderMetricsRepository  # noqa: E402
+from app.order_service import (  # noqa: E402
+    OrderMetricsRequestError,
+    OrderMetricsService,
+    OrderMetricsUnavailableError,
+)
+from app.main import create_app  # noqa: E402
 
 
 SOURCE_TABLES = {
@@ -63,6 +73,34 @@ CURATED_TABLES = {
     "order_item_fact_v1",
     "payment_fact_v1",
     "review_fact_v1",
+}
+SOURCE_ENTITIES = {
+    "orders",
+    "order_items",
+    "order_payments",
+    "order_reviews",
+    "customers",
+    "products",
+    "sellers",
+    "geolocation",
+    "category_translation",
+}
+FACT_RECONCILIATION_KEYS = {
+    "order_fact_expected_count",
+    "order_fact_row_count",
+    "order_item_fact_expected_count",
+    "order_item_fact_row_count",
+    "payment_fact_expected_count",
+    "payment_fact_row_count",
+    "review_fact_expected_count",
+    "review_fact_row_count",
+}
+REPORTABLE_QUALITY_KEYS = {
+    "unknown_order_status_count",
+    "unknown_payment_type_count",
+    "multi_review_order_count",
+    "lifecycle_order_anomaly_count",
+    "payment_item_total_mismatch_count",
 }
 
 
@@ -242,6 +280,221 @@ def publication_data(**overrides: object) -> dict[str, object]:
     }
     value.update(overrides)
     return value
+
+
+def _canonical_json(values: dict[str, object]) -> str:
+    return json.dumps(values, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def order_publication_row(**overrides: object) -> dict[str, object]:
+    source_snapshots = {
+        name: str(index) for index, name in enumerate(sorted(SOURCE_TABLES), 1)
+    }
+    curated_snapshots = {
+        name: str(index) for index, name in enumerate(sorted(CURATED_TABLES), 101)
+    }
+    row: dict[str, object] = {
+        "metric_run_id": f"orders-v1-b{'a' * 64}",
+        "dataset_id": "olist-brazilian-ecommerce-v2",
+        "metric_version": "orders-v1",
+        "source_bundle_sha256": "a" * 64,
+        "source_snapshots_json": _canonical_json(source_snapshots),
+        "curated_snapshots_json": _canonical_json(curated_snapshots),
+        "implementation_revision": "1" * 40,
+        "source_order_count": 2,
+        "window_start": date(2017, 1, 1),
+        "window_end": date(2017, 1, 2),
+        "calculated_at": datetime(2026, 9, 22, 8, 0, 0),
+        "published_at": datetime(2026, 9, 22, 8, 1, 0),
+        "overview_row_count": 1,
+        "overview_sha256": "1" * 64,
+        "delivery_row_count": 1,
+        "delivery_sha256": "2" * 64,
+        "payment_row_count": 1,
+        "payment_sha256": "3" * 64,
+        "ranking_row_count": 1,
+        "ranking_sha256": "4" * 64,
+        "review_row_count": 1,
+        "review_sha256": "5" * 64,
+        "quality_row_count": 1,
+        "quality_sha256": "6" * 64,
+        "status": "PUBLISHED",
+    }
+    row.update(overrides)
+    return row
+
+
+def order_identity_row(**overrides: object) -> dict[str, object]:
+    row: dict[str, object] = {
+        "metric_run_id": f"orders-v1-b{'a' * 64}",
+        "dataset_id": "olist-brazilian-ecommerce-v2",
+        "metric_version": "orders-v1",
+        "window_type": "FULL",
+        "window_start": date(2017, 1, 1),
+        "window_end": date(2017, 1, 2),
+    }
+    row.update(overrides)
+    return row
+
+
+def order_overview_row(**overrides: object) -> dict[str, object]:
+    row = order_identity_row(
+        order_count=2,
+        delivered_order_count=1,
+        canceled_order_count=1,
+        unavailable_order_count=0,
+        status_eligible_order_count=2,
+        status_excluded_order_count=0,
+        delivered_rate=Decimal("0.500000"),
+        canceled_rate=Decimal("0.500000"),
+        unique_customer_count=2,
+        repeat_customer_count=0,
+        repeat_customer_rate=Decimal("0.000000"),
+        item_row_count=2,
+        item_value_sum=Decimal("30.00"),
+        freight_value_sum=Decimal("5.00"),
+        payment_value_sum=Decimal("35.00"),
+        items_per_order_avg=Decimal("1.000000"),
+    )
+    row.update(overrides)
+    return row
+
+
+def order_delivery_row(**overrides: object) -> dict[str, object]:
+    row = order_identity_row(
+        delivery_eligible_order_count=1,
+        delivery_excluded_order_count=1,
+        delivery_days_avg=Decimal("3.000000"),
+        delivery_days_p50=Decimal("3.000000"),
+        delivery_days_p90=Decimal("3.000000"),
+        late_delivery_order_count=0,
+        late_delivery_eligible_order_count=1,
+        late_delivery_excluded_order_count=1,
+        late_delivery_rate=Decimal("0.000000"),
+    )
+    row.update(overrides)
+    return row
+
+
+def order_payment_row(**overrides: object) -> dict[str, object]:
+    row = order_identity_row(
+        payment_type="__ALL__",
+        is_all=1,
+        global_order_count=2,
+        payment_order_count=2,
+        payment_row_count=2,
+        installment_order_count=1,
+        payment_type_order_count=2,
+        payment_type_value_sum=Decimal("35.00"),
+    )
+    row.update(overrides)
+    return row
+
+
+def order_ranking_row(**overrides: object) -> dict[str, object]:
+    row = order_identity_row(
+        dimension_type="customer_state",
+        dimension_id="SP",
+        dimension_name="SP",
+        is_unknown=0,
+        ranking_order_count=2,
+        ranking_item_row_count=None,
+        ranking_customer_count=2,
+        ranking_item_value_sum=None,
+        ranking_freight_value_sum=None,
+        ranking_payment_value_sum=Decimal("35.00"),
+        ranking_late_delivery_order_count=0,
+        ranking_late_delivery_eligible_order_count=1,
+        ranking_late_delivery_rate=Decimal("0.000000"),
+        payment_value_is_additive=1,
+    )
+    row.update(overrides)
+    return row
+
+
+def order_review_row(**overrides: object) -> dict[str, object]:
+    row = order_identity_row(
+        review_row_count=2,
+        reviewed_order_count=2,
+        all_order_count=2,
+        review_coverage_rate=Decimal("1.000000"),
+        review_score_avg=Decimal("4.000000"),
+        low_score_order_count=1,
+        low_score_rate=Decimal("0.500000"),
+        multi_review_order_count=0,
+    )
+    row.update(overrides)
+    return row
+
+
+def order_quality_row(**overrides: object) -> dict[str, object]:
+    raw_counts = {name: 2 for name in SOURCE_ENTITIES}
+    normalized_counts = {name: 2 for name in SOURCE_ENTITIES}
+    iceberg_counts = {name: 2 for name in SOURCE_TABLES}
+    normalized_hashes = {name: "b" * 64 for name in SOURCE_ENTITIES}
+    source_snapshots = {
+        name: str(index) for index, name in enumerate(sorted(SOURCE_TABLES), 1)
+    }
+    curated_snapshots = {
+        name: str(index) for index, name in enumerate(sorted(CURATED_TABLES), 101)
+    }
+    fact_reconciliations = {name: 2 for name in FACT_RECONCILIATION_KEYS}
+    reportable_quality = {name: 0 for name in REPORTABLE_QUALITY_KEYS}
+    row = order_identity_row(
+        source_row_count=2,
+        iceberg_row_count=2,
+        duplicate_key_count=0,
+        orphan_key_count=0,
+        invalid_value_count=0,
+        temporal_anomaly_count=0,
+        amount_comparable_order_count=2,
+        amount_reconciled_order_count=2,
+        amount_mismatch_order_count=0,
+        amount_reconciliation_rate=Decimal("1.000000"),
+        payment_item_freight_abs_difference_avg=Decimal("0.000000"),
+        payment_item_freight_abs_difference_p50=Decimal("0.000000"),
+        payment_item_freight_abs_difference_p90=Decimal("0.000000"),
+        raw_row_counts_json=_canonical_json(raw_counts),
+        normalized_row_counts_json=_canonical_json(normalized_counts),
+        iceberg_row_counts_json=_canonical_json(iceberg_counts),
+        normalized_sha256_json=_canonical_json(normalized_hashes),
+        source_snapshots_json=_canonical_json(source_snapshots),
+        curated_snapshots_json=_canonical_json(curated_snapshots),
+        fact_reconciliations_json=_canonical_json(fact_reconciliations),
+        reportable_quality_json=_canonical_json(reportable_quality),
+        reconciliation_status="PASS",
+    )
+    row.update(overrides)
+    return row
+
+
+def make_order_repository(
+    *, rows: list[dict[str, object]] | None = None, row: dict[str, object] | None = None
+) -> tuple[OrderMetricsRepository, MagicMock, Mock]:
+    cursor = MagicMock()
+    cursor.fetchall.return_value = [] if rows is None else rows
+    cursor.fetchone.return_value = row
+    connection = MagicMock()
+    connection.__enter__.return_value = connection
+    connection.cursor.return_value.__enter__.return_value = cursor
+    connect = Mock(return_value=connection)
+    return OrderMetricsRepository(connect), cursor, connect
+
+
+def make_order_service(**repository_overrides: object) -> tuple[OrderMetricsService, Mock]:
+    repository = Mock()
+    repository.fetch_latest_publication.return_value = order_publication_row()
+    repository.fetch_family_row_count.return_value = 1
+    repository.fetch_overview.return_value = [order_overview_row()]
+    repository.fetch_delivery.return_value = [order_delivery_row()]
+    repository.fetch_payments.return_value = [order_payment_row()]
+    repository.fetch_rankings.return_value = [order_ranking_row()]
+    repository.fetch_reviews.return_value = [order_review_row()]
+    repository.fetch_quality.return_value = order_quality_row()
+    for name, value in repository_overrides.items():
+        getattr(repository, name).return_value = value
+    catalog = OrderMetricDefinitionCatalog.load(DEFINITIONS)
+    return OrderMetricsService(repository, catalog), repository
 
 
 class OrderModelAndCatalogTests(unittest.TestCase):
@@ -439,6 +692,307 @@ class OrderModelAndCatalogTests(unittest.TestCase):
             service = build_order_metrics_service(settings)
         self.assertEqual(("repository", "analytics"), service.repository)
         self.assertEqual(REQUIRED_ORDER_METRICS, frozenset(item.metric_name for item in service.catalog.all()))
+
+
+class OrderMetricsRepositoryTests(unittest.TestCase):
+    def test_repository_uses_fixed_queries_bound_values_and_physical_sort_columns(self):
+        repository, cursor, _ = make_order_repository(row=order_publication_row())
+        publication = repository.fetch_latest_publication()
+        self.assertEqual("PUBLISHED", publication["status"])
+        query, parameters = cursor.execute.call_args.args
+        self.assertIn("FROM order_metric_publications WHERE status = %s", query)
+        self.assertIn("ORDER BY published_at DESC, metric_run_id DESC LIMIT 1", query)
+        self.assertEqual(("PUBLISHED",), parameters)
+
+        cursor.reset_mock()
+        cursor.fetchall.return_value = [order_overview_row(window_type="DAY")]
+        rows = repository.fetch_overview(
+            f"orders-v1-b{'a' * 64}", "day", date(2017, 1, 1), date(2017, 1, 2)
+        )
+        self.assertEqual(1, len(rows))
+        query, parameters = cursor.execute.call_args.args
+        self.assertIn("FROM order_metric_overview", query)
+        self.assertIn("window_start >= %s AND window_end <= %s", query)
+        self.assertEqual(
+            (f"orders-v1-b{'a' * 64}", "DAY", date(2017, 1, 1), date(2017, 1, 2)),
+            parameters,
+        )
+
+        cursor.reset_mock()
+        cursor.fetchall.return_value = [order_ranking_row(dimension_type="product")]
+        repository.fetch_rankings(
+            f"orders-v1-b{'a' * 64}",
+            "product",
+            "full",
+            None,
+            None,
+            "item_value",
+            20,
+        )
+        query, parameters = cursor.execute.call_args.args
+        self.assertIn(
+            "ORDER BY ranking_item_value_sum DESC, dimension_id ASC, window_start ASC LIMIT %s",
+            query,
+        )
+        self.assertEqual(
+            (f"orders-v1-b{'a' * 64}", "product", "FULL", 20), parameters
+        )
+
+        cursor.reset_mock()
+        cursor.fetchone.return_value = {"row_count": 7}
+        self.assertEqual(
+            7,
+            repository.fetch_family_row_count(f"orders-v1-b{'a' * 64}", "quality"),
+        )
+        query, parameters = cursor.execute.call_args.args
+        self.assertEqual(
+            "SELECT COUNT(*) AS row_count FROM order_metric_quality WHERE metric_run_id = %s",
+            query,
+        )
+        self.assertEqual((f"orders-v1-b{'a' * 64}",), parameters)
+
+    def test_repository_rejects_untrusted_query_shapes_before_connecting(self):
+        repository, _, connect = make_order_repository()
+        run_id = f"orders-v1-b{'a' * 64}"
+        invalid_calls = (
+            lambda: repository.fetch_overview(run_id, "week", None, None),
+            lambda: repository.fetch_overview(run_id, "day", date(2017, 1, 1), None),
+            lambda: repository.fetch_overview(
+                run_id, "full", date(2017, 1, 1), date(2017, 1, 2)
+            ),
+            lambda: repository.fetch_overview(
+                run_id, "day", date(2017, 1, 2), date(2017, 1, 1)
+            ),
+            lambda: repository.fetch_rankings(
+                run_id, "product; DROP TABLE x", "full", None, None, "order_count", 20
+            ),
+            lambda: repository.fetch_rankings(
+                run_id, "product", "full", None, None, "payment_value", 20
+            ),
+            lambda: repository.fetch_rankings(
+                run_id, "customer_state", "full", None, None, "item_value", 20
+            ),
+            lambda: repository.fetch_rankings(
+                run_id, "product", "full", None, None, "order_count", True
+            ),
+            lambda: repository.fetch_rankings(
+                run_id, "product", "full", None, None, "order_count", "20"
+            ),
+            lambda: repository.fetch_family_row_count(run_id, "quality; DROP TABLE x"),
+        )
+        for operation in invalid_calls:
+            with self.subTest(operation=operation), self.assertRaises(ValueError):
+                operation()
+        connect.assert_not_called()
+
+
+class OrderMetricsServiceTests(unittest.TestCase):
+    def test_all_responses_use_one_published_identity_and_typed_values(self):
+        service, repository = make_order_service()
+
+        publication = service.get_publication()
+        overview = service.get_overview("full", None, None)
+        delivery = service.get_delivery("full", None, None)
+        payments = service.get_payments("full", None, None)
+        rankings = service.get_rankings(
+            "customer_state", "full", None, None, "payment_value", 20
+        )
+        reviews = service.get_reviews("full", None, None)
+        quality = service.get_quality()
+        definitions = service.get_definitions()
+
+        for response in (
+            publication,
+            overview,
+            delivery,
+            payments,
+            rankings,
+            reviews,
+            quality,
+        ):
+            self.assertEqual(f"orders-v1-b{'a' * 64}", response.meta.metric_run_id)
+            self.assertEqual("unspecified", response.meta.source_timezone)
+            self.assertIsNone(response.meta.source_currency)
+            self.assertTrue(response.meta.warnings)
+        self.assertEqual("30.00", overview.data[0].item_value_sum)
+        self.assertEqual("35.00", payments.data[0].payment_value_sum)
+        self.assertTrue(rankings.data[0].payment_value_is_additive)
+        self.assertEqual(2, quality.data.raw_row_counts["orders"])
+        self.assertEqual(REQUIRED_ORDER_METRICS, frozenset(d.metric_name for d in definitions.definitions))
+        repository.fetch_overview.assert_called_once_with(
+            f"orders-v1-b{'a' * 64}", "full", None, None
+        )
+
+    def test_publication_rejects_every_identity_snapshot_and_range_gap(self):
+        canonical_source = order_publication_row()["source_snapshots_json"]
+        incomplete_source = json.loads(canonical_source)
+        incomplete_source.pop(next(iter(incomplete_source)))
+        cases: tuple[dict[str, object] | None, ...] = (
+            None,
+            {"status": "FAILED"},
+            {"dataset_id": "other"},
+            {"metric_version": "orders-v2"},
+            {"metric_run_id": f"orders-v1-b{'b' * 64}"},
+            {"source_bundle_sha256": "A" * 64},
+            {"source_snapshots_json": json.dumps(json.loads(canonical_source))},
+            {"source_snapshots_json": _canonical_json(incomplete_source)},
+            {"source_order_count": 0},
+            {"window_start": date(2017, 1, 3)},
+            {"implementation_revision": "A" * 40},
+            {"overview_sha256": "A" * 64},
+        )
+        for mutation in cases:
+            repository = Mock()
+            repository.fetch_latest_publication.return_value = (
+                None if mutation is None else order_publication_row(**mutation)
+            )
+            repository.fetch_family_row_count.return_value = 1
+            service = OrderMetricsService(
+                repository, OrderMetricDefinitionCatalog.load(DEFINITIONS)
+            )
+            with self.subTest(mutation=mutation), self.assertRaises(
+                OrderMetricsUnavailableError
+            ) as raised:
+                service.get_publication()
+            self.assertNotIn("SELECT", str(raised.exception))
+
+    def test_family_integrity_decimal_quality_and_ordering_fail_closed(self):
+        failures = (
+            ("overview", {"fetch_overview": [order_overview_row(dataset_id="other")]}),
+            ("overview", {"fetch_overview": [order_overview_row(item_value_sum="30.00")]}),
+            ("overview", {"fetch_family_row_count": 2}),
+            ("overview", {"fetch_overview": [
+                order_overview_row(window_type="DAY", window_start=date(2017, 1, 2), window_end=date(2017, 1, 2)),
+                order_overview_row(window_type="DAY", window_start=date(2017, 1, 1), window_end=date(2017, 1, 1)),
+            ]}),
+            ("quality", {"fetch_quality": order_quality_row(reconciliation_status="FAILED")}),
+            ("quality", {"fetch_quality": order_quality_row(raw_row_counts_json=_canonical_json({"orders": -1}))}),
+        )
+        for family, overrides in failures:
+            service, repository = make_order_service()
+            for method_name, value in overrides.items():
+                getattr(repository, method_name).return_value = value
+            operation = (
+                service.get_quality
+                if family == "quality"
+                else lambda: service.get_overview("day", None, None)
+            )
+            with self.subTest(family=family, overrides=overrides), self.assertRaises(
+                OrderMetricsUnavailableError
+            ):
+                operation()
+
+    def test_request_ranges_are_rejected_before_family_queries(self):
+        invalid = (
+            ("day", date(2017, 1, 1), None),
+            ("full", date(2017, 1, 1), date(2017, 1, 2)),
+            ("day", date(2017, 1, 2), date(2017, 1, 1)),
+            ("day", date(2016, 12, 31), date(2017, 1, 1)),
+        )
+        for window, start, end in invalid:
+            service, repository = make_order_service()
+            with self.subTest(window=window, start=start, end=end), self.assertRaises(
+                OrderMetricsRequestError
+            ):
+                service.get_overview(window, start, end)
+            repository.fetch_overview.assert_not_called()
+
+
+class OrderMetricsRouteTests(unittest.TestCase):
+    def setUp(self) -> None:
+        real_service, _ = make_order_service()
+        self.service = Mock()
+        self.service.get_publication.return_value = real_service.get_publication()
+        self.service.get_overview.return_value = real_service.get_overview("full", None, None)
+        self.service.get_delivery.return_value = real_service.get_delivery("full", None, None)
+        self.service.get_payments.return_value = real_service.get_payments("full", None, None)
+        self.service.get_rankings.return_value = real_service.get_rankings(
+            "customer_state", "full", None, None, "payment_value", 20
+        )
+        self.service.get_reviews.return_value = real_service.get_reviews("full", None, None)
+        self.service.get_quality.return_value = real_service.get_quality()
+        self.service.get_definitions.return_value = real_service.get_definitions()
+        self.behavior_service = Mock()
+        app = create_app(
+            repository=Mock(),
+            analysis_service=Mock(),
+            tool_analysis_service=Mock(),
+            readiness_service=Mock(),
+            behavior_service=self.behavior_service,
+            order_service=self.service,
+        )
+        self.client = TestClient(app)
+
+    def test_all_eight_order_contracts_use_the_injected_service(self):
+        responses = (
+            self.client.get("/api/v1/orders/publication"),
+            self.client.get("/api/v1/orders/overview"),
+            self.client.get("/api/v1/orders/delivery"),
+            self.client.get("/api/v1/orders/payments"),
+            self.client.get(
+                "/api/v1/orders/rankings",
+                params={"dimension": "customer_state", "sort_by": "payment_value"},
+            ),
+            self.client.get("/api/v1/orders/reviews"),
+            self.client.get("/api/v1/orders/quality"),
+            self.client.get(
+                "/api/v1/metrics/definitions",
+                params={"domain": "orders", "version": "orders-v1"},
+            ),
+        )
+        self.assertTrue(all(response.status_code == 200 for response in responses))
+        self.assertTrue(all(response.json().get("meta", {}).get("metric_version") == "orders-v1" for response in responses[:7]))
+        self.assertEqual("orders-v1", responses[-1].json()["metric_version"])
+        self.service.get_rankings.assert_called_once_with(
+            "customer_state", "full", None, None, "payment_value", 20
+        )
+
+    def test_invalid_query_combinations_return_422_before_service_calls(self):
+        invalid_requests = (
+            ("/api/v1/orders/overview", {"start_date": "not-a-date", "end_date": "2017-01-02"}),
+            ("/api/v1/orders/overview", {"window": "day", "start_date": "2017-01-01"}),
+            ("/api/v1/orders/overview", {"window": "full", "start_date": "2017-01-01", "end_date": "2017-01-02"}),
+            ("/api/v1/orders/rankings", {"dimension": "product", "sort_by": "payment_value"}),
+            ("/api/v1/orders/rankings", {"dimension": "product", "limit": 101}),
+            ("/api/v1/metrics/definitions", {"domain": "behavior", "version": "orders-v1"}),
+            ("/api/v1/metrics/definitions", {"domain": "orders", "version": "behavior-v1"}),
+        )
+        for path, parameters in invalid_requests:
+            with self.subTest(path=path, parameters=parameters):
+                response = self.client.get(path, params=parameters)
+                self.assertEqual(422, response.status_code)
+        self.service.get_overview.assert_not_called()
+        self.service.get_rankings.assert_not_called()
+        self.service.get_definitions.assert_not_called()
+        self.behavior_service.get_definitions.assert_not_called()
+
+    def test_order_failures_return_safe_logged_503(self):
+        self.service.get_overview.side_effect = OrderMetricsUnavailableError(
+            "SELECT password FROM internal.host"
+        )
+        with patch("app.main.logger.error") as log_error:
+            response = self.client.get("/api/v1/orders/overview")
+        self.assertEqual(503, response.status_code)
+        self.assertEqual(
+            {"detail": "order metrics are temporarily unavailable"}, response.json()
+        )
+        log_error.assert_called_once_with(
+            "order_metrics_unavailable",
+            extra={
+                "stage": "order_overview",
+                "error_type": "OrderMetricsUnavailableError",
+            },
+        )
+
+        self.service.get_definitions.side_effect = OrderMetricsUnavailableError(
+            "invalid catalog /secret/path"
+        )
+        response = self.client.get(
+            "/api/v1/metrics/definitions",
+            params={"domain": "orders", "version": "orders-v1"},
+        )
+        self.assertEqual(503, response.status_code)
+        self.assertNotIn("secret", response.text)
 
 
 if __name__ == "__main__":
