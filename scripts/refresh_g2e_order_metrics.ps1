@@ -693,12 +693,23 @@ function Invoke-G2eComposeCommand {
     if ([string]::IsNullOrWhiteSpace([string]$script:G2eDockerExecutable)) {
         throw 'G2-E Docker executable was not initialized.'
     }
-    $output = @(& $script:G2eDockerExecutable compose --env-file $EnvFile `
+    $captured = @(& $script:G2eDockerExecutable compose --env-file $EnvFile `
         -f $script:G2eComposeFile @Arguments 2>&1)
-    if ($LASTEXITCODE -ne 0) {
-        throw "G2-E Docker Compose command failed: $($output -join ' ')"
+    $exitCode = $LASTEXITCODE
+    $standardOutput = [Collections.Generic.List[string]]::new()
+    $standardError = [Collections.Generic.List[string]]::new()
+    foreach ($item in $captured) {
+        if ($item -is [Management.Automation.ErrorRecord]) {
+            $standardError.Add([string]$item)
+        } else {
+            $standardOutput.Add([string]$item)
+        }
     }
-    return $output
+    if ($exitCode -ne 0) {
+        $diagnostics = @($standardOutput.ToArray()) + @($standardError.ToArray())
+        throw "G2-E Docker Compose command failed: $($diagnostics -join ' ')"
+    }
+    return [string[]]$standardOutput.ToArray()
 }
 
 function Start-G2eMetricServices {

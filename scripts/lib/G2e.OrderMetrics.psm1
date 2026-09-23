@@ -447,16 +447,28 @@ function ConvertFrom-G2eCsv {
     [CmdletBinding()]
     param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$CsvText)
 
-    $records = [Collections.Generic.List[object]]::new()
-    $fields = [Collections.Generic.List[object]]::new()
+    $headers = $null
+    $result = [Collections.Generic.List[object]]::new()
+    $fields = [Collections.Generic.List[string]]::new()
+    $quotedFields = [Collections.Generic.List[bool]]::new()
     $field = [Text.StringBuilder]::new()
     $inQuotes = $false
     $afterQuote = $false
     $fieldQuoted = $false
     $rowStarted = $false
 
-    for ($index = 0; $index -lt $CsvText.Length; $index++) {
-        $character = $CsvText[$index]
+    for ($index = 0; $index -le $CsvText.Length; $index++) {
+        $syntheticEnd = $index -eq $CsvText.Length
+        if ($syntheticEnd) {
+            if ($inQuotes) { throw 'Malformed CSV contains an unterminated quoted field.' }
+            if (-not ($afterQuote -or $rowStarted -or $fields.Count -gt 0 -or $field.Length -gt 0)) {
+                break
+            }
+            $character = "`n"
+        } else {
+            $character = $CsvText[$index]
+        }
+
         if ($inQuotes) {
             if ($character -eq '"') {
                 if ($index + 1 -lt $CsvText.Length -and $CsvText[$index + 1] -eq '"') {
@@ -464,61 +476,79 @@ function ConvertFrom-G2eCsv {
                 } else {
                     $inQuotes = $false; $afterQuote = $true
                 }
-            } else { $null = $field.Append($character) }
+            } else {
+                $null = $field.Append($character)
+            }
             continue
         }
+
+        $recordEnded = $false
         if ($afterQuote) {
             if ($character -eq ',') {
-                $fields.Add([pscustomobject]@{ Value = $field.ToString(); Quoted = $fieldQuoted })
-                $null = $field.Clear(); $afterQuote = $false; $fieldQuoted = $false; $rowStarted = $true
+                $fields.Add($field.ToString()); $quotedFields.Add($fieldQuoted)
+                $null = $field.Clear(); $afterQuote = $false; $fieldQuoted = $false
+                $rowStarted = $true
             } elseif ($character -eq "`r" -or $character -eq "`n") {
-                $fields.Add([pscustomobject]@{ Value = $field.ToString(); Quoted = $fieldQuoted })
-                $records.Add([object[]]$fields.ToArray())
-                $fields = [Collections.Generic.List[object]]::new(); $null = $field.Clear()
-                $afterQuote = $false; $fieldQuoted = $false; $rowStarted = $false
-                if ($character -eq "`r" -and $index + 1 -lt $CsvText.Length -and $CsvText[$index + 1] -eq "`n") { $index++ }
-            } else { throw 'Malformed CSV follows a closing quote.' }
-            continue
-        }
-        if ($character -eq '"') {
-            if ($field.Length -ne 0 -or $fieldQuoted) { throw 'Malformed CSV contains a quote in an unquoted field.' }
+                $recordEnded = $true
+            } else {
+                throw 'Malformed CSV follows a closing quote.'
+            }
+        } elseif ($character -eq '"') {
+            if ($field.Length -ne 0 -or $fieldQuoted) {
+                throw 'Malformed CSV contains a quote in an unquoted field.'
+            }
             $inQuotes = $true; $fieldQuoted = $true; $rowStarted = $true
         } elseif ($character -eq ',') {
-            $fields.Add([pscustomobject]@{ Value = $field.ToString(); Quoted = $fieldQuoted })
+            $fields.Add($field.ToString()); $quotedFields.Add($fieldQuoted)
             $null = $field.Clear(); $fieldQuoted = $false; $rowStarted = $true
         } elseif ($character -eq "`r" -or $character -eq "`n") {
-            $fields.Add([pscustomobject]@{ Value = $field.ToString(); Quoted = $fieldQuoted })
-            $records.Add([object[]]$fields.ToArray())
-            $fields = [Collections.Generic.List[object]]::new(); $null = $field.Clear()
-            $fieldQuoted = $false; $rowStarted = $false
-            if ($character -eq "`r" -and $index + 1 -lt $CsvText.Length -and $CsvText[$index + 1] -eq "`n") { $index++ }
+            $recordEnded = $true
         } else {
             $null = $field.Append($character); $rowStarted = $true
         }
-    }
-    if ($inQuotes) { throw 'Malformed CSV contains an unterminated quoted field.' }
-    if ($afterQuote -or $rowStarted -or $fields.Count -gt 0 -or $field.Length -gt 0) {
-        $fields.Add([pscustomobject]@{ Value = $field.ToString(); Quoted = $fieldQuoted })
-        $records.Add([object[]]$fields.ToArray())
-    }
-    if ($records.Count -lt 2) { throw 'G2-E CSV must contain a header and at least one row.' }
-    $headers = [string[]]@($records[0] | ForEach-Object { [string]$_.Value })
-    $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
-    foreach ($header in $headers) {
-        if ([string]::IsNullOrWhiteSpace($header) -or -not $seen.Add($header)) {
-            throw 'G2-E CSV headers must be nonempty and unique.'
+
+        if (-not $recordEnded) { continue }
+
+        $fields.Add($field.ToString()); $quotedFields.Add($fieldQuoted)
+        $values = [string[]]$fields.ToArray()
+        $quoted = [bool[]]$quotedFields.ToArray()
+        if ($null -eq $headers) {
+            $headers = $values
+            $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+            foreach ($header in $headers) {
+                if ([string]::IsNullOrWhiteSpace($header) -or -not $seen.Add($header)) {
+                    throw 'G2-E CSV headers must be nonempty and unique.'
+                }
+            }
+        } else {
+            if ($values.Count -ne $headers.Count) {
+                throw 'G2-E CSV row has an inconsistent column count.'
+            }
+            $row = [ordered]@{}
+            for ($column = 0; $column -lt $headers.Count; $column++) {
+                $row[$headers[$column]] = if (
+                    -not $quoted[$column] -and $values[$column].Length -eq 0
+                ) {
+                    $null
+                } else {
+                    $values[$column]
+                }
+            }
+            $result.Add([pscustomobject]$row)
+        }
+
+        $fields = [Collections.Generic.List[string]]::new()
+        $quotedFields = [Collections.Generic.List[bool]]::new()
+        $null = $field.Clear()
+        $afterQuote = $false; $fieldQuoted = $false; $rowStarted = $false
+        if (-not $syntheticEnd -and $character -eq "`r" -and
+                $index + 1 -lt $CsvText.Length -and $CsvText[$index + 1] -eq "`n") {
+            $index++
         }
     }
-    $result = [Collections.Generic.List[object]]::new()
-    for ($rowIndex = 1; $rowIndex -lt $records.Count; $rowIndex++) {
-        $values = [object[]]$records[$rowIndex]
-        if ($values.Count -ne $headers.Count) { throw 'G2-E CSV row has an inconsistent column count.' }
-        $row = [ordered]@{}
-        for ($column = 0; $column -lt $headers.Count; $column++) {
-            $cell = $values[$column]
-            $row[$headers[$column]] = if (-not $cell.Quoted -and $cell.Value.Length -eq 0) { $null } else { [string]$cell.Value }
-        }
-        $result.Add([pscustomobject]$row)
+
+    if ($null -eq $headers -or $result.Count -lt 1) {
+        throw 'G2-E CSV must contain a header and at least one row.'
     }
     return @($result.ToArray())
 }

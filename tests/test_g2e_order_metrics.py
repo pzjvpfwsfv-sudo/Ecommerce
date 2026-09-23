@@ -399,6 +399,19 @@ $rows = ConvertFrom-G2eCsv "id,note,nullable`r`n1,`"a,b`",`r`n2,`"`",x`r`n"
         self.assertTrue(payload["short_row"])
         self.assertTrue(payload["bad_quote"])
 
+    def test_csv_parser_rejects_an_invalid_header_before_scanning_the_body(self):
+        payload = self.payload(
+            r'''
+$message = ''
+try { $null = ConvertFrom-G2eCsv ",value`n1,`"unterminated" }
+catch { $message = $_.Exception.Message }
+[ordered]@{ message=$message } | ConvertTo-Json -Compress
+'''
+        )
+        self.assertEqual(
+            "G2-E CSV headers must be nonempty and unique.", payload["message"]
+        )
+
     def test_quality_merge_reconciles_manifest_source_and_curated_evidence(self):
         payload = self.payload(
             r'''
@@ -809,6 +822,29 @@ $rows = @(Invoke-G2eMetricTrinoStatement -Name ranking -Sql 'SELECT 1;' -EnvFile
         )
         self.assertEqual("CSV_HEADER", payload["format"])
         self.assertEqual("sao paulo, sp", payload["value"])
+
+    def test_trino_transport_keeps_success_warnings_out_of_csv_rows(self):
+        with tempfile.TemporaryDirectory(dir=ROOT / "tmp") as temporary:
+            executable = Path(temporary) / "docker-fixture.cmd"
+            executable.write_text(
+                '@echo off\n'
+                '>&2 echo WARNING: diagnostic only\n'
+                'echo "dimension_name"\n'
+                'echo "sao paulo, sp"\n'
+                'exit /b 0\n',
+                encoding="ascii",
+            )
+            escaped = str(executable).replace("'", "''")
+            payload = self.refresh_payload(
+                rf'''
+$script:G2eDockerExecutable = '{escaped}'
+$rows = @(Invoke-G2eMetricTrinoStatement -Name ranking -Sql 'SELECT 1;' -EnvFile 'fixture.env')
+[ordered]@{{ count=$rows.Count; value=$rows[0].dimension_name }} |
+    ConvertTo-Json -Compress
+'''
+            )
+            self.assertEqual(1, payload["count"])
+            self.assertEqual("sao paulo, sp", payload["value"])
 
     def test_metric_output_rejects_physical_link_escape_when_supported(self):
         payload = self.refresh_payload(
