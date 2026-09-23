@@ -822,6 +822,47 @@ $accepted = Assert-G2eReportPath -SourceBundleSha256 ('a' * 64) -Path $paths.Rep
         self.assertNotIn("$env:PATH =", script)
         self.assertNotIn("setx", script.lower())
 
+    def test_refresh_stages_query_and_serving_services_for_local_memory(self):
+        script = (ROOT / "scripts/refresh_g2e_order_metrics.ps1").read_text(
+            encoding="utf-8"
+        )
+        function_names = (
+            "Stop-G2eDormantMetricServices",
+            "Start-G2eMetricQueryServices",
+            "Stop-G2eMetricQueryServices",
+            "Start-G2eMetricServingServices",
+        )
+        for function_name in function_names:
+            self.assertIn(f"function {function_name} {{", script)
+
+        refresh = script.split("function Invoke-G2eRefresh {", 1)[1]
+        sequence = (
+            "Stop-G2eDormantMetricServices -EnvFile $envFile",
+            "Start-G2eMetricQueryServices -EnvFile $envFile",
+            "Invoke-G2eMetricQueries",
+            "Stop-G2eMetricQueryServices -EnvFile $envFile",
+            "Start-G2eMetricServingServices -EnvFile $envFile",
+            "Wait-G2eDorisDependency",
+        )
+        positions = [refresh.index(token) for token in sequence]
+        self.assertEqual(sorted(positions), positions)
+
+        dormant = script.split(
+            "function Stop-G2eDormantMetricServices {", 1
+        )[1].split("function Start-G2eMetricQueryServices {", 1)[0]
+        for service in (
+            "flink-sql-client", "flink-taskmanager", "flink-jobmanager",
+            "doris-be", "doris-fe",
+        ):
+            self.assertIn(f"'{service}'", dormant)
+
+        query = script.split(
+            "function Start-G2eMetricQueryServices {", 1
+        )[1].split("function Stop-G2eMetricQueryServices {", 1)[0]
+        self.assertIn("'trino'", query)
+        self.assertNotIn("'doris-fe'", query)
+        self.assertNotIn("'doris-be'", query)
+
     def test_trino_transport_preserves_a_dimension_name_containing_a_comma(self):
         payload = self.refresh_payload(
             r'''

@@ -725,18 +725,47 @@ function Invoke-G2eComposeCommand {
     return [string[]]$standardOutput.ToArray()
 }
 
-function Start-G2eMetricServices {
+function Stop-G2eDormantMetricServices {
     [CmdletBinding()]
     param([Parameter(Mandatory = $true)][string]$EnvFile)
 
     $services = [string[]]@(
-        'minio', 'minio-init', 'metastore-postgres', 'hive-metastore', 'trino',
-        'doris-fe', 'doris-be'
+        'flink-sql-client', 'flink-taskmanager', 'flink-jobmanager',
+        'doris-be', 'doris-fe'
     )
     $arguments = [string[]]@(
-        '--profile', 'lakehouse', '--profile', 'serving', 'up', '-d'
+        '--profile', 'flink', '--profile', 'serving', 'stop'
     ) + $services
     $null = Invoke-G2eComposeCommand -EnvFile $EnvFile -Arguments $arguments
+}
+
+function Start-G2eMetricQueryServices {
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][string]$EnvFile)
+
+    $services = [string[]]@(
+        'minio', 'minio-init', 'metastore-postgres', 'hive-metastore', 'trino'
+    )
+    $arguments = [string[]]@('--profile', 'lakehouse', 'up', '-d') + $services
+    $null = Invoke-G2eComposeCommand -EnvFile $EnvFile -Arguments $arguments
+}
+
+function Stop-G2eMetricQueryServices {
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][string]$EnvFile)
+
+    $null = Invoke-G2eComposeCommand -EnvFile $EnvFile -Arguments @(
+        '--profile', 'lakehouse', 'stop', 'trino'
+    )
+}
+
+function Start-G2eMetricServingServices {
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][string]$EnvFile)
+
+    $null = Invoke-G2eComposeCommand -EnvFile $EnvFile -Arguments @(
+        '--profile', 'serving', 'up', '-d', 'doris-fe', 'doris-be'
+    )
 }
 
 function Invoke-G2eMetricTrinoStatement {
@@ -1348,7 +1377,8 @@ function Invoke-G2eRefresh {
         if ($LASTEXITCODE -ne 0 -or $dockerVersion.Count -ne 1) {
             throw 'Docker Engine is unavailable for G2-E metric refresh.'
         }
-        Start-G2eMetricServices -EnvFile $envFile
+        Stop-G2eDormantMetricServices -EnvFile $envFile
+        Start-G2eMetricQueryServices -EnvFile $envFile
         Wait-G2eTrinoDependency -EnvFile $envFile -TimeoutSeconds $TimeoutSeconds
         $null = Get-G2eLiveSnapshotMap -Evidence $evidence -EnvFile $envFile
         $window = Get-G2eMetricWindow -Evidence $evidence -EnvFile $envFile
@@ -1360,8 +1390,13 @@ function Invoke-G2eRefresh {
             -WindowStart $window.WindowStart -WindowEnd $window.WindowEnd `
             -CalculatedAt $calculatedAt -ImplementationRevision $revision
         $null = Get-G2eRefreshPlan -MetricRunId $identity.MetricRunId
-        $queryBundle = Invoke-G2eMetricQueries `
-            -Evidence $evidence -Identity $identity -EnvFile $envFile
+        $queryBundle = $null
+        try {
+            $queryBundle = Invoke-G2eMetricQueries `
+                -Evidence $evidence -Identity $identity -EnvFile $envFile
+        } finally {
+            Stop-G2eMetricQueryServices -EnvFile $envFile
+        }
 
         $candidates = [ordered]@{}
         $candidateEvidence = [ordered]@{}
@@ -1384,6 +1419,7 @@ function Invoke-G2eRefresh {
         }
         Assert-G2eExactEvidenceMap -Evidence $candidateEvidence
 
+        Start-G2eMetricServingServices -EnvFile $envFile
         Wait-G2eDorisDependency -EnvFile $envFile -TimeoutSeconds $TimeoutSeconds
         Initialize-G2eDorisSchema -EnvFile $envFile
         Assert-G2eDorisTables -EnvFile $envFile
