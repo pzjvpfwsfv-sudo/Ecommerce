@@ -1068,6 +1068,36 @@ $native = @(ConvertTo-G2eNativeArguments -Arguments @('enclose:"'))
         self.assertEqual(r'enclose:\"', payload["value"])
         self.assertEqual(10, payload["length"])
 
+    def test_doris_upload_csv_uses_backslash_escaping_without_changing_candidate(self):
+        with tempfile.TemporaryDirectory(dir=ROOT / "tmp") as temporary:
+            source = Path(temporary) / "candidate.csv"
+            target = Path(temporary) / ".upload.csv"
+            canonical = (
+                'id,note,empty,nullable\n'
+                '1,"a,b ""quoted"" slash\\value","",\\N\n'
+            )
+            source.write_text(canonical, encoding="utf-8", newline="")
+            ps_source = str(source).replace("'", "''")
+            ps_target = str(target).replace("'", "''")
+            payload = self.refresh_payload(
+                rf'''
+$saved = New-G2eDorisUploadCsv -CandidatePath '{ps_source}' -OutputPath '{ps_target}'
+$bytes = [IO.File]::ReadAllBytes($saved)
+[ordered]@{{
+    text=[Text.Encoding]::UTF8.GetString($bytes)
+    source=[IO.File]::ReadAllText('{ps_source}', [Text.Encoding]::UTF8)
+    no_bom=(-not ($bytes.Length -ge 3 -and $bytes[0]-eq 239 -and $bytes[1]-eq 187 -and $bytes[2]-eq 191))
+}} | ConvertTo-Json -Compress
+'''
+            )
+            expected = (
+                'id,note,empty,nullable\n'
+                '1,"a,b \\"quoted\\" slash\\\\value","",\\N\n'
+            )
+            self.assertEqual(expected, payload["text"])
+            self.assertEqual(canonical, payload["source"])
+            self.assertTrue(payload["no_bom"])
+
     def test_trino_transport_maps_its_quoted_empty_null_encoding_to_null(self):
         payload = self.refresh_payload(
             r'''

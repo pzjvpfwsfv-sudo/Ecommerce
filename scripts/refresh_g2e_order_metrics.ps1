@@ -1240,6 +1240,37 @@ function Get-G2eStoredEvidence {
     return $evidence
 }
 
+function New-G2eDorisUploadCsv {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$CandidatePath,
+        [Parameter(Mandatory = $true)][string]$OutputPath
+    )
+
+    $source = [IO.Path]::GetFullPath($CandidatePath)
+    $target = [IO.Path]::GetFullPath($OutputPath)
+    if (-not [IO.File]::Exists($source)) { throw 'G2-E Doris upload candidate is missing.' }
+    if (-not [IO.Path]::GetDirectoryName($source).Equals(
+            [IO.Path]::GetDirectoryName($target), (Get-G2ePathComparison))) {
+        throw 'G2-E Doris upload copy must remain beside its candidate.'
+    }
+    if ([IO.File]::Exists($target) -or [IO.Directory]::Exists($target)) {
+        throw 'G2-E Doris upload copy already exists.'
+    }
+
+    $canonical = [IO.File]::ReadAllText($source, [Text.Encoding]::UTF8)
+    $quotedField = '"(?:""|[^"])*"'
+    $escapeField = [Text.RegularExpressions.MatchEvaluator]{
+        param([Text.RegularExpressions.Match]$Match)
+        $inner = $Match.Value.Substring(1, $Match.Value.Length - 2)
+        $inner = $inner.Replace('\', '\\').Replace('""', '\"')
+        return '"' + $inner + '"'
+    }
+    $upload = [Text.RegularExpressions.Regex]::Replace($canonical, $quotedField, $escapeField)
+    [IO.File]::WriteAllText($target, $upload, [Text.UTF8Encoding]::new($false))
+    return $target
+}
+
 function Invoke-G2eStreamLoad {
     [CmdletBinding()]
     param(
@@ -1263,31 +1294,38 @@ function Invoke-G2eStreamLoad {
     $bundlePrefix = $MetricRunId.Substring($MetricRunId.Length - 64, 16)
     $label = "g2e-$bundlePrefix-$Family-$AttemptId"
     if ($label -cnotmatch '^[a-z0-9-]+$') { throw 'G2-E Stream Load label is unsafe.' }
-    $arguments = @(
-        '--silent', '--show-error', '--location-trusted', '--user',
-        ("$script:G2eDorisUsername`:$script:G2eDorisPassword"), '--request', 'PUT',
-        '--header', 'Expect:100-continue', '--header', "label:$label", '--header', 'format:csv',
-        '--header', 'column_separator:,', '--header', 'skip_lines:1',
-        '--header', 'enclose:"', '--header', 'trim_double_quotes:true',
-        '--header', 'strict_mode:true', '--header', 'max_filter_ratio:0',
-        '--header', ('columns:' + ($spec.Columns -join ',')),
-        '--upload-file', $path,
-        "$script:G2eDorisStreamLoadUrl/api/analytics/$($spec.Table)/_stream_load"
-    )
-    $nativeArguments = ConvertTo-G2eNativeArguments -Arguments $arguments
-    $previousErrorActionPreference = $ErrorActionPreference
+    $uploadPath = Join-Path ([IO.Path]::GetDirectoryName($path)) `
+        ('.g2e-stream-' + [guid]::NewGuid().ToString('N') + '.csv')
     try {
-        $ErrorActionPreference = 'Continue'
-        $output = @(& curl.exe @nativeArguments 2>&1)
-        $exitCode = $LASTEXITCODE
+        $null = New-G2eDorisUploadCsv -CandidatePath $path -OutputPath $uploadPath
+        $arguments = @(
+            '--silent', '--show-error', '--location-trusted', '--user',
+            ("$script:G2eDorisUsername`:$script:G2eDorisPassword"), '--request', 'PUT',
+            '--header', 'Expect:100-continue', '--header', "label:$label", '--header', 'format:csv',
+            '--header', 'column_separator:,', '--header', 'skip_lines:1',
+            '--header', 'enclose:"', '--header', 'escape:\',
+            '--header', 'trim_double_quotes:true', '--header', 'strict_mode:true',
+            '--header', 'max_filter_ratio:0', '--header', ('columns:' + ($spec.Columns -join ',')),
+            '--upload-file', $uploadPath,
+            "$script:G2eDorisStreamLoadUrl/api/analytics/$($spec.Table)/_stream_load"
+        )
+        $nativeArguments = ConvertTo-G2eNativeArguments -Arguments $arguments
+        $previousErrorActionPreference = $ErrorActionPreference
+        try {
+            $ErrorActionPreference = 'Continue'
+            $output = @(& curl.exe @nativeArguments 2>&1)
+            $exitCode = $LASTEXITCODE
+        } finally {
+            $ErrorActionPreference = $previousErrorActionPreference
+        }
+        if ($exitCode -ne 0) {
+            throw "G2-E Stream Load request failed for $($spec.Table): $($output -join ' ')"
+        }
+        try { return (($output -join "`n") | ConvertFrom-Json) } catch {
+            throw "G2-E Stream Load returned malformed JSON for $($spec.Table)."
+        }
     } finally {
-        $ErrorActionPreference = $previousErrorActionPreference
-    }
-    if ($exitCode -ne 0) {
-        throw "G2-E Stream Load request failed for $($spec.Table): $($output -join ' ')"
-    }
-    try { return (($output -join "`n") | ConvertFrom-Json) } catch {
-        throw "G2-E Stream Load returned malformed JSON for $($spec.Table)."
+        if ([IO.File]::Exists($uploadPath)) { [IO.File]::Delete($uploadPath) }
     }
 }
 
