@@ -612,7 +612,7 @@ function Assert-G2eAcceptanceEvidence {
     foreach ($name in $hardGateNames) {
         if ((Assert-G2eAcceptanceCount `
                     (Get-G2eAcceptanceProperty $hardGate $name 'curated hard gate') `
-                    "hard gate $name") -ne 0) {
+                    "hard gate $name" -AllowString) -ne 0) {
             throw 'G2-E acceptance curated hard gate did not pass.'
         }
     }

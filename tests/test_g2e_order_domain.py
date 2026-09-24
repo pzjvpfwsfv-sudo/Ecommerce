@@ -364,7 +364,7 @@ def valid_synthetic_acceptance() -> dict:
             "source_bundle_sha256": BUNDLE,
             "source_snapshots": source_snapshots,
             "curated_snapshots": curated_snapshots,
-            "hard_gate": {"duplicate_order_key_count": 0, "orphan_item_order_count": 0},
+            "hard_gate": {"duplicate_order_key_count": "0", "orphan_item_order_count": "0"},
             "reportable_quality": quality["reportable_quality"],
             "grain_reconciliation": quality["fact_reconciliations"],
         },
@@ -477,6 +477,7 @@ class G2eOrderDomainContractTests(PowerShellAcceptanceTestCase):
     def test_api_quality_metadata_endpoint_and_row_mutations_fail_closed(self):
         cases = {}
         cases["quality"] = lambda item: item["api"]["responses"]["quality"]["data"].__setitem__("reconciliation_status", "FAIL")
+        cases["hard gate count"] = lambda item: item["curated"]["hard_gate"].__setitem__("duplicate_order_key_count", "00")
         cases["timezone"] = lambda item: item["api"]["responses"]["overview"]["meta"].__setitem__("source_timezone", "UTC")
         cases["currency warning"] = lambda item: item["api"]["responses"]["overview"]["meta"].__setitem__("warnings", ["wrong"])
         cases["endpoint"] = lambda item: item["api"]["endpoints"].pop()
