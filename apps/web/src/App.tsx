@@ -11,6 +11,7 @@ import { Behavior } from "./modules/Behavior";
 import { Orders } from "./modules/Orders";
 import { Rankings } from "./modules/Rankings";
 import { Fulfillment } from "./modules/Fulfillment";
+import { Quality } from "./modules/Quality";
 
 const moduleNames: Record<string, string> = {
   overview: "运营总览",
@@ -88,7 +89,7 @@ export default function App() {
         <Routes>
           <Route path="/" element={<Navigate to="/overview" replace />} />
           {Object.entries(moduleNames).map(([path, name]) => (
-            <Route key={path} path={`/${path}`} element={path === "overview" ? <Overview /> : path === "behavior" ? <Behavior /> : path === "orders" ? <Orders /> : path === "rankings" ? <Rankings /> : path === "fulfillment" ? <Fulfillment /> : <ModulePending name={name} />} />
+            <Route key={path} path={`/${path}`} element={path === "overview" ? <Overview /> : path === "behavior" ? <Behavior /> : path === "orders" ? <Orders /> : path === "rankings" ? <Rankings /> : path === "fulfillment" ? <Fulfillment /> : <Quality />} />
           ))}
           <Route path="/account" element={<AccountPage user={session} />} />
           <Route path="*" element={<Navigate to="/overview" replace />} />
