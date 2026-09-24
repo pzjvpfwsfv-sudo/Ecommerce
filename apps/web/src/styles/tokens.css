@@ -1,0 +1,15 @@
+:root {
+  --ink: #1a2e29;
+  --deep: #1d3c33;
+  --forest: #2b5b4d;
+  --jade: #2d7566;
+  --mint: #e7eee8;
+  --paper: #f2f2ed;
+  --sheet: #fdfdfa;
+  --line: #d8e0d9;
+  --copper: #b48361;
+  --muted: #64766c;
+  --shadow: 0 24px 70px rgba(26, 46, 41, 0.1);
+  --body-font: "MiSans", "HarmonyOS Sans SC", "Noto Sans CJK SC", "Microsoft YaHei", sans-serif;
+  --display-font: "Songti SC", "Noto Serif CJK SC", Georgia, serif;
+}
