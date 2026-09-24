@@ -1043,7 +1043,7 @@ git commit -m "feat: expose immutable Olist order metrics API"
 - Produces: one immutable `tmp/graduation/g2e/$sourceBundleSha256/acceptance.json`, measured documentation, completed plan checkboxes/record, full regression evidence, whole-branch review, and a verified remote branch backup.
 - Verifier: `scripts/verify_g2e_order_domain.ps1 -ManifestPath $manifestPath -ApiBaseUrl http://localhost:8000`.
 
-- [ ] **Step 1: Write failing verifier contract tests**
+- [x] **Step 1: Write failing verifier contract tests**
 
 Dot-source the verifier with `-FunctionsOnly`. Test `Assert-G2eAcceptanceIdentity`, `Assert-G2eApiMeta`, `Assert-G2eApiRows`, and `Assert-G2eAcceptanceEvidence` against synthetic evidence. Require exact agreement across manifest, nine source reports, nine curated Snapshot entries, refresh report, Doris publication, six family digests, and all eight API responses.
 
@@ -1057,7 +1057,7 @@ def test_acceptance_rejects_one_changed_curated_snapshot(self):
         assert_acceptance_evidence(evidence)
 ```
 
-- [ ] **Step 2: Run all G2-E offline tests and confirm GREEN before real data**
+- [x] **Step 2: Run all G2-E offline tests and confirm GREEN before real data**
 
 Run:
 
@@ -1070,19 +1070,19 @@ python -m unittest tests.test_olist_data tests.test_olist_data_cli tests.test_g2
 
 Expected: all G2-E offline tests PASS. If Kaggle authentication is not already valid, pause only at the browser/account boundary so the user can log in; do not request or handle their password, token, or cookie.
 
-- [ ] **Step 3: Prepare the official bundle and record only measured provenance**
+- [x] **Step 3: Prepare the official bundle and record only measured provenance**
 
 Download from `https://www.kaggle.com/olistbr/brazilian-ecommerce/home`, verify the current page metadata/license, and run Task 1 against `D:\EcommerceData\olist`. Record the actual archive/file hashes, bytes, logical rows, headers, normalized hashes, bundle identity, acquisition time, and elapsed time in the ignored manifest/report. Do not copy raw paths containing the Windows username into committed docs.
 
-- [ ] **Step 4: Ingest and verify all nine source tables sequentially**
+- [x] **Step 4: Ingest and verify all nine source tables sequentially**
 
 For each registry entity in filename order, run Task 2's runner and verifier, wait for `FINISHED`, then stop before the next entity. Require exact source/normalized/Iceberg row counts, distinct row IDs, ordered row-ID digest, bundle identity, business-key uniqueness, and positive Snapshot ID. Capture peak container memory where available; do not run frontend builds or a local language model concurrently.
 
-- [ ] **Step 5: Build curated tables, publish metrics, and start the API**
+- [x] **Step 5: Build curated tables, publish metrics, and start the API**
 
 Run Task 3 builder/verifier, then Task 5 refresh. Start only the serving profile needed for the API after metric publication. Require hard-gate zeros, separately reported quality counts, exact curated grains, anti-fanout sums, six candidate readbacks, publication last, and one full run identity.
 
-- [ ] **Step 6: Verify Trino, Doris, and all eight API contracts end to end**
+- [x] **Step 6: Verify Trino, Doris, and all eight API contracts end to end**
 
 Call:
 
@@ -1099,11 +1099,11 @@ Call:
 
 Then exercise one measured DAY range and one MONTH range from inside the publication window. The verifier independently queries fixed Trino facts and Doris candidates, recomputes response expectations, verifies row counts/digests and metadata, confirms invalid parameter requests return 422, and confirms an unavailable fake publication path returns 503 in offline tests rather than mutating live data.
 
-- [ ] **Step 7: Write only measured documentation and an honest status**
+- [x] **Step 7: Write only measured documentation and an honest status**
 
 The runbook records reproducible commands, table grains, metric definitions, identities, actual counts, nonzero reportable quality findings, durations, observed resource peaks, restart/resume behavior, and safe failure recovery. README and data-readiness may say G2-E is dynamically accepted only if Step 6 passes. If Docker or data acquisition blocks dynamic execution, state exactly “代码与离线契约完成，真实动态验收未完成” and preserve the remaining commands; never insert expected-looking numbers.
 
-- [ ] **Step 8: Run repository-wide verification**
+- [x] **Step 8: Run repository-wide verification**
 
 Run:
 
@@ -1133,6 +1133,18 @@ git commit -m "docs: record G2-E Olist order acceptance"
 ```
 
 Push `codex/chapter-10-controlled-tools` using the current command-scoped proxy only when direct GitHub access needs it. Compare `git rev-parse HEAD` with `git ls-remote origin refs/heads/codex/chapter-10-controlled-tools`. Do not merge `main` without a separate explicit user request.
+
+### Task 8 Measured Acceptance Record
+
+- 2026-09-24 formal verifier status: `PASS`; evidence written once to ignored `tmp/graduation/g2e/3e0119b83f4ae47a992a6b2dcf30a6ed57403ef798413209ed52d2d4e624c3c3/acceptance.json`.
+- Official ZIP: 44,717,580 bytes, SHA-256 `967e41e04fc306fe604e2a693f488995a8b41e5047418f8a5c8e4abd6deca784`; nine source files: 1,550,922 logical rows and bundle `3e0119b83f4ae47a992a6b2dcf30a6ed57403ef798413209ed52d2d4e624c3c3`.
+- All nine source tables and nine curated tables passed exact row, key, digest and Snapshot gates. The order fact has 99,441 rows over `2016-09-04` through `2018-10-17`; all 18 hard gates are zero and nine reportable quality measures remain visible.
+- Immutable run `orders-v1-b3e0119b83f4ae47a992a6b2dcf30a6ed57403ef798413209ed52d2d4e624c3c3` is `PUBLISHED`. Six family row counts are `660/660/3,031/316,153/660/1`; all candidate and Doris readback SHA-256 values agree.
+- Eight full API contracts, one DAY range (`2016-09-04`), one MONTH range (`2016-09-04` through `2016-09-15`) and invalid-request 422 behavior passed. The final read-only acceptance took about 9 minutes 30 seconds.
+- Docker was capped at 7.66 GiB. Staged services eliminated the reproduced Trino exit 137, and the 316,153-row one-pass ranking parser used about 1.30 GiB in 35.5 seconds instead of about 5 GiB. No Docker volume, Iceberg table, Doris publication or user file was deleted.
+- Exact Task 8 offline command passed 100 tests in 48.739 seconds with one expected Windows symbolic-link capability skip.
+- The first repository-wide run found the new Compose resume variable missing from the Chapter 10.5 isolated environment. TDD fixed isolation to force `HIVE_METASTORE_IS_RESUME=false`; focused 2/2 and cold-start 34/34 tests passed.
+- Final repository-wide verification passed 658 tests in 237.357 seconds with the same one host-capability skip. Compose config and `git diff --check` passed; no Java/DataStream file changed.
 
 ## Self-Review
 

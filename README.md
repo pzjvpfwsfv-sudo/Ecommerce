@@ -14,10 +14,11 @@
 - [G2-B Java 真实事件质量入口](docs/graduation/real-event-quality-runbook.md)
 - [G2-C 真实事件统一落湖与 Trino 验收](docs/graduation/real-event-lakehouse-runbook.md)
 - [G2-D 行为指标与版本化 API 验收](docs/graduation/behavior-metrics-api-runbook.md)
+- [G2-E Olist 订单域真实验收与运行手册](docs/graduation/olist-order-domain-runbook.md)
 
 已新增不依赖 Docker 的真实数据准备工具：`python -m generators.real_data --help`。它与旧模拟生成器隔离，不自动写 Kafka，不把历史前缀样本当作完整分析窗口。
 
-当前真实数据依据：已完整扫描 2019 年 10/11 月共 109,950,743 条源记录，按稳定用户抽样得到 2,199,938 条事件，覆盖 61 天。G2-A 至 G2-D 已完成隔离动态验收；G2-D 将正式 Iceberg 表的 1,002 条真实事件发布为 Snapshot 绑定的 Doris 指标 run，并通过六个版本化 API 契约验收。该 run 是最终 SQL/verifier 加固前的不可变历史证据；加固后的动态发布验收须等待自然产生的新 Snapshot。下一步进入 G2-E 独立 Olist 订单域，业务页面和 RAG 尚未完成。GitHub 备份使用 `codex/chapter-10-controlled-tools` 开发分支；真实数据、密钥和服务卷不包含在 Git 中。
+当前有两套职责隔离的真实数据：REES46 两个月 109,950,743 条行为源记录经稳定用户抽样得到 2,199,938 条事件；Olist 官方九文件共 1,550,922 条订单域记录。G2-A 至 G2-D 已完成行为链路的隔离动态验收，G2-E 已将 Olist 全量九文件顺序写入 9 张 Iceberg 源表和 9 张主题表，并以不可变 Doris run 发布 321,165 行六类指标；8 个版本化 API 合同于 2026-09-24 完整通过。两套匿名数据不做身份拼接。下一步是 G3 业务可视化和 G4 知识库/RAG，当前尚未宣称完成。GitHub 备份使用 `codex/chapter-10-controlled-tools` 开发分支；真实数据、密钥和服务卷不包含在 Git 中。
 
 G2-A 已提供 `python -m generators.real_data.replay`：默认离线试跑，显式 Kafka 模式只允许真实数据专用 Topic，支持限速、确认后保存进度和 Ctrl+C 恢复。真实样本 400+600 条离线恢复与真实 Kafka 续传均通过，独立消费核对 1,000 条的业务字段、事件 ID、顺序与 key 全部一致。证据见运行手册，不等同于 220 万条全量回放或新 Flink/湖仓链路已完成。
 
@@ -26,6 +27,8 @@ G2-B 新增独立 Java 清洗入口，严格保留真实字段和稳定 ID，支
 G2-C 使用两个严格 Kafka JSON Source 将 clean/late 统一为一套列，并由单一 Flink SQL writer 写入 `lakehouse.analytics.real_behavior_detail_v1`。正式表验收为 `总数=1002、clean=1001、late=1、不同 event_id=1002`，五类字段质量违规均为 0；17 个源字段逐事件对账 17,034 次零差异。该结论不等于 220 万条容量或长期 exactly-once 验收，完整证据与重跑边界见 G2-C 运行手册。
 
 G2-D 实测发布 `behavior-v1-s881836466779140976`，Trino 源总数、Doris `DAY/FULL` 总数和 API overview 均为 1,002，`clean=1,001`、`late=1`、不同 `event_id=1,002`。四张 Doris 指标表的行数和重算 SHA-256 与发布元数据一致，六个 API 均返回 HTTP 200。`purchase_amount_proxy` 只是缺少数量、币种、折扣、退款、取消和支付状态的分析代理值。该 1,002 条验收明确不是容量证据；既有发布未因后续 SQL/verifier 加固而刷新或覆盖，完整证据与新 Snapshot 重验边界见 G2-D 运行手册。
+
+G2-E 使用 Olist 官方 Version 2 全量九文件，1,550,922 条记录形成 9 张 Snapshot 绑定的 Iceberg 源表和 9 张反扇出主题表。99,441 笔订单覆盖 `2016-09-04` 至 `2018-10-17`；18 项硬门禁全为 0，重复评价 ID、缺失品类、生命周期异常等真实问题单独报告。不可变 run `orders-v1-b3e0119b83f4ae47a992a6b2dcf30a6ed57403ef798413209ed52d2d4e624c3c3` 的六类指标共 321,165 行，文件摘要、Doris 回读和 8 个 API 合同全部一致。完整数字、资源取舍和恢复步骤见 G2-E 运行手册。
 
 ## 项目目标
 
