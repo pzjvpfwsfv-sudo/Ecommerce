@@ -1,3 +1,4 @@
+import hashlib
 import sys
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -92,7 +93,8 @@ class AuthStoreTest(unittest.TestCase):
             "role": "analyst", "active": True,
         }
         self.expiry = datetime.now(timezone.utc) + timedelta(hours=8)
-        self.token_hash = "a" * 64
+        self.session_token = "raw-session-token"
+        self.token_hash = hashlib.sha256(self.session_token.encode("utf-8")).hexdigest()
 
     def call_store(self, call, *, one=None, rows=()):
         cursor = RecordingCursor(one=one, rows=rows)
@@ -163,14 +165,14 @@ class AuthStoreTest(unittest.TestCase):
         }
         _, create_calls, _ = self.call_store(
             lambda: self.store.create_session(
-                self.token_hash, 7, "csrf-secret", self.expiry
+                self.session_token, 7, "csrf-secret", self.expiry
             )
         )
         session, get_calls, _ = self.call_store(
-            lambda: self.store.get_session(self.token_hash), one=session_row
+            lambda: self.store.get_session(self.session_token), one=session_row
         )
         _, revoke_calls, _ = self.call_store(
-            lambda: self.store.revoke_session(self.token_hash)
+            lambda: self.store.revoke_session(self.session_token)
         )
 
         self.assertEqual(
@@ -183,15 +185,38 @@ class AuthStoreTest(unittest.TestCase):
         self.assertIn("FROM app_sessions", get_calls[0][0])
         self.assertIn("UPDATE app_sessions", revoke_calls[0][0])
         self.assertIn("revoked_at", revoke_calls[0][0])
-        for sql, _ in (*create_calls, *get_calls, *revoke_calls):
-            self.assertNotIn(self.token_hash, sql)
-        self.assertIsNone(self.call_store(lambda: self.store.get_session(self.token_hash))[0])
+        for sql, parameters in (*create_calls, *get_calls, *revoke_calls):
+            self.assertNotIn(self.session_token, sql)
+            self.assertNotIn(self.session_token, parameters)
+        self.assertIsNone(self.call_store(lambda: self.store.get_session(self.session_token))[0])
 
-    def test_raw_session_token_is_rejected_before_database_access(self):
-        with patch("app.auth_store.psycopg.connect") as connect:
-            with self.assertRaises(ValueError):
-                self.store.create_session("raw-session-token", 7, "csrf-secret", self.expiry)
-            connect.assert_not_called()
+    def test_hex_shaped_raw_token_is_hashed_before_every_session_query(self):
+        raw_token = "a" * 64
+        digest = hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
+        session_row = {
+            "token_hash": digest, "user_id": 7,
+            "csrf_token": "csrf-secret", "expires_at": self.expiry,
+            "revoked_at": None,
+        }
+
+        _, create_calls, _ = self.call_store(
+            lambda: self.store.create_session(raw_token, 7, "csrf-secret", self.expiry)
+        )
+        session, get_calls, _ = self.call_store(
+            lambda: self.store.get_session(raw_token), one=session_row
+        )
+        _, revoke_calls, _ = self.call_store(
+            lambda: self.store.revoke_session(raw_token)
+        )
+
+        self.assertNotEqual(raw_token, digest)
+        self.assertEqual(create_calls[0][1][0], digest)
+        self.assertEqual(get_calls[0][1], (digest,))
+        self.assertEqual(revoke_calls[0][1], (digest,))
+        self.assertEqual(session.token_hash, digest)
+        for sql, parameters in (*create_calls, *get_calls, *revoke_calls):
+            self.assertNotIn(raw_token, sql)
+            self.assertNotIn(raw_token, parameters)
 
     def test_audit_records_nullable_user_id_with_parameters(self):
         for user_id in (None, 7):
@@ -209,7 +234,7 @@ class AuthStoreTest(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "database unavailable"):
                 self.store.get_user("alice")
             with self.assertRaisesRegex(RuntimeError, "database unavailable"):
-                self.store.get_session(self.token_hash)
+                self.store.get_session(self.session_token)
 
 
 if __name__ == "__main__":

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
-import re
+import hashlib
 from typing import Literal
 
 import psycopg
@@ -13,7 +13,6 @@ from app.config import ApiSettings
 
 Role = Literal["admin", "analyst", "viewer"]
 _MAX_USERNAME_LENGTH = 128
-_TOKEN_HASH_PATTERN = re.compile(r"[0-9a-f]{64}\Z")
 
 
 @dataclass(frozen=True)
@@ -41,9 +40,8 @@ def _normalize_username(username: str) -> str:
     return normalized
 
 
-def _validate_token_hash(token_hash: str) -> None:
-    if not _TOKEN_HASH_PATTERN.fullmatch(token_hash):
-        raise ValueError("token_hash must be a lowercase SHA-256 hex digest")
+def _session_token_hash(session_token: str) -> str:
+    return hashlib.sha256(session_token.encode("utf-8")).hexdigest()
 
 
 def _stored_user(row: dict) -> StoredUser:
@@ -126,9 +124,9 @@ class AuthStore:
         return [_stored_user(row) for row in rows]
 
     def create_session(
-        self, token_hash: str, user_id: int, csrf_token: str, expires_at: datetime
+        self, session_token: str, user_id: int, csrf_token: str, expires_at: datetime
     ) -> None:
-        _validate_token_hash(token_hash)
+        token_hash = _session_token_hash(session_token)
         with self._connect() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
@@ -137,8 +135,8 @@ class AuthStore:
                     (token_hash, user_id, csrf_token, expires_at),
                 )
 
-    def get_session(self, token_hash: str) -> StoredSession | None:
-        _validate_token_hash(token_hash)
+    def get_session(self, session_token: str) -> StoredSession | None:
+        token_hash = _session_token_hash(session_token)
         with self._connect() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
@@ -149,8 +147,8 @@ class AuthStore:
                 row = cursor.fetchone()
         return _stored_session(row) if row is not None else None
 
-    def revoke_session(self, token_hash: str) -> None:
-        _validate_token_hash(token_hash)
+    def revoke_session(self, session_token: str) -> None:
+        token_hash = _session_token_hash(session_token)
         with self._connect() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
