@@ -327,7 +327,7 @@ $after=[Environment]::GetEnvironmentVariable("PROJECT_NAME", "Process")
     def test_complete_isolated_environment_overrides_ambient_internal_endpoints(self):
         payload = self._payload(r'''
 . "scripts/verify_chapter_10_5_cold_start.ps1" -FunctionsOnly
-$reference=[ordered]@{PROJECT_NAME='reference';API_BIND_HOST='0.0.0.0';TRINO_BASE_URL='http://foreign:8080';FLINK_REST_URL='http://foreign:8081';KAFKA_CONTROLLER_HOST='foreign';KAFKA_CONTROLLER_PORT='19093';CHAPTER9_PRODUCTION_JOB_NAME='foreign-job'}
+$reference=[ordered]@{PROJECT_NAME='reference';API_BIND_HOST='0.0.0.0';TRINO_BASE_URL='http://foreign:8080';FLINK_REST_URL='http://foreign:8081';KAFKA_CONTROLLER_HOST='foreign';KAFKA_CONTROLLER_PORT='19093';CHAPTER9_PRODUCTION_JOB_NAME='foreign-job';HIVE_METASTORE_IS_RESUME='true'}
 $actual=[ordered]@{PROJECT_NAME='actual';TRINO_BASE_URL='http://default-redirect:8080';FLINK_REST_URL='http://default-redirect:8081'}
 $isolation=[ordered]@{PROJECT_NAME='chapter105-acceptance-123456789abc';MINIO_DATA_DIR='C:\safe\minio-data';DORIS_INTERNAL_QUERY_PORT='9030'}
 [Environment]::SetEnvironmentVariable('TRINO_BASE_URL','http://ambient-redirect:8080','Process')
@@ -344,6 +344,7 @@ Restore-AcceptanceEnvironment -Previous $previous
         self.assertEqual("kafka-controller", values["KAFKA_CONTROLLER_HOST"])
         self.assertEqual("9093", values["KAFKA_CONTROLLER_PORT"])
         self.assertEqual("chapter-9-datastream-quality-production", values["CHAPTER9_PRODUCTION_JOB_NAME"])
+        self.assertEqual("false", values["HIVE_METASTORE_IS_RESUME"])
         self.assertEqual("http://trino:8080", payload["during"])
         self.assertEqual("http://ambient-redirect:8080", payload["after"])
 

@@ -179,6 +179,7 @@ function New-AcceptanceIsolatedEnvironment {
             DORIS_INTERNAL_QUERY_PORT = '9030'
             KAFKA_CONTROLLER_HOST = 'kafka-controller'
             KAFKA_CONTROLLER_PORT = '9093'
+            HIVE_METASTORE_IS_RESUME = 'false'
             CHAPTER9_PRODUCTION_JOB_NAME = 'chapter-9-datastream-quality-production'
         }).GetEnumerator()) {
         $values[[string]$entry.Key] = [string]$entry.Value
