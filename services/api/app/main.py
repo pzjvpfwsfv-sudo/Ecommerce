@@ -15,6 +15,9 @@ from app.analysis_service import (
     AnalysisUnavailableError,
     RealtimeDataUnavailableError,
 )
+from app.auth_api import router as auth_router
+from app.auth_service import AuthService
+from app.auth_store import AuthStore
 from app.behavior_models import (
     FunnelResponse,
     MetricDefinitionsResponse,
@@ -64,8 +67,11 @@ def create_app(
     settings: ApiSettings | None = None,
     behavior_service: BehaviorMetricsService | Any | None = None,
     order_service: OrderMetricsService | Any | None = None,
+    auth_service: AuthService | None = None,
 ) -> FastAPI:
     settings = settings or load_settings()
+    if auth_service is None:
+        auth_service = AuthService(AuthStore(settings))
     if repository is None:
         repository = RealtimeMetricsRepository.from_settings(settings)
     if analysis_service is None:
@@ -94,6 +100,8 @@ def create_app(
                     tool_analysis_service.close()
 
     app = FastAPI(title="Realtime Metrics API", version="0.3.0", lifespan=lifespan)
+    app.state.auth_service = auth_service
+    app.include_router(auth_router)
 
     def behavior_response(stage: str, operation: Callable[[], Any]) -> Any:
         try:
