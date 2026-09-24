@@ -1123,7 +1123,7 @@ Expected: every Python test passes, Compose validates, diff check is clean, and 
 
 Use `superpowers:requesting-code-review` against the merge base through current HEAD. Review priority is data authenticity, key/FK gates, fanout, Snapshot identity, immutable publication, SQL injection, API semantics, secrets, path containment, and destructive operations. Fix every confirmed finding, rerun the affected focused suite, then rerun Step 8 before claiming completion.
 
-- [ ] **Step 10: Commit evidence and verify GitHub backup**
+- [x] **Step 10: Commit evidence and verify GitHub backup**
 
 Update this plan's checkboxes and append exact measured acceptance/test records. Commit only source, tests, and documentation:
 
@@ -1147,6 +1147,7 @@ Push `codex/chapter-10-controlled-tools` using the current command-scoped proxy 
 - Repository-wide verification after the cold-start fix passed 658 tests in 237.357 seconds; the post-review final rerun passed the same 658 tests in 235.567 seconds, both with the same one host-capability skip. Compose config and `git diff --check` passed; no Java/DataStream file changed.
 - Final review: self-review (no subagent tool), range `7b66f9051ceb80a68dcb3c9d575bc94fe9da93c1..0068296466d5bd0c85e884f8404a9239a4953cef`. No Critical or Important findings. Three documentation-consistency findings were fixed: source replay order now matches the filename-ordered acceptance run, Tasks 1-7 reflect their committed completion, and the Chapter 10.5 runbook has no trailing whitespace.
 - Review boundary: production HA/capacity/SLA and roadmap stages G3-G5 were not judged because G2-E specifies a single-machine bounded acceptance. Upstream collection authenticity beyond the official Kaggle archive, recorded hashes, license metadata, and operator acquisition evidence cannot be independently proven from this repository.
+- GitHub backup was verified on branch `codex/chapter-10-controlled-tools`: local HEAD and `refs/heads/codex/chapter-10-controlled-tools` both resolved to `00bb3ae8abc983d3a140815a4f263b8ca97f4b14` before this final evidence-only commit.
 
 ## Self-Review
 
