@@ -1267,6 +1267,17 @@ function New-G2eDorisUploadCsv {
         return '"' + $inner + '"'
     }
     $upload = [Text.RegularExpressions.Regex]::Replace($canonical, $quotedField, $escapeField)
+    $unquotedField = '(?m)(^|,)([^",\r\n]*\\[^",\r\n]*)(?=,|$)'
+    $escapeUnquotedField = [Text.RegularExpressions.MatchEvaluator]{
+        param([Text.RegularExpressions.Match]$Match)
+        $prefix = $Match.Groups[1].Value
+        $field = $Match.Groups[2].Value
+        if ($field -ceq '\N') { return $Match.Value }
+        return $prefix + $field.Replace('\', '\\')
+    }
+    $upload = [Text.RegularExpressions.Regex]::Replace(
+        $upload, $unquotedField, $escapeUnquotedField
+    )
     [IO.File]::WriteAllText($target, $upload, [Text.UTF8Encoding]::new($false))
     return $target
 }

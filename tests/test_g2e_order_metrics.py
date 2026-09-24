@@ -1073,8 +1073,8 @@ $native = @(ConvertTo-G2eNativeArguments -Arguments @('enclose:"'))
             source = Path(temporary) / "candidate.csv"
             target = Path(temporary) / ".upload.csv"
             canonical = (
-                'id,note,empty,nullable\n'
-                '1,"a,b ""quoted"" slash\\value","",\\N\n'
+                'id,note,path,empty,nullable\n'
+                '1,"a,b ""quoted"" slash\\value",plain\\value,"",\\N\n'
             )
             source.write_text(canonical, encoding="utf-8", newline="")
             ps_source = str(source).replace("'", "''")
@@ -1091,8 +1091,8 @@ $bytes = [IO.File]::ReadAllBytes($saved)
 '''
             )
             expected = (
-                'id,note,empty,nullable\n'
-                '1,"a,b \\"quoted\\" slash\\\\value","",\\N\n'
+                'id,note,path,empty,nullable\n'
+                '1,"a,b \\"quoted\\" slash\\\\value",plain\\\\value,"",\\N\n'
             )
             self.assertEqual(expected, payload["text"])
             self.assertEqual(canonical, payload["source"])
