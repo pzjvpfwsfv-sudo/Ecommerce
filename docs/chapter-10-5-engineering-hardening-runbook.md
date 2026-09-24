@@ -82,4 +82,3 @@ docker compose --env-file infra/.env -f infra/docker-compose.yml --profile flink
 `POST /analysis/tools` 的 planner、repository、工具执行和 narrative 共用一个统一 deadline。同步阻塞调用由有界线程池隔离：`AI_TOOL_EXECUTOR_MAX_WORKERS` 允许 `1..3`，默认 `3`；`AI_TOOL_TOTAL_TIMEOUT_SECONDS` 默认 `20`。
 
 满载或总预算耗尽时接口应快速返回 503，且不会继续创建线程。排查时先核对 `infra/.env` 的这两个值，再查看 API 普通日志；不要通过增大 worker 数掩盖下游 Doris、Trino 或 Flink 阻塞。
-

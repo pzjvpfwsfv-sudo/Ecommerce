@@ -120,8 +120,8 @@ $env:HIVE_METASTORE_IS_RESUME='true'
 $manifest='D:\EcommerceData\olist\prepared\3e0119b83f4ae47a992a6b2dcf30a6ed57403ef798413209ed52d2d4e624c3c3\source-bundle.json'
 
 $entities=@(
-  'orders','order_items','order_payments','order_reviews','customers',
-  'products','sellers','geolocation','category_translation'
+  'customers','geolocation','order_items','order_payments','order_reviews',
+  'orders','products','sellers','category_translation'
 )
 foreach ($entity in $entities) {
   .\scripts\run_g2e_olist_source.ps1 -ManifestPath $manifest -Entity $entity -TimeoutSeconds 600

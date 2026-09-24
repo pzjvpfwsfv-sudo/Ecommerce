@@ -103,7 +103,7 @@
 - Produces: `TABLE_SPECS: Mapping[str, TableSpec]`; `normalize_row(spec: TableSpec, row: Mapping[str, str], row_number: int) -> dict[str, object]`; `prepare_bundle(archive_path: Path, input_dir: Path, output_root: Path, acquisition: Acquisition) -> dict[str, object]`; and `$outputRoot/prepared/$sourceBundleSha256/source-bundle.json` plus nine `$outputRoot/prepared/$sourceBundleSha256/normalized/$entity.jsonl` files.
 - CLI: `python -m generators.olist_data prepare-bundle --archive $archivePath --input-dir $inputDir --output-root $outputRoot --acquired-at $acquiredAt --license-name $licenseName --license-url $licenseUrl`; paths and license values are runtime inputs and are not persisted in Git.
 
-- [ ] **Step 1: Write failing schema, parser, identity, and bundle tests**
+- [x] **Step 1: Write failing schema, parser, identity, and bundle tests**
 
 Use in-memory fixture rows clearly labeled synthetic. Pin the exact official file/header registry:
 
@@ -140,7 +140,7 @@ def test_identity_changes_with_row_number_or_canonical_content(self):
 
 Also test exact headers, UTF-8 with optional BOM only at file start, quoted multiline comments, blank-to-null conversion, 65,536-character logical-record bound, decimal exponent/negative/NaN rejection, required ID rejection, invalid/nonexistent dates, stable canonical JSON, ZIP `../` and absolute member rejection, ZIP/extracted byte mismatch, extra/missing CSVs, duplicate case-insensitive filenames, symlinked files/directories, output inside input, existing target, interrupted staging cleanup, and independent recomputation of the bundle digest.
 
-- [ ] **Step 2: Run the focused tests and confirm RED**
+- [x] **Step 2: Run the focused tests and confirm RED**
 
 Run:
 
@@ -152,7 +152,7 @@ python -m unittest tests.test_olist_data tests.test_olist_data_cli -v
 
 Expected: FAIL because `generators.olist_data` does not exist.
 
-- [ ] **Step 3: Implement the immutable registry and streaming primitives**
+- [x] **Step 3: Implement the immutable registry and streaming primitives**
 
 Use frozen records and preserve the source spelling `lenght`:
 
@@ -192,7 +192,7 @@ Known order statuses are exactly `created`, `approved`, `invoiced`, `processing`
 
 Money keeps two representations in normalized JSON: the trimmed source text under the official column name and a canonical two-decimal string under that name plus the `_decimal` suffix. For example, source `price="0.1"` remains `price="0.1"` while `price_decimal="0.10"`; validation rejects exponents, signs, NaN/infinity, more than two fractional digits, and overflow. Stable row identity uses only normalized official-header values, not derived convenience fields.
 
-- [ ] **Step 4: Implement canonical normalization and bundle publication**
+- [x] **Step 4: Implement canonical normalization and bundle publication**
 
 Canonical identity is byte-defined:
 
@@ -210,7 +210,7 @@ The manifest contains only attributable metadata: schema version, dataset ID, Ka
 
 Validate every archive member and extracted file before creating staging output. Write each JSON object with sorted keys and one LF. Append `source_file`, one-based `source_row_number`, `source_row_id`, `source_bundle_sha256`, and `schema_version=1`; because the bundle digest is known only after raw verification, compute all raw identities first and normalize in a second streaming pass. Publish the whole prepared directory by one no-overwrite directory rename only after all nine output reconciliations pass.
 
-- [ ] **Step 5: Implement the safe CLI and acquisition guide**
+- [x] **Step 5: Implement the safe CLI and acquisition guide**
 
 `prepare-bundle` accepts only an absolute D-drive `--output-root`, rejects a C-drive output, rejects output nested in the input/archive directory, and maps `OSError`, `UnicodeError`, `csv.Error`, `zipfile.BadZipFile`, and validation errors to a stable reason-code suffix on stderr, such as `olist-data error: invalid_header`, with exit code 1. It prints the completed manifest JSON only after publication.
 
@@ -228,13 +228,13 @@ python -m generators.olist_data prepare-bundle `
   --license-url $licenseUrl
 ```
 
-- [ ] **Step 6: Run tests and confirm GREEN**
+- [x] **Step 6: Run tests and confirm GREEN**
 
 Run the command from Step 2.
 
 Expected: all Olist preparation tests PASS; each failure fixture leaves no published manifest, JSONL, or `.part` file.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```powershell
 git add generators/olist_data tests/test_olist_data.py tests/test_olist_data_cli.py docs/graduation/olist-source-acquisition.md
@@ -260,7 +260,7 @@ git commit -m "feat: prepare attributable Olist source bundles"
 - Runner: `scripts/run_g2e_olist_source.ps1 -ManifestPath $manifestPath -Entity $entity` where both values have already passed the D-drive/registry checks.
 - Verifier: `scripts/verify_g2e_olist_source.ps1 -ManifestPath $manifestPath -Entity $entity -JobId $jobId`; `-JobId` is omitted only for an exact `already_ingested` verification.
 
-- [ ] **Step 1: Write failing SQL, Compose, runner, and verifier tests**
+- [x] **Step 1: Write failing SQL, Compose, runner, and verifier tests**
 
 Assert the renderer accepts only registry entities and lowercase 64-hex bundle IDs, emits one `INSERT INTO`, one fixed target, `execution.runtime-mode=batch`, parallelism 1, strict JSON parsing, the derived `/data/olist/prepared/$sourceBundleSha256/normalized/$entity.jsonl` path, all source coordinates, and no Kafka connector. Assert only fixed registry values can fill these template tokens:
 
@@ -285,7 +285,7 @@ Assert-G2eSourceState -Observed $observed -Expected $deployment
 
 Negative cases cover non-D-drive manifests, manifests outside `OLIST_DATA_DIR`, altered normalized hashes, unresolved SQL tokens, unknown entities, active duplicate pipeline jobs, a target containing a different bundle, partial nonzero rows, duplicate IDs, row gaps, wrong source filename, digest mismatch, no Iceberg snapshot, and a supplied Job ID that is not the finished bounded job.
 
-- [ ] **Step 2: Run the focused test and confirm RED**
+- [x] **Step 2: Run the focused test and confirm RED**
 
 Run:
 
@@ -297,7 +297,7 @@ python -m unittest tests.test_g2e_olist_lakehouse -v
 
 Expected: FAIL because the renderer, templates, scripts, and mounts do not exist.
 
-- [ ] **Step 3: Implement fixed-registry SQL rendering and the read-only mount**
+- [x] **Step 3: Implement fixed-registry SQL rendering and the read-only mount**
 
 The template creates `lakehouse.olist` and one temporary filesystem JSON source. Source fields match Task 1 JSON types; target business columns use `VARCHAR`, `BIGINT`, `DECIMAL`, or timezone-free `TIMESTAMP(3)`. Each monetary source field becomes both a `_raw`-suffixed `VARCHAR` preserving the official text and a typed `DECIMAL(38,2)` under the official field name for downstream use. These are followed by:
 
@@ -320,7 +320,7 @@ Add this Compose mount to all three Flink services:
   read_only: true
 ```
 
-- [ ] **Step 4: Implement safe submit/resume behavior**
+- [x] **Step 4: Implement safe submit/resume behavior**
 
 Before submission, the runner verifies the formal manifest and normalized file against Task 1 hashes, checks the physical path remains below `OLIST_DATA_DIR`, starts only Flink/MinIO/Metastore/Trino, and queries the fixed target name.
 
@@ -347,7 +347,7 @@ switch ($state.Kind) {
 
 Wait for the exact pipeline job to reach `FINISHED`; reject `FAILED`, `CANCELED`, timeout, or multiple matching jobs. A completed checkpoint is recorded when present, but a short batch job may prove atomic completion through `FINISHED` plus the committed Iceberg snapshot.
 
-- [ ] **Step 5: Implement Trino verification**
+- [x] **Step 5: Implement Trino verification**
 
 `20_olist_source_verify.sql.template` returns fixed named results for table existence, row summary, ordered row-ID digest, business-key uniqueness, bundle identity, source filename, and latest snapshot. The digest must match Task 1's LF-delimited `source_row_id_sequence_sha256`:
 
@@ -359,13 +359,13 @@ lower(to_hex(sha256(to_utf8(
 
 Require `row_count = manifest row_count = count(distinct source_row_id)`, `min(source_row_number)=1`, `max(source_row_number)=row_count`, one bundle value, one source filename, zero duplicate strong/composite keys, and a positive decimal-string Snapshot ID. Write the report atomically and never overwrite an existing contradictory report.
 
-- [ ] **Step 6: Run tests and confirm GREEN**
+- [x] **Step 6: Run tests and confirm GREEN**
 
 Run the command from Step 2.
 
 Expected: all source-ingestion contract tests PASS without requiring Docker.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```powershell
 git add generators/olist_data/flink_sql.py generators/olist_data/__main__.py jobs/sql/19_olist_source_ingest.sql.template jobs/sql/20_olist_source_verify.sql.template scripts/run_g2e_olist_source.ps1 scripts/verify_g2e_olist_source.ps1 infra/.env.example infra/docker-compose.yml tests/test_g2e_olist_lakehouse.py
@@ -387,7 +387,7 @@ git commit -m "feat: ingest bounded Olist sources into Iceberg"
 - Builder: `scripts/build_g2e_olist_curated.ps1 -ManifestPath $manifestPath`; it discovers and validates source reports rather than accepting caller-supplied table names or SQL.
 - Source tokens: `__ORDERS_SRC_SNAPSHOT__`, `__ORDER_ITEMS_SRC_SNAPSHOT__`, `__ORDER_PAYMENTS_SRC_SNAPSHOT__`, `__ORDER_REVIEWS_SRC_SNAPSHOT__`, `__CUSTOMERS_SRC_SNAPSHOT__`, `__PRODUCTS_SRC_SNAPSHOT__`, `__SELLERS_SRC_SNAPSHOT__`, `__GEOLOCATION_SRC_SNAPSHOT__`, and `__CATEGORY_TRANSLATION_SRC_SNAPSHOT__`; curated dependency tokens use the matching singular table name plus `_SNAPSHOT__`.
 
-- [ ] **Step 1: Write failing source-gate, grain, anti-fanout, and resume tests**
+- [x] **Step 1: Write failing source-gate, grain, anti-fanout, and resume tests**
 
 Create a small synthetic SQL fixture with one order that has two items, two payments, and two reviews. Tests inspect executable query results or pure assertion functions and require:
 
@@ -404,7 +404,7 @@ Add rejection tests for duplicate order/customer/product/seller/category keys; d
 
 Resume tests require an existing curated table to match bundle identity, exact grain count, source Snapshot map, and its recorded latest curated Snapshot; a conflicting table fails without `DROP`, `DELETE`, `TRUNCATE`, or replacement.
 
-- [ ] **Step 2: Run the focused test and confirm RED**
+- [x] **Step 2: Run the focused test and confirm RED**
 
 Run:
 
@@ -416,7 +416,7 @@ python -m unittest tests.test_g2e_olist_curated -v
 
 Expected: FAIL because curated SQL and scripts do not exist.
 
-- [ ] **Step 3: Define exact curated grains and columns**
+- [x] **Step 3: Define exact curated grains and columns**
 
 The template has nine statements in this exact dependency order: `customer_dim`, `category_dim`, `product_dim`, `seller_dim`, `geolocation_dim`, `order_fact`, `order_item_fact`, `payment_fact`, and `review_fact`. Every source reference uses a `FOR VERSION AS OF` token that the renderer replaces only with a validated positive integer:
 
@@ -453,7 +453,7 @@ JOIN lakehouse.olist.product_dim_v1 FOR VERSION AS OF __PRODUCT_DIM_SNAPSHOT__ A
 
 The renderer replaces only positive integer Snapshot tokens and the validated 64-hex snapshot-set digest. Production SQL uses `CREATE TABLE IF NOT EXISTS` plus pre/post state checks so interruption can resume without replacing an existing table.
 
-- [ ] **Step 4: Implement hard gates before CTAS and reportable quality after CTAS**
+- [x] **Step 4: Implement hard gates before CTAS and reportable quality after CTAS**
 
 Split `22_olist_curated_verify.sql.template` into named single-row statements. `hard_gate` returns every structural count with fixed aliases and must be all zero before the first CTAS. `reportable_quality` returns non-blocking counts. `grain_reconciliation` proves each curated key unique and source-to-curated counts exact. `anti_fanout` separately compares item, payment, and review source sums/counts to their facts. `snapshot_identity` returns sorted source and curated table/Snapshot pairs.
 
@@ -469,13 +469,13 @@ foreach ($stage in Get-G2eCuratedStageOrder) {
 }
 ```
 
-- [ ] **Step 5: Run tests and confirm GREEN**
+- [x] **Step 5: Run tests and confirm GREEN**
 
 Run the command from Step 2.
 
 Expected: all curated-model tests PASS; text-contract tests also prove every source table is Snapshot-pinned and forbidden destructive SQL is absent.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```powershell
 git add jobs/sql/21_olist_curated_model.sql.template jobs/sql/22_olist_curated_verify.sql.template scripts/build_g2e_olist_curated.ps1 scripts/verify_g2e_olist_curated.ps1 tests/test_g2e_olist_curated.py
@@ -497,7 +497,7 @@ git commit -m "feat: build anti-fanout Olist curated facts"
 - Metric identity object: `MetricRunId`, `DatasetId`, `MetricVersion`, `SourceBundleSha256`, sorted `SourceSnapshots`, sorted `CuratedSnapshots`, `SourceOrderCount`, `WindowStart`, `WindowEnd`, `CalculatedAt`, and `ImplementationRevision`.
 - Curated tokens: `__ORDER_FACT_SNAPSHOT__`, `__ORDER_ITEM_FACT_SNAPSHOT__`, `__PAYMENT_FACT_SNAPSHOT__`, `__REVIEW_FACT_SNAPSHOT__`, `__CUSTOMER_DIM_SNAPSHOT__`, `__PRODUCT_DIM_SNAPSHOT__`, `__SELLER_DIM_SNAPSHOT__`, `__CATEGORY_DIM_SNAPSHOT__`, and `__GEOLOCATION_DIM_SNAPSHOT__`.
 
-- [ ] **Step 1: Write failing catalog, SQL, DDL, and pure-function tests**
+- [x] **Step 1: Write failing catalog, SQL, DDL, and pure-function tests**
 
 Pin the catalog to this exact public set:
 
@@ -543,7 +543,7 @@ def test_order_level_review_average_gives_each_order_one_vote(self):
 
 Also pin a multi-payment order into two payment-type groups while retaining one global order count; prove grouped order counts are not summed as a total. Pin one order touching two seller states and prove each state may show the whole order payment value while the catalog and API mark seller-state payment totals non-additive.
 
-- [ ] **Step 2: Run the focused test and confirm RED**
+- [x] **Step 2: Run the focused test and confirm RED**
 
 Run:
 
@@ -555,7 +555,7 @@ python -m unittest tests.test_g2e_order_metrics -v
 
 Expected: FAIL because the catalog, SQL, DDL, and module do not exist.
 
-- [ ] **Step 3: Create the complete `orders-v1` definition catalog**
+- [x] **Step 3: Create the complete `orders-v1` definition catalog**
 
 The document identity is fixed:
 
@@ -572,7 +572,7 @@ Use `DAY`, `MONTH`, and `FULL` only. Status-rate denominator `status_eligible_or
 
 Window bounds are deterministic and remain inside the observed publication range: DAY uses the purchase date for both bounds; MONTH groups by calendar month but uses that group's minimum and maximum observed purchase dates; FULL uses the global minimum and maximum observed purchase dates. This makes first/last partial months explicit instead of pretending they cover unobserved calendar days.
 
-- [ ] **Step 4: Create six snapshot-pinned Trino metric statements**
+- [x] **Step 4: Create six snapshot-pinned Trino metric statements**
 
 Every statement independently builds DAY, MONTH, and FULL windows; FULL is recomputed from facts, not summed from smaller windows. Use three one-row-per-order CTEs before overview joins:
 
@@ -611,7 +611,7 @@ Metric-family contracts are exact:
 
 Product/category/seller ranks derive only from item facts. Customer-state payment sums use one order/customer-state row. Seller-state payment values first deduplicate `(order_id, seller_state)`, then attach the whole order payment total; they are deliberately non-additive across states. State late rates deduplicate `(order_id, state)` before numerator and denominator counts. Amount reconciliation compares only orders having both an item aggregate and a payment aggregate; equality is exact at two decimals, and the reported distribution uses the absolute signed-difference magnitude without hiding unmatched orders.
 
-- [ ] **Step 5: Define immutable Doris contracts**
+- [x] **Step 5: Define immutable Doris contracts**
 
 Create these tables with one local bucket and no destructive statement:
 
@@ -640,7 +640,7 @@ quality:  (metric_run_id)
 
 Use `DECIMAL(38,2)` for money and `DECIMAL(18,6)` for rates/averages. Use nullable money/rate columns only where a denominator or metric is semantically unavailable. Store canonical quality/Snapshot JSON as bounded `VARCHAR` and validate it before and after Doris load.
 
-- [ ] **Step 6: Implement pure PowerShell reconciliation and canonical digest functions**
+- [x] **Step 6: Implement pure PowerShell reconciliation and canonical digest functions**
 
 `Get-G2eMetricIdentity` accepts already parsed manifest/reports and rejects unknown/missing Snapshot keys, nonpositive IDs, a bundle mismatch, an empty order range, source-order count mismatch, a dirty/invalid implementation revision, or a run ID other than:
 
@@ -652,13 +652,13 @@ $expectedRunId = "orders-v1-b$($Manifest.source_bundle_sha256)"
 
 `Assert-G2eMetricBundle` enforces unique family keys, exact identity on every row, DAY/MONTH/FULL reconciliation, FULL source order count, nonnegative values, rates matching numerator/denominator to six decimals, valid null cases, stable ranking order inputs, the merged reportable quality maps, and `PASS`. `Export-G2eCandidateCsv` writes a fixed header and canonical rows atomically; `Get-G2eCanonicalDigest` hashes those exact UTF-8/LF bytes.
 
-- [ ] **Step 7: Run tests and confirm GREEN**
+- [x] **Step 7: Run tests and confirm GREEN**
 
 Run the command from Step 2.
 
 Expected: all metric contract and pure-function tests PASS.
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 ```powershell
 git add configs/metrics/orders-v1.json jobs/sql/23_g2e_order_metrics.sql.template infra/compose/doris/init/03_create_order_metrics.sql scripts/lib/G2e.OrderMetrics.psm1 tests/test_g2e_order_metrics.py
@@ -676,7 +676,7 @@ git commit -m "feat: define orders-v1 metric contracts"
 - Produces: `Get-G2eRefreshPlan`, `Enter-G2eRunLock`, `Invoke-G2ePublicationSequence`, `New-G2ePublicationRecord`, `Invoke-G2eRefresh`; six candidate CSVs; a report at `tmp/graduation/g2e/$sourceBundleSha256/metrics/refresh.json`; and either `published` or `already_published`.
 - Entrypoint: `scripts/refresh_g2e_order_metrics.ps1 -ManifestPath $manifestPath`; table names, SQL, run IDs, and Snapshot IDs are discovered from verified evidence rather than accepted as free-form arguments.
 
-- [ ] **Step 1: Write failing publication-order, retry, path, and readback tests**
+- [x] **Step 1: Write failing publication-order, retry, path, and readback tests**
 
 Dot-source with `-FunctionsOnly` and inject callbacks into `Invoke-G2ePublicationSequence`. Pin this order:
 
@@ -706,7 +706,7 @@ Retry tests cover:
 
 Path tests reject C-drive output, symlink/junction escape, a report outside fixed `tmp/graduation/g2e/$sourceBundleSha256/metrics`, existing conflicting files, and unresolved SQL tokens. A held run lock rejects a concurrent refresh before either process queries or loads candidates.
 
-- [ ] **Step 2: Run the refresh tests and confirm RED**
+- [x] **Step 2: Run the refresh tests and confirm RED**
 
 Run:
 
@@ -718,7 +718,7 @@ python -m unittest tests.test_g2e_order_metrics.G2eRefreshTests -v
 
 Expected: FAIL because `refresh_g2e_order_metrics.ps1` does not exist.
 
-- [ ] **Step 3: Implement dependency, identity, and SQL execution gates**
+- [x] **Step 3: Implement dependency, identity, and SQL execution gates**
 
 Reuse the repository's process-local Docker fallback `D:\DockerProgram\Docker\resources\bin`; never persist a PATH change. Acquire an exclusive create-new file handle for this full run ID and hold it through final readback so two local refreshes cannot race. Start only MinIO/Metastore/Trino and Doris for refresh. Require a clean tracked implementation state and capture `git rev-parse HEAD` as a 40-hex revision. Query every source and curated latest Snapshot, compare it to verified reports, then render only numeric `FOR VERSION AS OF` tokens in the fixed metric template.
 
@@ -736,7 +736,7 @@ $rendered = $rendered.Replace('__ORDER_FACT_SNAPSHOT__', $snapshotId)
 
 Split named SQL deterministically and execute each statement through the Trino CLI `CSV_HEADER_UNQUOTED` format. Parse with fixed columns, call `Assert-G2eMetricBundle`, and export each family into the run directory before touching Doris.
 
-- [ ] **Step 4: Implement candidate load and publication-last readback**
+- [x] **Step 4: Implement candidate load and publication-last readback**
 
 Run the fixed DDL, assert all seven table schemas, and Stream Load six candidate files with strict JSON/CSV options and zero tolerated filtering. After each load, query the rows back by parameter-escaped fixed run ID, canonicalize with the same module, and require exact row count and digest.
 
@@ -751,7 +751,7 @@ Publish-G2eMetadata -Record (New-G2ePublicationRecord -Identity $identity -Candi
 Assert-G2ePublicationReadback -Expected $identity
 ```
 
-- [ ] **Step 5: Run focused and neighboring regression tests**
+- [x] **Step 5: Run focused and neighboring regression tests**
 
 Run:
 
@@ -763,7 +763,7 @@ python -m unittest tests.test_g2e_order_metrics tests.test_g2d_behavior_metrics 
 
 Expected: G2-E publication tests and unchanged G2-D behavior publication tests PASS.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```powershell
 git add scripts/refresh_g2e_order_metrics.ps1 tests/test_g2e_order_metrics.py
@@ -785,7 +785,7 @@ git commit -m "feat: publish immutable Olist order metrics"
 - Consumes: `configs/metrics/orders-v1.json` and existing `ApiSettings` Doris configuration.
 - Produces: `OrderMetricMeta`, six point/quality models, seven response models, `OrderMetricDefinition`, `OrderMetricDefinitionsResponse`, `OrderMetricDefinitionCatalog.load(path)`, `ApiSettings.order_metric_definitions_path`, and `build_order_metrics_service(settings)`.
 
-- [ ] **Step 1: Write failing strict-model, catalog, settings, and factory tests**
+- [x] **Step 1: Write failing strict-model, catalog, settings, and factory tests**
 
 Require `extra="forbid"` on every model and pin the metadata contract:
 
@@ -811,7 +811,7 @@ Test full run ID length, lowercase digest, decimal Snapshot strings, exact sourc
 
 Catalog tests require exact identity and the Task 4 metric set, no duplicate names, valid source fields/windows, nonempty limitations, exact forbidden monetary claims, and seller-state non-additivity text. Settings tests require a nonblank `ORDER_METRIC_DEFINITIONS_PATH`; factory tests inject a temporary catalog and patched repository without making a network connection.
 
-- [ ] **Step 2: Run the focused API-contract tests and confirm RED**
+- [x] **Step 2: Run the focused API-contract tests and confirm RED**
 
 Run:
 
@@ -824,7 +824,7 @@ python -m unittest tests.test_order_metrics_api.OrderModelAndCatalogTests -v
 
 Expected: FAIL because the order model/catalog modules do not exist.
 
-- [ ] **Step 3: Implement exact typed responses**
+- [x] **Step 3: Implement exact typed responses**
 
 Create these response shapes:
 
@@ -854,7 +854,7 @@ class OrderPaymentPoint(StrictOrderModel):
     payment_value_sum: MoneyString
 ```
 
-- [ ] **Step 4: Implement the independent definition catalog and settings wiring**
+- [x] **Step 4: Implement the independent definition catalog and settings wiring**
 
 Do not broaden the existing behavior-only `MetricDefinitionCatalog`. `OrderMetricDefinitionCatalog` owns the order source-field allowlist and exact required set. Resolve the default `configs/metrics/orders-v1.json` using the same repository/container search strategy as behavior definitions.
 
@@ -866,7 +866,7 @@ order_metric_definitions_path: Path = _DEFAULT_ORDER_METRIC_DEFINITIONS_PATH
 
 Load `ORDER_METRIC_DEFINITIONS_PATH` in `load_settings`, validate it in `__post_init__`, expose `/app/configs/metrics/orders-v1.json` in `.env.example`, and pass it to the API container. `build_order_metrics_service` loads the order catalog and creates `OrderMetricsRepository.from_settings(settings)`.
 
-- [ ] **Step 5: Run tests and confirm GREEN**
+- [x] **Step 5: Run tests and confirm GREEN**
 
 Run the command from Step 2 plus:
 
@@ -877,7 +877,7 @@ python -m unittest tests.test_behavior_metrics_api tests.test_api_service -v
 
 Expected: new order model/catalog tests and unchanged behavior/core API tests PASS.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```powershell
 git add services/api/app/order_models.py services/api/app/order_metric_definitions.py services/api/app/config.py services/api/app/dependencies.py infra/.env.example infra/docker-compose.yml tests/test_order_metrics_api.py
@@ -910,7 +910,7 @@ get_definitions() -> OrderMetricDefinitionsResponse
 
 Repository integrity interface: `fetch_family_row_count(metric_run_id: str, family: Literal["overview", "delivery", "payment", "ranking", "review", "quality"]) -> int`; the family selects one fixed query from a constant map and never becomes a raw table name.
 
-- [ ] **Step 1: Write failing repository, service, and route tests**
+- [x] **Step 1: Write failing repository, service, and route tests**
 
 Use fake DB connections to assert exact fixed query text and parameter tuples. Repository tests reject unknown windows/dimensions/sorts, strings/booleans for limit, unpaired dates, date filters on FULL, reversed ranges, and SQL-like values. Require only these maps:
 
@@ -933,7 +933,7 @@ Route tests call all eight contracts with injected fake services, verify exact r
 
 Also assert existing behavior definitions and all existing `/metrics/*`, `/analysis/realtime`, and `/analysis/tools` tests remain unchanged.
 
-- [ ] **Step 2: Run the focused tests and confirm RED**
+- [x] **Step 2: Run the focused tests and confirm RED**
 
 Run:
 
@@ -946,7 +946,7 @@ python -m unittest tests.test_order_metrics_api -v
 
 Expected: FAIL because repository, service, and routes do not exist.
 
-- [ ] **Step 3: Implement parameterized fixed-table repository methods**
+- [x] **Step 3: Implement parameterized fixed-table repository methods**
 
 Use one private `_window_and_range()` validator. Date-filtered queries use `window_start >= %s AND window_end <= %s`; FULL uses no date predicate. Sort expressions are selected only from nested constant maps keyed by validated dimension and public sort name:
 
@@ -962,7 +962,7 @@ RANK_SORT_COLUMNS = {
 
 Ordering uses the selected constant column descending, followed by `dimension_id ASC, window_start ASC`; for example, item-value sorting becomes `item_value_sum DESC, dimension_id ASC, window_start ASC`. All values remain DB parameters. `fetch_latest_publication()` reads only `status='PUBLISHED'` and orders by publication time/run ID. Quality reads one FULL row. `fetch_family_row_count()` selects among six complete fixed `COUNT(*)` queries so limited/ranged responses can still prove the published family has not lost or gained rows. No method accepts a table, column, SQL fragment, or raw order expression.
 
-- [ ] **Step 4: Implement fail-closed service validation**
+- [x] **Step 4: Implement fail-closed service validation**
 
 `_load_publication()` derives the expected run ID from `source_bundle_sha256`, parses canonical sorted Snapshot objects, requires the exact nine source and nine curated names, verifies every positive decimal-string ID, and builds metadata. The source-order count must equal the `orders` manifest/source count represented by quality and overview FULL.
 
@@ -981,7 +981,7 @@ def _validate_range(window, start_date, end_date, publication_start, publication
 
 Each response validates row identity, requested family/window/range, row counts against publication metadata, stable ordering, denominator/rate consistency, and allowed nulls. Parse quality JSON with exact expected map keys and nonnegative integer values.
 
-- [ ] **Step 5: Add routes without breaking behavior definitions**
+- [x] **Step 5: Add routes without breaking behavior definitions**
 
 Add an `order_response()` wrapper that logs only stage and exception type and returns generic `503`. Add:
 
@@ -1010,7 +1010,7 @@ def get_order_overview(
     )
 ```
 
-- [ ] **Step 6: Run focused and full API regressions**
+- [x] **Step 6: Run focused and full API regressions**
 
 Run:
 
@@ -1021,7 +1021,7 @@ python -m unittest tests.test_order_metrics_api tests.test_behavior_metrics_api 
 
 Expected: all listed suites PASS.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```powershell
 git add services/api/app/order_repository.py services/api/app/order_service.py services/api/app/main.py tests/test_order_metrics_api.py
@@ -1119,7 +1119,7 @@ git status --short
 
 Expected: every Python test passes, Compose validates, diff check is clean, and no raw/normalized Olist data, runtime report, credential, or unrelated workspace file is staged. Run the existing Java DataStream Maven tests only if a Java/DataStream file changed; otherwise rely on the unchanged full Python/API/artifact regression plus Compose validation.
 
-- [ ] **Step 9: Request one whole-branch review and resolve findings**
+- [x] **Step 9: Request one whole-branch review and resolve findings**
 
 Use `superpowers:requesting-code-review` against the merge base through current HEAD. Review priority is data authenticity, key/FK gates, fanout, Snapshot identity, immutable publication, SQL injection, API semantics, secrets, path containment, and destructive operations. Fix every confirmed finding, rerun the affected focused suite, then rerun Step 8 before claiming completion.
 
@@ -1144,7 +1144,9 @@ Push `codex/chapter-10-controlled-tools` using the current command-scoped proxy 
 - Docker was capped at 7.66 GiB. Staged services eliminated the reproduced Trino exit 137, and the 316,153-row one-pass ranking parser used about 1.30 GiB in 35.5 seconds instead of about 5 GiB. No Docker volume, Iceberg table, Doris publication or user file was deleted.
 - Exact Task 8 offline command passed 100 tests in 48.739 seconds with one expected Windows symbolic-link capability skip.
 - The first repository-wide run found the new Compose resume variable missing from the Chapter 10.5 isolated environment. TDD fixed isolation to force `HIVE_METASTORE_IS_RESUME=false`; focused 2/2 and cold-start 34/34 tests passed.
-- Final repository-wide verification passed 658 tests in 237.357 seconds with the same one host-capability skip. Compose config and `git diff --check` passed; no Java/DataStream file changed.
+- Repository-wide verification after the cold-start fix passed 658 tests in 237.357 seconds; the post-review final rerun passed the same 658 tests in 235.567 seconds, both with the same one host-capability skip. Compose config and `git diff --check` passed; no Java/DataStream file changed.
+- Final review: self-review (no subagent tool), range `7b66f9051ceb80a68dcb3c9d575bc94fe9da93c1..0068296466d5bd0c85e884f8404a9239a4953cef`. No Critical or Important findings. Three documentation-consistency findings were fixed: source replay order now matches the filename-ordered acceptance run, Tasks 1-7 reflect their committed completion, and the Chapter 10.5 runbook has no trailing whitespace.
+- Review boundary: production HA/capacity/SLA and roadmap stages G3-G5 were not judged because G2-E specifies a single-machine bounded acceptance. Upstream collection authenticity beyond the official Kaggle archive, recorded hashes, license metadata, and operator acquisition evidence cannot be independently proven from this repository.
 
 ## Self-Review
 
