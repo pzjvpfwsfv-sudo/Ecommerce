@@ -171,7 +171,7 @@ def valid_synthetic_acceptance() -> dict:
             curated_snapshots, ensure_ascii=False, sort_keys=True, separators=(",", ":")
         ),
         "implementation_revision": REVISION,
-        "source_order_count": 2,
+        "source_order_count": "2",
         "window_start": "2017-01-01",
         "window_end": "2017-01-31",
         "calculated_at": "2026-09-22T08:00:00Z",
@@ -179,7 +179,7 @@ def valid_synthetic_acceptance() -> dict:
         "status": "PUBLISHED",
     }
     for family in FAMILIES:
-        publication[f"{family}_row_count"] = family_counts[family]
+        publication[f"{family}_row_count"] = str(family_counts[family])
         publication[f"{family}_sha256"] = family_digests[family]
 
     meta = _meta(source_snapshots, curated_snapshots)
@@ -462,6 +462,7 @@ class G2eOrderDomainContractTests(PowerShellAcceptanceTestCase):
         cases["source snapshot"] = lambda item: item["source_reports"][0]["iceberg"].__setitem__("snapshot_id", "999")
         cases["curated snapshot"] = lambda item: item["curated"]["curated_snapshots"].__setitem__("order_fact_v1", "999")
         cases["source order count"] = lambda item: item["doris"]["publication"].__setitem__("source_order_count", 3)
+        cases["noncanonical publication count"] = lambda item: item["doris"]["publication"].__setitem__("source_order_count", "02")
         cases["window"] = lambda item: item.__setitem__("window_end", "2017-02-01")
         cases["revision"] = lambda item: item.__setitem__("implementation_revision", "2" * 40)
         cases["row count"] = lambda item: item["doris"]["families"]["overview"].__setitem__("row_count", 4)

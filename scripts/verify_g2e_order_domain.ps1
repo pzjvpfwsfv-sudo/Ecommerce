@@ -129,11 +129,21 @@ function Test-G2eAcceptanceInteger {
 }
 
 function Assert-G2eAcceptanceCount {
-    param($Value, [string]$Label, [switch]$Positive)
-    if (-not (Test-G2eAcceptanceInteger $Value)) {
+    param($Value, [string]$Label, [switch]$Positive, [switch]$AllowString)
+    [long]$number = 0
+    if (Test-G2eAcceptanceInteger $Value) {
+        $number = [int64]$Value
+    } elseif ($AllowString -and $Value -is [string] -and
+            [string]$Value -cmatch '^(?:0|[1-9][0-9]*)$' -and
+            [int64]::TryParse(
+                [string]$Value,
+                [Globalization.NumberStyles]::None,
+                [Globalization.CultureInfo]::InvariantCulture,
+                [ref]$number
+            )) {
+    } else {
         throw "G2-E acceptance $Label must be an integer."
     }
-    $number = [int64]$Value
     if ($number -lt 0 -or ($Positive -and $number -eq 0)) {
         throw "G2-E acceptance $Label is outside its supported range."
     }
@@ -463,7 +473,7 @@ function Assert-G2eAcceptanceIdentity {
         'source order count' -Positive
     $publicationOrderCount = Assert-G2eAcceptanceCount `
         (Get-G2eAcceptanceProperty $Publication 'source_order_count' 'publication') `
-        'publication source order count' -Positive
+        'publication source order count' -Positive -AllowString
     if ($sourceOrderCount -ne $publicationOrderCount) {
         throw 'G2-E acceptance source order count differs.'
     }
@@ -622,7 +632,7 @@ function Assert-G2eAcceptanceEvidence {
         $digestField = "${family}_sha256"
         $publishedRows = Assert-G2eAcceptanceCount `
             (Get-G2eAcceptanceProperty $publication $rowField 'publication') `
-            "$family publication rows" -Positive
+            "$family publication rows" -Positive -AllowString
         $publishedDigest = Assert-G2eAcceptanceSha256 `
             (Get-G2eAcceptanceProperty $publication $digestField 'publication') `
             "$family publication digest"
@@ -669,11 +679,25 @@ function Assert-G2eAcceptanceEvidence {
         throw 'G2-E acceptance API publication status differs.'
     }
     foreach ($family in $script:G2eAcceptanceFamilies) {
-        foreach ($suffix in @('row_count', 'sha256')) {
-            $field = "${family}_$suffix"
-            $actual = Get-G2eAcceptanceProperty $publicationData $field 'publication response'
-            $expected = Get-G2eAcceptanceProperty $publication $field 'publication'
-            Assert-G2eAcceptanceValueEqual $actual $expected "API publication $field"
+        $rowField = "${family}_row_count"
+        $actualRows = Assert-G2eAcceptanceCount `
+            (Get-G2eAcceptanceProperty $publicationData $rowField 'publication response') `
+            "API publication $rowField" -Positive
+        $expectedRows = Assert-G2eAcceptanceCount `
+            (Get-G2eAcceptanceProperty $publication $rowField 'publication') `
+            "Doris publication $rowField" -Positive -AllowString
+        if ($actualRows -ne $expectedRows) {
+            throw "G2-E acceptance API publication $rowField differs."
+        }
+        $digestField = "${family}_sha256"
+        $actualDigest = Assert-G2eAcceptanceSha256 `
+            (Get-G2eAcceptanceProperty $publicationData $digestField 'publication response') `
+            "API publication $digestField"
+        $expectedDigest = Assert-G2eAcceptanceSha256 `
+            (Get-G2eAcceptanceProperty $publication $digestField 'publication') `
+            "Doris publication $digestField"
+        if ($actualDigest -cne $expectedDigest) {
+            throw "G2-E acceptance API publication $digestField differs."
         }
     }
     $apiPublishedAt = ConvertTo-G2eAcceptanceUtcTimestamp `
