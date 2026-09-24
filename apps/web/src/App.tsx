@@ -6,6 +6,7 @@ import { LoginPage } from "./components/LoginPage";
 import { Shell } from "./components/Shell";
 import { AuthSession, getSession, logoutUser } from "./lib/auth";
 import { ApiError } from "./lib/http";
+import { Overview } from "./modules/Overview";
 
 const moduleNames: Record<string, string> = {
   overview: "运营总览",
@@ -83,7 +84,7 @@ export default function App() {
         <Routes>
           <Route path="/" element={<Navigate to="/overview" replace />} />
           {Object.entries(moduleNames).map(([path, name]) => (
-            <Route key={path} path={`/${path}`} element={<ModulePending name={name} />} />
+            <Route key={path} path={`/${path}`} element={path === "overview" ? <Overview /> : <ModulePending name={name} />} />
           ))}
           <Route path="/account" element={<AccountPage user={session} />} />
           <Route path="*" element={<Navigate to="/overview" replace />} />

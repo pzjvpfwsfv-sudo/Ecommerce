@@ -1,10 +1,12 @@
 import { HttpResponse, http } from "msw";
 import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import App from "../App";
 import { server } from "../test/handlers";
+
+vi.mock("../modules/Overview", () => ({ Overview: () => <div>总览模块</div> }));
 
 const admin = { id: 1, username: "owner", role: "admin", csrf_token: "csrf-test" };
 const viewer = { ...admin, username: "reader", role: "viewer" };
