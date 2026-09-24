@@ -903,8 +903,12 @@ function Wait-G2eDorisDependency {
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
     do {
         try {
-            $probe = @(Invoke-G2eDorisSql -Sql 'SELECT 1 AS ready;' -EnvFile $EnvFile -NoHeaders)
-            if ($probe.Count -eq 1 -and [string]$probe[0] -ceq '1') { return }
+            $backends = @(Invoke-G2eDorisQuery -Sql 'SHOW BACKENDS;' -EnvFile $EnvFile)
+            foreach ($backend in $backends) {
+                $alive = [string](Get-G2ePropertyValue $backend 'Alive')
+                $decommissioned = [string](Get-G2ePropertyValue $backend 'SystemDecommissioned')
+                if ($alive -ceq 'true' -and $decommissioned -ceq 'false') { return }
+            }
         } catch {
         }
         Start-Sleep -Seconds 2

@@ -1113,6 +1113,25 @@ Wait-G2eTrinoDependency -EnvFile 'fixture.env' -TimeoutSeconds 5
         )
         self.assertEqual(2, payload["attempts"])
 
+    def test_doris_readiness_waits_for_an_alive_backend(self):
+        payload = self.refresh_payload(
+            r'''
+$script:backendAttempts = 0
+function Invoke-G2eDorisSql { return @('1') }
+function Invoke-G2eDorisQuery {
+    param([string]$Sql, [string]$EnvFile)
+    $script:backendAttempts++
+    if ($script:backendAttempts -eq 1) {
+        return @([pscustomobject]@{ Alive='false'; SystemDecommissioned='false' })
+    }
+    return @([pscustomobject]@{ Alive='true'; SystemDecommissioned='false' })
+}
+Wait-G2eDorisDependency -EnvFile 'fixture.env' -TimeoutSeconds 5
+[ordered]@{ attempts=$script:backendAttempts } | ConvertTo-Json -Compress
+'''
+        )
+        self.assertEqual(2, payload["attempts"])
+
     def test_metric_output_rejects_physical_link_escape_when_supported(self):
         payload = self.refresh_payload(
             r'''
