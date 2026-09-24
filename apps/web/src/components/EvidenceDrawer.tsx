@@ -12,12 +12,13 @@ function snapshots(meta: MetricMeta): [string, string][] {
   return [["REES46 source snapshot", (meta as BehaviorMeta).source_snapshot_id]];
 }
 
-export function EvidenceDrawer({ open, onClose, meta, domain, publishedAt }: {
+export function EvidenceDrawer({ open, onClose, meta, domain, publishedAt, highlightMetric }: {
   open: boolean;
   onClose: () => void;
   meta: MetricMeta;
   domain: "orders" | "behavior";
   publishedAt?: string;
+  highlightMetric?: string;
 }) {
   const closeRef = useRef<HTMLButtonElement>(null);
   const [definitions, setDefinitions] = useState<DefinitionsResponse | null>(null);
@@ -72,7 +73,7 @@ export function EvidenceDrawer({ open, onClose, meta, domain, publishedAt }: {
       <h3>指标定义</h3>
       {error && <p role="alert">定义接口暂不可用；不会显示缓存的演示定义。</p>}
       {!error && !definitions && <p role="status">正在加载定义…</p>}
-      {definitions && <ul className="definition-list">{definitions.definitions.map((definition) => <li key={definition.metric_name}>
+      {definitions && <ul className="definition-list">{[...definitions.definitions].sort((a, b) => Number(b.metric_name === highlightMetric) - Number(a.metric_name === highlightMetric)).map((definition) => <li key={definition.metric_name} className={definition.metric_name === highlightMetric ? "definition--highlight" : undefined}>
         <strong>{definition.display_name}</strong><code>{definition.metric_name}</code>
         <p>{definition.formula}</p>
         {definition.limitations.map((limit) => <small key={limit}>{limit}</small>)}
