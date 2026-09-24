@@ -1,0 +1,21 @@
+CREATE TABLE IF NOT EXISTS app_users (
+  id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  username TEXT NOT NULL UNIQUE,
+  password_hash TEXT NOT NULL,
+  role TEXT NOT NULL CHECK (role IN ('admin','analyst','viewer')),
+  active BOOLEAN NOT NULL DEFAULT TRUE,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS app_sessions (
+  token_hash CHAR(64) PRIMARY KEY,
+  user_id BIGINT NOT NULL REFERENCES app_users(id),
+  csrf_token TEXT NOT NULL,
+  expires_at TIMESTAMPTZ NOT NULL,
+  revoked_at TIMESTAMPTZ
+);
+CREATE TABLE IF NOT EXISTS auth_audit (
+  id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  user_id BIGINT REFERENCES app_users(id),
+  action TEXT NOT NULL,
+  occurred_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
