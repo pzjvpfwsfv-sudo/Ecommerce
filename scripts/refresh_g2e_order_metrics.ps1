@@ -684,6 +684,17 @@ function Get-G2eDockerExecutable {
     throw 'Docker CLI is unavailable for G2-E metric refresh.'
 }
 
+function ConvertTo-G2eNativeArguments {
+    param([Parameter(Mandatory = $true)][string[]]$Arguments)
+
+    if ($PSVersionTable.PSVersion.Major -lt 7) {
+        return [string[]]@($Arguments | ForEach-Object {
+            $_.Replace('"', '\"')
+        })
+    }
+    return [string[]]$Arguments
+}
+
 function Invoke-G2eComposeCommand {
     param(
         [Parameter(Mandatory = $true)][string]$EnvFile,
@@ -693,12 +704,7 @@ function Invoke-G2eComposeCommand {
     if ([string]::IsNullOrWhiteSpace([string]$script:G2eDockerExecutable)) {
         throw 'G2-E Docker executable was not initialized.'
     }
-    $nativeArguments = $Arguments
-    if ($PSVersionTable.PSVersion.Major -lt 7) {
-        $nativeArguments = [string[]]@($Arguments | ForEach-Object {
-            $_.Replace('"', '\"')
-        })
-    }
+    $nativeArguments = ConvertTo-G2eNativeArguments -Arguments $Arguments
     $previousErrorActionPreference = $ErrorActionPreference
     try {
         # Windows PowerShell 5.1 wraps native stderr as ErrorRecord objects.
@@ -1268,8 +1274,18 @@ function Invoke-G2eStreamLoad {
         '--upload-file', $path,
         "$script:G2eDorisStreamLoadUrl/api/analytics/$($spec.Table)/_stream_load"
     )
-    $output = @(& curl.exe @arguments 2>&1)
-    if ($LASTEXITCODE -ne 0) { throw "G2-E Stream Load request failed for $($spec.Table)." }
+    $nativeArguments = ConvertTo-G2eNativeArguments -Arguments $arguments
+    $previousErrorActionPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        $output = @(& curl.exe @nativeArguments 2>&1)
+        $exitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
+    if ($exitCode -ne 0) {
+        throw "G2-E Stream Load request failed for $($spec.Table): $($output -join ' ')"
+    }
     try { return (($output -join "`n") | ConvertFrom-Json) } catch {
         throw "G2-E Stream Load returned malformed JSON for $($spec.Table)."
     }

@@ -1053,6 +1053,21 @@ try {{
                 payload["sql"],
             )
 
+    def test_windows_native_arguments_escape_curl_header_quotes(self):
+        executable = shutil.which("powershell")
+        if executable is None:
+            self.skipTest("Windows PowerShell is unavailable")
+        payload = self.refresh_payload(
+            r'''
+$native = @(ConvertTo-G2eNativeArguments -Arguments @('enclose:"'))
+[ordered]@{ value=$native[0]; length=$native[0].Length } |
+    ConvertTo-Json -Compress
+''',
+            executable=executable,
+        )
+        self.assertEqual(r'enclose:\"', payload["value"])
+        self.assertEqual(10, payload["length"])
+
     def test_trino_transport_maps_its_quoted_empty_null_encoding_to_null(self):
         payload = self.refresh_payload(
             r'''
