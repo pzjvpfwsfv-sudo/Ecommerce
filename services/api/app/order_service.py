@@ -63,23 +63,31 @@ _SOURCE_ENTITIES = frozenset(
         "category_translation",
     }
 )
+_CURATED_STAGE_PREFIXES = (
+    "customer_dim",
+    "category_dim",
+    "product_dim",
+    "seller_dim",
+    "geolocation_dim",
+    "order_fact",
+    "order_item_fact",
+    "payment_fact",
+    "review_fact",
+)
 _FACT_RECONCILIATION_KEYS = frozenset(
-    {
-        "order_fact_expected_count",
-        "order_fact_row_count",
-        "order_item_fact_expected_count",
-        "order_item_fact_row_count",
-        "payment_fact_expected_count",
-        "payment_fact_row_count",
-        "review_fact_expected_count",
-        "review_fact_row_count",
-    }
+    f"{prefix}_{suffix}"
+    for prefix in _CURATED_STAGE_PREFIXES
+    for suffix in ("expected_count", "row_count", "distinct_key_count")
 )
 _REPORTABLE_QUALITY_KEYS = frozenset(
     {
+        "duplicate_review_id_count",
         "unknown_order_status_count",
         "unknown_payment_type_count",
+        "missing_product_category_count",
+        "missing_category_translation_count",
         "multi_review_order_count",
+        "missing_optional_time_count",
         "lifecycle_order_anomaly_count",
         "payment_item_total_mismatch_count",
     }
@@ -87,6 +95,7 @@ _REPORTABLE_QUALITY_KEYS = frozenset(
 _HEX_64 = re.compile(r"^[0-9a-f]{64}$")
 _HEX_40 = re.compile(r"^[0-9a-f]{40}$")
 _SNAPSHOT_ID = re.compile(r"^[1-9][0-9]*$")
+_COUNT_STRING = re.compile(r"^(?:0|[1-9][0-9]*)$")
 _MONEY_QUANTUM = Decimal("0.01")
 _SIX_QUANTUM = Decimal("0.000001")
 _T = TypeVar("_T")
@@ -323,10 +332,14 @@ class OrderMetricsService:
                 row["curated_snapshots_json"], CURATED_SNAPSHOT_TABLES
             )
             fact_reconciliations = _parse_integer_map(
-                row["fact_reconciliations_json"], _FACT_RECONCILIATION_KEYS
+                row["fact_reconciliations_json"],
+                _FACT_RECONCILIATION_KEYS,
+                allow_decimal_strings=True,
             )
             reportable_quality = _parse_integer_map(
-                row["reportable_quality_json"], _REPORTABLE_QUALITY_KEYS
+                row["reportable_quality_json"],
+                _REPORTABLE_QUALITY_KEYS,
+                allow_decimal_strings=True,
             )
             if source_snapshots != meta.source_snapshots or curated_snapshots != meta.curated_snapshots:
                 raise ValueError("quality snapshots differ from publication")
@@ -340,10 +353,11 @@ class OrderMetricsService:
                 or iceberg_counts["orders_src_v1"] != meta.source_order_count
             ):
                 raise ValueError("quality order counts differ from publication")
-            for prefix in ("order_fact", "order_item_fact", "payment_fact", "review_fact"):
-                if fact_reconciliations[f"{prefix}_expected_count"] != fact_reconciliations[
-                    f"{prefix}_row_count"
-                ]:
+            for prefix in _CURATED_STAGE_PREFIXES:
+                expected_count = fact_reconciliations[f"{prefix}_expected_count"]
+                row_count = fact_reconciliations[f"{prefix}_row_count"]
+                distinct_count = fact_reconciliations[f"{prefix}_distinct_key_count"]
+                if expected_count != row_count or distinct_count != row_count:
                     raise ValueError("quality fact reconciliation failed")
             comparable = _nonnegative_int(row["amount_comparable_order_count"])
             reconciled = _nonnegative_int(row["amount_reconciled_order_count"])
@@ -869,11 +883,26 @@ def _parse_snapshot_map(raw: Any, expected_keys: frozenset[str]) -> dict[str, st
     return parsed
 
 
-def _parse_integer_map(raw: Any, expected_keys: frozenset[str]) -> dict[str, int]:
+def _parse_integer_map(
+    raw: Any,
+    expected_keys: frozenset[str],
+    *,
+    allow_decimal_strings: bool = False,
+) -> dict[str, int]:
     parsed = _parse_canonical_object(raw)
     if set(parsed) != expected_keys:
         raise ValueError("integer evidence map has an unexpected key set")
-    return {key: _nonnegative_int(value) for key, value in parsed.items()}
+
+    def parse_value(value: Any) -> int:
+        if (
+            allow_decimal_strings
+            and type(value) is str
+            and _COUNT_STRING.fullmatch(value) is not None
+        ):
+            return int(value)
+        return _nonnegative_int(value)
+
+    return {key: parse_value(value) for key, value in parsed.items()}
 
 
 def _parse_hash_map(raw: Any, expected_keys: frozenset[str]) -> dict[str, str]:

@@ -86,19 +86,42 @@ SOURCE_ENTITIES = {
     "category_translation",
 }
 FACT_RECONCILIATION_KEYS = {
+    "customer_dim_expected_count",
+    "customer_dim_row_count",
+    "customer_dim_distinct_key_count",
+    "category_dim_expected_count",
+    "category_dim_row_count",
+    "category_dim_distinct_key_count",
+    "product_dim_expected_count",
+    "product_dim_row_count",
+    "product_dim_distinct_key_count",
+    "seller_dim_expected_count",
+    "seller_dim_row_count",
+    "seller_dim_distinct_key_count",
+    "geolocation_dim_expected_count",
+    "geolocation_dim_row_count",
+    "geolocation_dim_distinct_key_count",
     "order_fact_expected_count",
     "order_fact_row_count",
+    "order_fact_distinct_key_count",
     "order_item_fact_expected_count",
     "order_item_fact_row_count",
+    "order_item_fact_distinct_key_count",
     "payment_fact_expected_count",
     "payment_fact_row_count",
+    "payment_fact_distinct_key_count",
     "review_fact_expected_count",
     "review_fact_row_count",
+    "review_fact_distinct_key_count",
 }
 REPORTABLE_QUALITY_KEYS = {
+    "duplicate_review_id_count",
     "unknown_order_status_count",
     "unknown_payment_type_count",
+    "missing_product_category_count",
+    "missing_category_translation_count",
     "multi_review_order_count",
+    "missing_optional_time_count",
     "lifecycle_order_anomaly_count",
     "payment_item_total_mismatch_count",
 }
@@ -438,8 +461,8 @@ def order_quality_row(**overrides: object) -> dict[str, object]:
     curated_snapshots = {
         name: str(index) for index, name in enumerate(sorted(CURATED_TABLES), 101)
     }
-    fact_reconciliations = {name: 2 for name in FACT_RECONCILIATION_KEYS}
-    reportable_quality = {name: 0 for name in REPORTABLE_QUALITY_KEYS}
+    fact_reconciliations = {name: "2" for name in FACT_RECONCILIATION_KEYS}
+    reportable_quality = {name: "0" for name in REPORTABLE_QUALITY_KEYS}
     row = order_identity_row(
         source_row_count=2,
         iceberg_row_count=2,
@@ -857,6 +880,8 @@ class OrderMetricsServiceTests(unittest.TestCase):
             self.assertNotIn("SELECT", str(raised.exception))
 
     def test_family_integrity_decimal_quality_and_ordering_fail_closed(self):
+        noncanonical_counts = {name: "2" for name in FACT_RECONCILIATION_KEYS}
+        noncanonical_counts["order_fact_row_count"] = "02"
         failures = (
             ("overview", {"fetch_overview": [order_overview_row(dataset_id="other")]}),
             ("overview", {"fetch_overview": [order_overview_row(item_value_sum="30.00")]}),
@@ -867,6 +892,9 @@ class OrderMetricsServiceTests(unittest.TestCase):
             ]}),
             ("quality", {"fetch_quality": order_quality_row(reconciliation_status="FAILED")}),
             ("quality", {"fetch_quality": order_quality_row(raw_row_counts_json=_canonical_json({"orders": -1}))}),
+            ("quality", {"fetch_quality": order_quality_row(
+                fact_reconciliations_json=_canonical_json(noncanonical_counts)
+            )}),
         )
         for family, overrides in failures:
             service, repository = make_order_service()

@@ -1033,7 +1033,7 @@ $dockerVersion = @(& $script:G2eDockerExecutable version --format '{{.Server.Ver
 if ($LASTEXITCODE -ne 0 -or $dockerVersion.Count -ne 1) {
     throw 'Docker Engine is unavailable for G2-E acceptance.'
 }
-Wait-G2eTrinoDependency -TimeoutSeconds $acceptanceTimeoutSeconds
+Wait-G2eTrinoDependency -EnvFile $envFile -TimeoutSeconds $acceptanceTimeoutSeconds
 Wait-G2eDorisDependency -EnvFile $envFile -TimeoutSeconds $acceptanceTimeoutSeconds
 $liveSnapshots = Get-G2eLiveSnapshotMap -Evidence $runtimeEvidence -EnvFile $envFile
 $window = Get-G2eMetricWindow -Evidence $runtimeEvidence -EnvFile $envFile
