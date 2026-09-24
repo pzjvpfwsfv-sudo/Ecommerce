@@ -9,6 +9,7 @@ import { ApiError } from "./lib/http";
 import { Overview } from "./modules/Overview";
 import { Behavior } from "./modules/Behavior";
 import { Orders } from "./modules/Orders";
+import { Rankings } from "./modules/Rankings";
 
 const moduleNames: Record<string, string> = {
   overview: "运营总览",
@@ -86,7 +87,7 @@ export default function App() {
         <Routes>
           <Route path="/" element={<Navigate to="/overview" replace />} />
           {Object.entries(moduleNames).map(([path, name]) => (
-            <Route key={path} path={`/${path}`} element={path === "overview" ? <Overview /> : path === "behavior" ? <Behavior /> : path === "orders" ? <Orders /> : <ModulePending name={name} />} />
+            <Route key={path} path={`/${path}`} element={path === "overview" ? <Overview /> : path === "behavior" ? <Behavior /> : path === "orders" ? <Orders /> : path === "rankings" ? <Rankings /> : <ModulePending name={name} />} />
           ))}
           <Route path="/account" element={<AccountPage user={session} />} />
           <Route path="*" element={<Navigate to="/overview" replace />} />
