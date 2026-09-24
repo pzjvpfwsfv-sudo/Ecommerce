@@ -1132,6 +1132,16 @@ Wait-G2eDorisDependency -EnvFile 'fixture.env' -TimeoutSeconds 5
         )
         self.assertEqual(2, payload["attempts"])
 
+    def test_doris_query_normalizes_an_empty_result_to_zero_rows(self):
+        payload = self.refresh_payload(
+            r'''
+function Invoke-G2eDorisSql { return $null }
+$rows = @(Invoke-G2eDorisQuery -Sql 'SELECT 1 WHERE false;' -EnvFile 'fixture.env')
+[ordered]@{ count=$rows.Count } | ConvertTo-Json -Compress
+'''
+        )
+        self.assertEqual(0, payload["count"])
+
     def test_metric_output_rejects_physical_link_escape_when_supported(self):
         payload = self.refresh_payload(
             r'''

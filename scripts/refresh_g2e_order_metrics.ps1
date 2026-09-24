@@ -868,9 +868,13 @@ function Invoke-G2eDorisQuery {
         [Parameter(Mandatory = $true)][string]$EnvFile
     )
 
-    return @(ConvertFrom-G2eMysqlBatch -Lines (
-        Invoke-G2eDorisSql -Sql $Sql -EnvFile $EnvFile
-    ))
+    $rawLines = @(Invoke-G2eDorisSql -Sql $Sql -EnvFile $EnvFile)
+    if ($rawLines.Count -eq 0 -or
+            ($rawLines.Count -eq 1 -and [string]::IsNullOrEmpty([string]$rawLines[0]))) {
+        return @()
+    }
+    $lines = [string[]]$rawLines
+    return @(ConvertFrom-G2eMysqlBatch -Lines $lines)
 }
 
 function Wait-G2eTrinoDependency {
