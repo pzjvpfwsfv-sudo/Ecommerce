@@ -1109,7 +1109,7 @@ function Export-G2eCandidateArtifact {
     }
     $candidateRows = @(ConvertFrom-G2eCsv -CsvText (
         [IO.File]::ReadAllText($finalPath, [Text.Encoding]::UTF8)
-    ))
+    ) -TreatTrinoNulls)
     $spec = Get-G2eTargetSpec -Family $Family
     $canonical = Get-G2eCanonicalDigest -Rows $candidateRows `
         -Columns $spec.Columns -UniqueKeyColumns $spec.UniqueKeyColumns

@@ -758,6 +758,35 @@ $success = [pscustomobject]@{ Status='Success'; NumberLoadedRows=1; NumberFilter
         self.assertTrue(payload["changed"] and payload["identity"])
         self.assertTrue(payload["stream_ok"] and payload["filtered"] and payload["short"])
 
+    def test_candidate_readback_restores_exported_null_markers(self):
+        with tempfile.TemporaryDirectory(dir=ROOT / "tmp") as temporary:
+            metrics_dir = str(Path(temporary)).replace("'", "''")
+            payload = self.refresh_payload(
+                rf'''
+$identity = New-Identity
+$row = [pscustomobject][ordered]@{{
+    window_type='FULL'; window_start='2017-01-01'; window_end='2017-01-01'
+    delivery_eligible_order_count='0'; delivery_excluded_order_count='2'
+    delivery_days_avg=$null; delivery_days_p50=$null; delivery_days_p90=$null
+    late_delivery_order_count='0'; late_delivery_eligible_order_count='0'
+    late_delivery_excluded_order_count='2'; late_delivery_rate=$null
+}}
+$artifact = Export-G2eCandidateArtifact -Family delivery -Rows @($row) `
+    -Identity $identity -MetricsDirectory '{metrics_dir}'
+$text = [IO.File]::ReadAllText($artifact.Path, [Text.Encoding]::UTF8)
+[ordered]@{{
+    rows=$artifact.RowCount; digest=$artifact.CanonicalSha256
+    average_is_null=($null -eq $artifact.Rows[0].delivery_days_avg)
+    rate_is_null=($null -eq $artifact.Rows[0].late_delivery_rate)
+    contains_null_marker=$text.Contains(',\N,')
+}} | ConvertTo-Json -Compress
+'''
+            )
+            self.assertEqual(1, payload["rows"])
+            self.assertRegex(payload["digest"], r"^[0-9a-f]{64}$")
+            self.assertTrue(payload["average_is_null"] and payload["rate_is_null"])
+            self.assertTrue(payload["contains_null_marker"])
+
     def test_unpublished_partial_candidates_require_exact_evidence(self):
         payload = self.refresh_payload(
             r'''
