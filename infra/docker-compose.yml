@@ -113,6 +113,7 @@ services:
     volumes:
       - ../services/api:/app
       - ../configs/metrics:/app/configs/metrics:ro
+      - ../scripts/bootstrap_g3_admin.py:/app/scripts/bootstrap_g3_admin.py:ro
     working_dir: /app
     command:
       - sh

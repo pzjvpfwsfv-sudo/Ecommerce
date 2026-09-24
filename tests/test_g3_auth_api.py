@@ -3,7 +3,7 @@ import sys
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from fastapi.testclient import TestClient
 
@@ -300,6 +300,65 @@ class G3AuthApiTest(unittest.TestCase):
         self.store.fail = True
         self.assertEqual(client.get("/metrics/realtime").status_code, 503)
         repository.fetch_all_metrics.assert_called_once_with()
+
+
+class G3BootstrapTest(unittest.TestCase):
+    def setUp(self):
+        self.store = MemoryAuthStore()
+
+    def test_missing_or_short_secret_is_rejected_without_creating_user(self):
+        from scripts.bootstrap_g3_admin import bootstrap_admin
+
+        for username, password in (("", "long-password"), ("owner", ""), ("owner", "short")):
+            with self.subTest(username=username, password_length=len(password)):
+                with patch.dict(
+                    "os.environ",
+                    {"APP_ADMIN_USERNAME": username, "APP_ADMIN_PASSWORD": password},
+                ):
+                    self.assertEqual(bootstrap_admin(self.store), 2)
+        self.assertEqual(self.store.users, {})
+
+    def test_first_run_hashes_password_and_second_run_is_noop(self):
+        from scripts.bootstrap_g3_admin import bootstrap_admin
+
+        with patch.dict(
+            "os.environ",
+            {"APP_ADMIN_USERNAME": "  OWNER  ", "APP_ADMIN_PASSWORD": "long-password"},
+        ):
+            self.assertEqual(bootstrap_admin(self.store), 0)
+            self.assertEqual(bootstrap_admin(self.store), 0)
+        self.assertEqual(len(self.store.users), 1)
+        user = self.store.users["owner"]
+        self.assertEqual(user.role, "admin")
+        self.assertNotEqual(user.password_hash, "long-password")
+        self.assertTrue(verify_password("long-password", user.password_hash))
+
+    def test_non_admin_name_collision_and_database_failure_fail_closed(self):
+        from scripts.bootstrap_g3_admin import bootstrap_admin
+
+        self.store.create_user("owner", hash_password("viewer-password"), "viewer")
+        with patch.dict(
+            "os.environ",
+            {"APP_ADMIN_USERNAME": "owner", "APP_ADMIN_PASSWORD": "long-password"},
+        ):
+            self.assertEqual(bootstrap_admin(self.store), 3)
+            self.store.fail = True
+            self.assertNotEqual(bootstrap_admin(self.store), 0)
+
+    def test_explicit_store_revocation_invalidates_cookie(self):
+        from app.auth_service import AuthService
+
+        self.store.create_user("owner", hash_password("long-password"), "admin")
+        client = TestClient(create_app(auth_service=AuthService(self.store)))
+        self.assertEqual(
+            client.post(
+                "/api/v1/auth/login",
+                json={"username": "owner", "password": "long-password"},
+            ).status_code,
+            200,
+        )
+        self.store.revoke_session(client.cookies.get("ecom_session"))
+        self.assertEqual(client.get("/api/v1/auth/me").status_code, 401)
 
 
 if __name__ == "__main__":
