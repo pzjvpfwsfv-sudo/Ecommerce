@@ -943,6 +943,21 @@ function ConvertTo-G2eAcceptanceProjectedRow {
     return [pscustomobject]$result
 }
 
+function ConvertTo-G2eAcceptanceCountMap {
+    param(
+        [Parameter(Mandatory = $true)]$Object,
+        [Parameter(Mandatory = $true)][string]$Label
+    )
+
+    $result = [ordered]@{}
+    foreach ($name in @(Get-G2eAcceptancePropertyNames $Object)) {
+        $result[$name] = Assert-G2eAcceptanceCount `
+            (Get-G2eAcceptanceProperty $Object $name $Label) `
+            "$Label.$name" -AllowString
+    }
+    return [pscustomobject]$result
+}
+
 function ConvertTo-G2eAcceptanceQualityProjection {
     param([Parameter(Mandatory = $true)]$Row)
 
@@ -978,9 +993,13 @@ function ConvertTo-G2eAcceptanceQualityProjection {
             @('fact_reconciliations_json', 'fact_reconciliations'),
             @('reportable_quality_json', 'reportable_quality')
         )) {
-        $result[$mapping[1]] = ConvertFrom-G2eAcceptanceJsonObject `
+        $value = ConvertFrom-G2eAcceptanceJsonObject `
             (Get-G2eAcceptanceProperty $Row $mapping[0] 'quality row') `
             "quality $($mapping[1])"
+        if ($mapping[1] -in @('fact_reconciliations', 'reportable_quality')) {
+            $value = ConvertTo-G2eAcceptanceCountMap $value "quality $($mapping[1])"
+        }
+        $result[$mapping[1]] = $value
     }
     $result.reconciliation_status = [string](
         Get-G2eAcceptanceProperty $Row 'reconciliation_status' 'quality row'

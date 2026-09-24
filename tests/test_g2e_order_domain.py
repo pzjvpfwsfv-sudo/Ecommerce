@@ -440,6 +440,52 @@ class PowerShellAcceptanceTestCase(unittest.TestCase):
 
 
 class G2eOrderDomainContractTests(PowerShellAcceptanceTestCase):
+    def test_quality_projection_normalizes_only_canonical_string_counts(self):
+        row = {
+            "window_type": "FULL",
+            "window_start": "2017-01-01",
+            "window_end": "2017-01-31",
+            "source_row_count": "2",
+            "iceberg_row_count": "2",
+            "duplicate_key_count": "0",
+            "orphan_key_count": "0",
+            "invalid_value_count": "0",
+            "temporal_anomaly_count": "0",
+            "amount_comparable_order_count": "2",
+            "amount_reconciled_order_count": "2",
+            "amount_mismatch_order_count": "0",
+            "amount_reconciliation_rate": "1.000000",
+            "payment_item_freight_abs_difference_avg": "0.000000",
+            "payment_item_freight_abs_difference_p50": "0.000000",
+            "payment_item_freight_abs_difference_p90": "0.000000",
+            "raw_row_counts_json": '{"orders":2}',
+            "normalized_row_counts_json": '{"orders":2}',
+            "iceberg_row_counts_json": '{"orders_src_v1":2}',
+            "normalized_sha256_json": '{"orders":"' + "b" * 64 + '"}',
+            "source_snapshots_json": '{"orders_src_v1":"1"}',
+            "curated_snapshots_json": '{"order_fact_v1":"2"}',
+            "fact_reconciliations_json": '{"order_fact_row_count":"2"}',
+            "reportable_quality_json": '{"multi_review_order_count":"0"}',
+            "reconciliation_status": "PASS",
+        }
+        evidence = {
+            "row": row,
+            "bad_fact_json": '{"order_fact_row_count":"02"}',
+        }
+        body = (
+            "$projection=ConvertTo-G2eAcceptanceQualityProjection -Row $evidence.row; "
+            "if ($projection.fact_reconciliations.order_fact_row_count -isnot [long] -or "
+            "$projection.fact_reconciliations.order_fact_row_count -ne 2 -or "
+            "$projection.reportable_quality.multi_review_order_count -isnot [long]) "
+            "{ throw 'quality string count was not normalized' }; "
+            "$evidence.row.fact_reconciliations_json=$evidence.bad_fact_json; "
+            "$rejected=$false; try { ConvertTo-G2eAcceptanceQualityProjection "
+            "-Row $evidence.row | Out-Null } catch { $rejected=$true }; "
+            "if (-not $rejected) { throw 'noncanonical quality count was accepted' }"
+        )
+        result = self.run_script(evidence, body)
+        self.assertEqual(0, result.returncode, result.stderr or result.stdout)
+
     def test_valid_evidence_and_all_four_public_assertions_pass(self):
         evidence = valid_synthetic_acceptance()
         body = (
