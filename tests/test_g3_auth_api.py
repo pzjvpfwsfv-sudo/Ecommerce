@@ -3,6 +3,7 @@ import sys
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import Mock
 
 from fastapi.testclient import TestClient
 
@@ -213,6 +214,92 @@ class G3AuthApiTest(unittest.TestCase):
 
     def test_health_stays_public(self):
         self.assertEqual(self.client.get("/health").status_code, 200)
+
+    def test_every_existing_data_route_rejects_anonymous_access(self):
+        paths = (
+            "/api/v1/behavior/publication",
+            "/api/v1/behavior/overview",
+            "/api/v1/behavior/funnel",
+            "/api/v1/behavior/rankings?dimension=product",
+            "/api/v1/behavior/quality",
+            "/api/v1/orders/publication",
+            "/api/v1/orders/overview",
+            "/api/v1/orders/delivery",
+            "/api/v1/orders/payments",
+            "/api/v1/orders/rankings?dimension=product",
+            "/api/v1/orders/reviews",
+            "/api/v1/orders/quality",
+            "/api/v1/metrics/definitions?domain=orders&version=orders-v1",
+            "/metrics/realtime",
+            "/metrics/unknown",
+        )
+        for path in paths:
+            with self.subTest(path=path):
+                self.assertEqual(self.client.get(path).status_code, 401)
+        for path in ("/analysis/realtime", "/analysis/tools"):
+            with self.subTest(path=path):
+                self.assertEqual(
+                    self.client.post(path, json={"question": "sales"}).status_code,
+                    401,
+                )
+
+    def test_viewer_cannot_analyze_and_analyst_needs_csrf(self):
+        from app.auth_service import AuthService
+
+        analysis = Mock()
+        tools = Mock()
+        client = TestClient(
+            create_app(
+                analysis_service=analysis,
+                tool_analysis_service=tools,
+                auth_service=AuthService(self.store),
+            )
+        )
+        viewer_login = client.post(
+            "/api/v1/auth/login",
+            json={"username": "viewer", "password": "viewer-password"},
+        )
+        csrf = {"X-CSRF-Token": viewer_login.json()["csrf_token"]}
+        for path in ("/analysis/realtime", "/analysis/tools"):
+            with self.subTest(path=path):
+                self.assertEqual(
+                    client.post(path, json={"question": "sales"}, headers=csrf).status_code,
+                    403,
+                )
+        analyst_login = client.post(
+            "/api/v1/auth/login",
+            json={"username": "analyst", "password": "analyst-password"},
+        )
+        self.assertEqual(analyst_login.status_code, 200)
+        for path in ("/analysis/realtime", "/analysis/tools"):
+            with self.subTest(path=path):
+                self.assertEqual(
+                    client.post(path, json={"question": "sales"}).status_code,
+                    403,
+                )
+        analysis.analyze.assert_not_called()
+        tools.analyze.assert_not_called()
+
+    def test_viewer_can_read_metrics_but_store_outage_fails_closed(self):
+        from app.auth_service import AuthService
+
+        repository = Mock()
+        repository.fetch_all_metrics.return_value = {"source": "published"}
+        client = TestClient(
+            create_app(repository=repository, auth_service=AuthService(self.store))
+        )
+        self.assertEqual(
+            client.post(
+                "/api/v1/auth/login",
+                json={"username": "viewer", "password": "viewer-password"},
+            ).status_code,
+            200,
+        )
+        self.assertEqual(client.get("/metrics/realtime").json(), {"source": "published"})
+        repository.fetch_all_metrics.assert_called_once_with()
+        self.store.fail = True
+        self.assertEqual(client.get("/metrics/realtime").status_code, 503)
+        repository.fetch_all_metrics.assert_called_once_with()
 
 
 if __name__ == "__main__":

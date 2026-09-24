@@ -13,9 +13,16 @@ MAIN_FILE = ROOT / "services" / "api" / "app" / "main.py"
 REQUIREMENTS_FILE = ROOT / "services" / "api" / "requirements.txt"
 
 sys.path.insert(0, str((ROOT / "services" / "api").resolve()))
-from app.main import create_app  # noqa: E402
+from app.main import create_app as _create_app  # noqa: E402
 from app.config import ApiSettings  # noqa: E402
 from app.readiness_service import ReadinessService  # noqa: E402
+from tests.api_auth_helpers import grant_test_role  # noqa: E402
+
+
+def create_app(*args, **kwargs):
+    app = _create_app(*args, **kwargs)
+    grant_test_role(app)
+    return app
 
 
 class ApiServiceArtifactsTest(unittest.TestCase):
@@ -46,8 +53,12 @@ class ApiServiceArtifactsTest(unittest.TestCase):
         text = MAIN_FILE.read_text(encoding="utf-8")
 
         self.assertIn('@app.get("/health")', text)
-        self.assertIn('@app.get("/metrics/realtime")', text)
-        self.assertIn('@app.get("/metrics/{metric_name}")', text)
+        self.assertIn(
+            '@app.get("/metrics/realtime", dependencies=[Depends(require_principal)])', text
+        )
+        self.assertIn(
+            '@app.get("/metrics/{metric_name}", dependencies=[Depends(require_principal)])', text
+        )
         self.assertIn('@app.post("/analysis/realtime"', text)
         self.assertIn('@app.post("/analysis/tools"', text)
         for route in (

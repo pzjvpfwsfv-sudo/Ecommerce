@@ -14,9 +14,16 @@ sys.path.insert(0, str((ROOT / "services" / "api").resolve()))
 
 from app.analysis_models import AnalysisRequest, RealtimeEvidence
 from app.config import ApiSettings
-from app.main import create_app
+from app.main import create_app as _create_app
 from app.tool_analysis_service import ToolAnalysisUnavailableError
 from app.tool_models import ToolAnalysisResponse, ToolCallSummary, ToolEvidence, ToolId
+from tests.api_auth_helpers import grant_test_role
+
+
+def create_app(*args, **kwargs):
+    app = _create_app(*args, **kwargs)
+    grant_test_role(app)
+    return app
 
 
 def valid_tool_response() -> ToolAnalysisResponse:

@@ -7,7 +7,7 @@ import logging
 from threading import Lock
 from typing import Any, Callable, Literal
 
-from fastapi import FastAPI, HTTPException, Query, status
+from fastapi import Depends, FastAPI, HTTPException, Query, status
 
 from app.analysis_models import AnalysisRequest, AnalysisResponse, ToolAnalysisRequest
 from app.analysis_service import (
@@ -16,7 +16,7 @@ from app.analysis_service import (
     RealtimeDataUnavailableError,
 )
 from app.auth_api import router as auth_router
-from app.auth_service import AuthService
+from app.auth_service import AuthService, require_analyst, require_csrf, require_principal
 from app.auth_store import AuthStore
 from app.behavior_models import (
     FunnelResponse,
@@ -153,11 +153,11 @@ def create_app(
                 detail="start_date must not be after end_date",
             )
 
-    @app.get("/api/v1/behavior/publication", response_model=PublicationResponse)
+    @app.get("/api/v1/behavior/publication", response_model=PublicationResponse, dependencies=[Depends(require_principal)])
     def get_behavior_publication() -> PublicationResponse:
         return behavior_response("behavior_publication", behavior_service.get_publication)
 
-    @app.get("/api/v1/behavior/overview", response_model=OverviewResponse)
+    @app.get("/api/v1/behavior/overview", response_model=OverviewResponse, dependencies=[Depends(require_principal)])
     def get_behavior_overview(
         window: Literal["day", "full"] = "full",
     ) -> OverviewResponse:
@@ -165,7 +165,7 @@ def create_app(
             "behavior_overview", lambda: behavior_service.get_overview(window)
         )
 
-    @app.get("/api/v1/behavior/funnel", response_model=FunnelResponse)
+    @app.get("/api/v1/behavior/funnel", response_model=FunnelResponse, dependencies=[Depends(require_principal)])
     def get_behavior_funnel(
         window: Literal["day", "full"] = "full",
     ) -> FunnelResponse:
@@ -173,7 +173,7 @@ def create_app(
             "behavior_funnel", lambda: behavior_service.get_funnel(window)
         )
 
-    @app.get("/api/v1/behavior/rankings", response_model=RankingsResponse)
+    @app.get("/api/v1/behavior/rankings", response_model=RankingsResponse, dependencies=[Depends(require_principal)])
     def get_behavior_rankings(
         dimension: Literal["product", "category", "brand"],
         window: Literal["day", "full"] = "full",
@@ -185,15 +185,15 @@ def create_app(
             lambda: behavior_service.get_rankings(dimension, window, sort_by, limit),
         )
 
-    @app.get("/api/v1/behavior/quality", response_model=QualityResponse)
+    @app.get("/api/v1/behavior/quality", response_model=QualityResponse, dependencies=[Depends(require_principal)])
     def get_behavior_quality() -> QualityResponse:
         return behavior_response("behavior_quality", behavior_service.get_quality)
 
-    @app.get("/api/v1/orders/publication", response_model=OrderPublicationResponse)
+    @app.get("/api/v1/orders/publication", response_model=OrderPublicationResponse, dependencies=[Depends(require_principal)])
     def get_order_publication() -> OrderPublicationResponse:
         return order_response("order_publication", order_service.get_publication)
 
-    @app.get("/api/v1/orders/overview", response_model=OrderOverviewResponse)
+    @app.get("/api/v1/orders/overview", response_model=OrderOverviewResponse, dependencies=[Depends(require_principal)])
     def get_order_overview(
         window: Literal["day", "month", "full"] = "full",
         start_date: date | None = None,
@@ -205,7 +205,7 @@ def create_app(
             lambda: order_service.get_overview(window, start_date, end_date),
         )
 
-    @app.get("/api/v1/orders/delivery", response_model=OrderDeliveryResponse)
+    @app.get("/api/v1/orders/delivery", response_model=OrderDeliveryResponse, dependencies=[Depends(require_principal)])
     def get_order_delivery(
         window: Literal["day", "month", "full"] = "full",
         start_date: date | None = None,
@@ -217,7 +217,7 @@ def create_app(
             lambda: order_service.get_delivery(window, start_date, end_date),
         )
 
-    @app.get("/api/v1/orders/payments", response_model=OrderPaymentsResponse)
+    @app.get("/api/v1/orders/payments", response_model=OrderPaymentsResponse, dependencies=[Depends(require_principal)])
     def get_order_payments(
         window: Literal["day", "month", "full"] = "full",
         start_date: date | None = None,
@@ -229,7 +229,7 @@ def create_app(
             lambda: order_service.get_payments(window, start_date, end_date),
         )
 
-    @app.get("/api/v1/orders/rankings", response_model=OrderRankingsResponse)
+    @app.get("/api/v1/orders/rankings", response_model=OrderRankingsResponse, dependencies=[Depends(require_principal)])
     def get_order_rankings(
         dimension: Literal["product", "category", "seller", "customer_state", "seller_state"],
         window: Literal["day", "month", "full"] = "full",
@@ -259,7 +259,7 @@ def create_app(
             ),
         )
 
-    @app.get("/api/v1/orders/reviews", response_model=OrderReviewsResponse)
+    @app.get("/api/v1/orders/reviews", response_model=OrderReviewsResponse, dependencies=[Depends(require_principal)])
     def get_order_reviews(
         window: Literal["day", "month", "full"] = "full",
         start_date: date | None = None,
@@ -271,13 +271,14 @@ def create_app(
             lambda: order_service.get_reviews(window, start_date, end_date),
         )
 
-    @app.get("/api/v1/orders/quality", response_model=OrderQualityResponse)
+    @app.get("/api/v1/orders/quality", response_model=OrderQualityResponse, dependencies=[Depends(require_principal)])
     def get_order_quality() -> OrderQualityResponse:
         return order_response("order_quality", order_service.get_quality)
 
     @app.get(
         "/api/v1/metrics/definitions",
         response_model=MetricDefinitionsResponse | OrderMetricDefinitionsResponse,
+        dependencies=[Depends(require_principal)],
     )
     def get_metric_definitions(
         domain: Literal["behavior", "orders"],
@@ -296,7 +297,7 @@ def create_app(
             detail="domain and version do not match",
         )
 
-    @app.post("/analysis/realtime", response_model=AnalysisResponse)
+    @app.post("/analysis/realtime", response_model=AnalysisResponse, dependencies=[Depends(require_analyst), Depends(require_csrf)])
     def analyze_realtime(request: AnalysisRequest) -> AnalysisResponse:
         if len(request.question) > settings.ai_max_question_length:
             raise HTTPException(status_code=422, detail="question is too long")
@@ -325,7 +326,7 @@ def create_app(
                 detail="analysis is temporarily unavailable",
             ) from None
 
-    @app.post("/analysis/tools", response_model=ToolAnalysisResponse)
+    @app.post("/analysis/tools", response_model=ToolAnalysisResponse, dependencies=[Depends(require_analyst), Depends(require_csrf)])
     def analyze_with_tools(request: ToolAnalysisRequest) -> ToolAnalysisResponse:
         if len(request.question) > settings.ai_max_question_length:
             raise HTTPException(status_code=422, detail="question is too long")
@@ -374,11 +375,11 @@ def create_app(
                 detail="service is not ready",
             ) from None
 
-    @app.get("/metrics/realtime")
+    @app.get("/metrics/realtime", dependencies=[Depends(require_principal)])
     def get_realtime_metrics() -> dict[str, object]:
         return repository.fetch_all_metrics()
 
-    @app.get("/metrics/{metric_name}")
+    @app.get("/metrics/{metric_name}", dependencies=[Depends(require_principal)])
     def get_metric(metric_name: str) -> dict[str, object]:
         metric = repository.fetch_metric(metric_name)
         if metric is None:

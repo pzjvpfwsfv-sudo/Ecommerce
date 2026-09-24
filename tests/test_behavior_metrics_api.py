@@ -38,8 +38,15 @@ from app.behavior_service import (  # noqa: E402
     BehaviorMetricsService,
     BehaviorMetricsUnavailableError,
 )
-from app.main import create_app  # noqa: E402
+from app.main import create_app as _create_app  # noqa: E402
 from app.metric_definitions import MetricDefinitionCatalog  # noqa: E402
+from tests.api_auth_helpers import grant_test_role  # noqa: E402
+
+
+def create_app(*args, **kwargs):
+    app = _create_app(*args, **kwargs)
+    grant_test_role(app)
+    return app
 
 
 def publication_row(**overrides: object) -> dict[str, object]:
