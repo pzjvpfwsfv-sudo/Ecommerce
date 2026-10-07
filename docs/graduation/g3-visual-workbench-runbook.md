@@ -55,3 +55,11 @@ Remove-Item Env:G3_E2E_USERNAME
 - FastAPI 静态挂载 3 项测试通过；合并鉴权、订单、行为和静态服务的重点回归 88 项通过。Compose 在空值和 `WEB_DIST_DIR=/web` 两种配置下均通过 `config --quiet`。独立的本机 FastAPI 在 18000 端口提供构建产物，真实 Edge 的桌面和 390px 登录页测试 2 项通过，截图已检查，无明显横向溢出。
 - Docker 引擎本次未启动，8000 端口无已发布 API；因此需要真实账号的 2 项浏览器测试按设计跳过。登录后的六个功能模块、真实 `dataset_id` / `metric_run_id` 和容器内 `/web` 挂载尚未在本次验证，不应称为端到端通过。没有重启或改动现有容器与卷。
 - 全量 Python 首轮执行 691 项，3 失败、6 错误、1 跳过，不能称为全绿。其中 `kafka-python` 漏装到本机虚拟环境；按 `generators/requirements.txt` 安装后，该组 5 项单测通过。旧 Chapter 10.5 冷启动验证单独执行 34 项，仍有 3 失败、1 错误，集中在原有 PowerShell 子进程/时限测试；本次没有修改相关脚本，需另行排障。
+
+### 后续动态复验（2026-10-08，取代上方“真实浏览器跳过”的状态）
+
+- Docker Desktop 恢复后，仅启动原有 Doris FE/BE，保留 `ecommerce-lakehouse-ai_doris-fe-meta` 和 `ecommerce-lakehouse-ai_doris-be-storage` 卷。由于本机端口保留/占用，本次只把宿主机 FE HTTP `8030` 改为 `18030`、BE HTTP `8040` 改为 `18040`、FE edit-log `9010` 改为 `19010`；容器内部端口和数据未改。该端口覆盖仅用于本次运行，不是默认配置变更。
+- Doris 中核对到已发布 Olist `olist-brazilian-ecommerce-v2`，run `orders-v1-b3e0119b83f4ae47a992a6b2dcf30a6ed57403ef798413209ed52d2d4e624c3c3`，源订单 99,441、概览行 660；另有独立的 REES46 `rees46-multicategory`，run `behavior-v1-s881836466779140976`，当前为 1,002 事件的正确性子集。页面没有把两套数据合并成用户级转化。
+- 为避免改动现有 `ecom-api` 和持久化 `app-postgres-data`，本次使用一次性 PostgreSQL tmpfs 和临时管理员账号，在宿主机 `127.0.0.1:18000` 启动 FastAPI 并挂载本次构建的工作台。真实 Edge 无接口模拟：桌面 1440×900 和手机 390×844 的登录、总览、FULL 筛选、证据抽屉、质量页、退出，以及六模块逐页加载、来源标识和无横向溢出，共 6/6 项通过。手机端证据按钮换行问题经失败断言复现并修正；前端 38/38 单测、类型检查和构建通过。浏览器截图保存在 D 盘临时目录，不纳入 Git。
+- 本次验证证明的是宿主机 FastAPI 对真实 Doris 发布指标的同源 `/app/` 浏览器流程；**没有验证 Compose 容器内 `/web` 静态挂载**。生产身份库和正式账号仍需按身份手册配置；本次 tmpfs 账号不是生产账号。上方全量 Python/旧冷启动脚本的失败也未由这轮前端复验消除。
+- 验证后已关闭宿主机临时 API 与 Doris FE/BE，一次性 PostgreSQL 容器自动移除；本轮宿主机端口不再监听，原 Doris 命名卷仍在，未执行卷或镜像清理。

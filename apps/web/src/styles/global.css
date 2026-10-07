@@ -289,6 +289,8 @@ button:disabled { cursor: wait; opacity: .65; }
   .login-intro p, .login-ledger { display: none; }
   .auth-card { padding: 28px; }
   .module-intro, .behavior-status { align-items: start; flex-direction: column; }
+  .metric-frame-head { align-items: flex-start; flex-direction: column; gap: 12px; }
+  .metric-frame-head .secondary-button { white-space: nowrap; }
   .overview-hero { grid-template-columns: 1fr; }
   .overview-lead { padding: 28px; }
   .overview-pub { border-left: 0; border-top: 1px solid var(--line); }

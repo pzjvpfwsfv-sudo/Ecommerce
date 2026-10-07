@@ -34,7 +34,11 @@ for (const [label, width, height] of [["desktop", 1440, 900], ["mobile", 390, 84
       expect((await fullResponse).ok()).toBe(true);
       await expect(page.locator(".metric-identity")).toContainText("orders-v1");
       await expect(page.locator(".overview-side")).toContainText("当前窗口订单数");
-      await page.getByRole("button", { name: "查看数据证据" }).click();
+      const evidenceButton = page.getByRole("button", { name: "查看数据证据" });
+      if (label === "mobile") {
+        expect(await evidenceButton.evaluate((button) => button.getBoundingClientRect().height)).toBeLessThan(50);
+      }
+      await evidenceButton.click();
       const dialog = page.getByRole("dialog", { name: "数据证据" });
       await expect(dialog).toBeVisible();
       await expect(dialog).toContainText(/orders-v1-[a-f0-9]+/);
@@ -48,6 +52,33 @@ for (const [label, width, height] of [["desktop", 1440, 900], ["mobile", 390, 84
       await page.screenshot({ path: testInfo.outputPath(`${label}-quality.png`), fullPage: true });
       await page.getByRole("button", { name: "退出" }).click();
       await expect(page.getByRole("heading", { name: /登录/ })).toBeVisible();
+    });
+
+    test("loads every published module without horizontal overflow", async ({ page }, testInfo) => {
+      test.skip(!username || !password, "G3_E2E_USERNAME/G3_E2E_PASSWORD are required for real published-API verification");
+      await page.emulateMedia({ reducedMotion: "reduce" });
+      await page.goto("");
+      await page.getByLabel("用户名").fill(username!);
+      await page.getByLabel("密码").fill(password!);
+      await page.getByRole("button", { name: "登录" }).click();
+
+      const modules = [
+        ["运营总览", "Olist 历史订单", "olist-brazilian-ecommerce-v2", "overview"],
+        ["行为与转化", "REES46 行为与转化", "rees46-multicategory", "behavior"],
+        ["订单与支付", "订单与支付", "olist-brazilian-ecommerce-v2", "orders"],
+        ["商品与品类", "Olist 聚合排名", "olist-brazilian-ecommerce-v2", "rankings"],
+        ["履约与评价", "履约与评价", "olist-brazilian-ecommerce-v2", "fulfillment"],
+        ["数据质量", "Olist 来源与对账", "olist-brazilian-ecommerce-v2", "quality"],
+      ] as const;
+      for (const [navigation, title, dataset, slug] of modules) {
+        if (label === "mobile") await page.getByRole("button", { name: "展开导航" }).click();
+        await page.getByRole("link", { name: navigation }).click();
+        const frame = page.locator(".metric-frame");
+        await expect(frame.getByRole("heading", { name: title })).toBeVisible();
+        await expect(frame.locator(".metric-identity")).toContainText(dataset);
+        expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(width + 1);
+        await page.screenshot({ path: testInfo.outputPath(`${label}-${slug}.png`), fullPage: true });
+      }
     });
   });
 }
