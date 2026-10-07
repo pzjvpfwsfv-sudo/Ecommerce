@@ -110,10 +110,12 @@ services:
       AI_TOOL_MAX_EVENT_TYPES: ${AI_TOOL_MAX_EVENT_TYPES:-20}
       BEHAVIOR_METRIC_DEFINITIONS_PATH: ${BEHAVIOR_METRIC_DEFINITIONS_PATH}
       ORDER_METRIC_DEFINITIONS_PATH: ${ORDER_METRIC_DEFINITIONS_PATH}
+      WEB_DIST_DIR: ${WEB_DIST_DIR:-}
     volumes:
       - ../services/api:/app
       - ../configs/metrics:/app/configs/metrics:ro
       - ../scripts/bootstrap_g3_admin.py:/app/scripts/bootstrap_g3_admin.py:ro
+      - ../apps/web/dist:/web:ro
     working_dir: /app
     command:
       - sh

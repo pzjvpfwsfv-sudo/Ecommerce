@@ -58,6 +58,7 @@ class ApiSettings:
     ai_tool_max_event_types: int = 20
     behavior_metric_definitions_path: Path = _DEFAULT_BEHAVIOR_METRIC_DEFINITIONS_PATH
     order_metric_definitions_path: Path = _DEFAULT_ORDER_METRIC_DEFINITIONS_PATH
+    web_dist_dir: Path | None = None
 
     def __post_init__(self) -> None:
         raw_definitions_path = self.behavior_metric_definitions_path
@@ -74,6 +75,8 @@ class ApiSettings:
         if order_definitions_path == Path(""):
             raise ValueError("ORDER_METRIC_DEFINITIONS_PATH must not be empty")
         object.__setattr__(self, "order_metric_definitions_path", order_definitions_path)
+        if isinstance(self.web_dist_dir, str):
+            object.__setattr__(self, "web_dist_dir", Path(self.web_dist_dir) if self.web_dist_dir.strip() else None)
         if self.ai_tool_planner_mode not in {"rule_based", "openai_compatible"}:
             raise ValueError(f"unsupported AI_TOOL_PLANNER_MODE: {self.ai_tool_planner_mode}")
         if not 1 <= self.ai_tool_max_calls <= 3:
@@ -138,4 +141,5 @@ def load_settings(environ: Mapping[str, str] | None = None) -> ApiSettings:
                 str(_DEFAULT_ORDER_METRIC_DEFINITIONS_PATH),
             )
         ),
+        web_dist_dir=Path(values["WEB_DIST_DIR"]) if values.get("WEB_DIST_DIR", "").strip() else None,
     )

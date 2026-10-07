@@ -8,6 +8,7 @@ from threading import Lock
 from typing import Any, Callable, Literal
 
 from fastapi import Depends, FastAPI, HTTPException, Query, status
+from fastapi.staticfiles import StaticFiles
 
 from app.analysis_models import AnalysisRequest, AnalysisResponse, ToolAnalysisRequest
 from app.analysis_service import (
@@ -70,6 +71,8 @@ def create_app(
     auth_service: AuthService | None = None,
 ) -> FastAPI:
     settings = settings or load_settings()
+    if settings.web_dist_dir is not None and not (settings.web_dist_dir / "index.html").is_file():
+        raise RuntimeError("WEB_DIST_DIR must contain index.html")
     if auth_service is None:
         auth_service = AuthService(AuthStore(settings))
     if repository is None:
@@ -385,6 +388,9 @@ def create_app(
         if metric is None:
             raise HTTPException(status_code=404, detail=f"metric '{metric_name}' not found")
         return metric
+
+    if settings.web_dist_dir is not None:
+        app.mount("/app", StaticFiles(directory=settings.web_dist_dir, html=True), name="web")
 
     return app
 
