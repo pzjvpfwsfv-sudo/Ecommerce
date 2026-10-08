@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import PurePosixPath
 from typing import Literal
 from urllib.parse import urlsplit
@@ -72,3 +73,58 @@ class KnowledgeChunkInput:
 @dataclass(frozen=True)
 class EmbeddedChunk(KnowledgeChunkInput):
     embedding: tuple[float, ...]
+
+
+@dataclass(frozen=True)
+class DocumentVersion:
+    id: UUID
+    document_id: UUID
+    version_no: int
+    status: str
+    created_at: datetime
+    published_at: datetime | None
+
+
+@dataclass(frozen=True)
+class KnowledgeDocument:
+    id: UUID
+    title: str
+    category: str
+    source_type: SourceType
+    source_ref: str
+    visibility_roles: tuple[Role, ...]
+    published_version_id: UUID | None
+
+
+@dataclass(frozen=True)
+class KnowledgeChunkPreview:
+    id: UUID
+    ordinal: int
+    section: str
+    page: int | None
+    text: str
+
+
+@dataclass(frozen=True)
+class DocumentPreview:
+    document_id: UUID
+    version_id: UUID
+    extracted_text: str
+    chunks: tuple[KnowledgeChunkPreview, ...]
+
+
+@dataclass(frozen=True)
+class Citation:
+    chunk_id: UUID
+    document_id: UUID
+    version_id: UUID
+    section: str
+    page: int | None
+    text: str
+    source_ref: str
+
+
+@dataclass(frozen=True)
+class RevokedCitation:
+    chunk_id: UUID
+    status: Literal["revoked"] = "revoked"
