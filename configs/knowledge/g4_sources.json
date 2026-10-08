@@ -1,0 +1,9 @@
+{
+  "sources": [
+    {"path": "configs/metrics/behavior-v1.json", "label": "项目文档"},
+    {"path": "configs/metrics/orders-v1.json", "label": "项目文档"},
+    {"path": "docs/graduation/olist-order-domain-runbook.md", "label": "项目文档"},
+    {"path": "docs/graduation/behavior-metrics-api-runbook.md", "label": "项目文档"},
+    {"path": "docs/graduation/real-event-quality-runbook.md", "label": "项目文档"}
+  ]
+}
