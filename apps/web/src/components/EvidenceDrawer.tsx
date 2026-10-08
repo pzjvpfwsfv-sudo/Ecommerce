@@ -9,7 +9,7 @@ function snapshots(meta: MetricMeta): [string, string][] {
     const order = meta as OrderMeta;
     return [...Object.entries(order.source_snapshots ?? {}), ...Object.entries(order.curated_snapshots ?? {})];
   }
-  return [["REES46 source snapshot", (meta as BehaviorMeta).source_snapshot_id]];
+  return [["REES46 来源 Snapshot", (meta as BehaviorMeta).source_snapshot_id]];
 }
 
 export function EvidenceDrawer({ open, onClose, meta, domain, publishedAt, highlightMetric }: {
@@ -44,6 +44,7 @@ export function EvidenceDrawer({ open, onClose, meta, domain, publishedAt, highl
   }, [open, domain, meta.metric_run_id]);
 
   if (!open) return null;
+  const behavior = meta.metric_version === "behavior-v1" ? meta as BehaviorMeta : null;
   return <div className="drawer-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
     <aside className="evidence-drawer" role="dialog" aria-modal="true" aria-label="数据证据"
       onKeyDown={(event) => {
@@ -58,11 +59,16 @@ export function EvidenceDrawer({ open, onClose, meta, domain, publishedAt, highl
       }}>
       <div className="drawer-header"><div><span className="eyebrow">EVIDENCE / 可追溯性</span><h2>数据证据</h2></div>
         <button type="button" ref={closeRef} className="text-button" aria-label="关闭数据证据" onClick={onClose}>关闭</button></div>
+      {behavior && <p className="evidence-replay-note">历史回放 · 展示原始业务发生窗口，不代表当前实时交易</p>}
       <dl className="evidence-facts">
         <div><dt>数据集</dt><dd>{meta.dataset_id}</dd></div>
         <div><dt>指标版本</dt><dd>{meta.metric_version}</dd></div>
         <div><dt>运行 ID</dt><dd className="break-all">{meta.metric_run_id}</dd></div>
         <div><dt>业务窗口</dt><dd>{meta.window_start} 至 {meta.window_end}</dd></div>
+        {behavior && <div><dt>来源表</dt><dd className="break-all">{behavior.source_table}</dd></div>}
+        {behavior && <div><dt>回放区间</dt><dd>{behavior.replay_first_at && behavior.replay_last_at
+          ? `${formatDateTime(behavior.replay_first_at)} 至 ${formatDateTime(behavior.replay_last_at)}`
+          : "回放时间未记录（旧发布）"}</dd></div>}
         <div><dt>计算时间</dt><dd>{formatDateTime(meta.calculated_at)}</dd></div>
         <div><dt>发布时间</dt><dd>{publishedAt ? formatDateTime(publishedAt) : "当前响应未提供"}</dd></div>
       </dl>

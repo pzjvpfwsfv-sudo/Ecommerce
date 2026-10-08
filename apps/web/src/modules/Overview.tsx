@@ -77,7 +77,7 @@ export function Overview() {
       {behavior.loading && <p role="status">正在读取发布状态…</p>}
       {behavior.error && <p role="alert">行为域发布状态暂不可用。<button className="text-button" onClick={behavior.retry}>重试</button></p>}
       {behavior.data && <div className="behavior-status-detail"><strong>{behavior.data.data.status}</strong>
-        <span>{behavior.data.meta.data_scope === "g2c-correctness-subset" ? "正确性子集" : "稳定用户样本"} · {formatCount(behavior.data.meta.source_event_count)} 条来源事件</span>
+        <span>历史回放 · {behavior.data.meta.data_scope === "g2c-correctness-subset" ? "正确性子集" : "稳定用户样本"} · {formatCount(behavior.data.meta.source_event_count)} 条来源事件</span>
         <small>{behavior.data.meta.warnings.join("；")}</small></div>}
     </section>
     {overview && <EvidenceDrawer open={evidenceOpen} onClose={() => setEvidenceOpen(false)} meta={overview.meta}

@@ -24,6 +24,9 @@ export interface BehaviorMeta extends MetricMeta {
   dataset_id: "rees46-multicategory";
   metric_version: "behavior-v1";
   source_snapshot_id: string;
+  source_table: string;
+  replay_first_at: string | null;
+  replay_last_at: string | null;
   data_scope: "g2c-correctness-subset" | "stable-user-2pct-full";
   source_event_count: number;
 }

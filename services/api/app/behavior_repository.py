@@ -50,17 +50,19 @@ class BehaviorMetricsRepository:
 
     def fetch_latest_publication(self) -> dict[str, Any] | None:
         query = (
-            "SELECT metric_run_id, dataset_id, metric_version, data_scope, "
+            "SELECT metric_run_id, dataset_id, metric_version, data_scope, source_table, "
             "source_snapshot_id, source_event_count, window_start, window_end, "
-            "calculated_at, published_at, overview_row_count, overview_sha256, "
+            "replay_first_at, replay_last_at, calculated_at, published_at, "
+            "overview_row_count, overview_sha256, "
             "funnel_row_count, funnel_sha256, dimension_row_count, dimension_sha256, "
             "quality_row_count, quality_sha256, status "
             "FROM behavior_metric_publications WHERE status = %s "
-            "ORDER BY published_at DESC, metric_run_id DESC LIMIT 1"
+            "ORDER BY CASE WHEN data_scope = %s THEN 0 ELSE 1 END, "
+            "published_at DESC, metric_run_id DESC LIMIT 1"
         )
         with self._connect() as connection:
             with connection.cursor() as cursor:
-                cursor.execute(query, ("PUBLISHED",))
+                cursor.execute(query, ("PUBLISHED", "stable-user-2pct-full"))
                 return cursor.fetchone()
 
     def fetch_overview(self, metric_run_id: str, window: str) -> list[dict[str, Any]]:

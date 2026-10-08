@@ -55,10 +55,13 @@ def publication_row(**overrides: object) -> dict[str, object]:
         "dataset_id": "rees46-multicategory",
         "metric_version": "behavior-v1",
         "data_scope": "g2c-correctness-subset",
+        "source_table": "real_behavior_detail_v1",
         "source_snapshot_id": 3854376992136224865,
         "source_event_count": 1002,
         "window_start": date(2019, 10, 1),
         "window_end": date(2019, 11, 30),
+        "replay_first_at": None,
+        "replay_last_at": None,
         "calculated_at": datetime(2026, 9, 18, 1, 2, 3, 456000),
         "published_at": datetime(2026, 9, 18, 2, 3, 4, 567000),
         "overview_row_count": 61,
@@ -193,10 +196,13 @@ class BehaviorModelsAndCatalogTests(unittest.TestCase):
             dataset_id="rees46-multicategory",
             metric_version="behavior-v1",
             metric_run_id="behavior-v1-s3854376992136224865",
+            source_table="real_behavior_detail_v1",
             source_snapshot_id="3854376992136224865",
             window_start=date(2019, 10, 1),
             window_end=date(2019, 11, 30),
             calculated_at=datetime(2026, 9, 18, tzinfo=UTC),
+            replay_first_at=None,
+            replay_last_at=None,
             data_scope="g2c-correctness-subset",
             source_event_count=1002,
             warnings=["correctness subset; not the full 2% user sample"],
@@ -206,6 +212,9 @@ class BehaviorModelsAndCatalogTests(unittest.TestCase):
         payload = self._meta().model_dump(mode="json")
 
         self.assertEqual("3854376992136224865", payload["source_snapshot_id"])
+        self.assertEqual("real_behavior_detail_v1", payload["source_table"])
+        self.assertIsNone(payload["replay_first_at"])
+        self.assertIsNone(payload["replay_last_at"])
         self.assertEqual(
             ["correctness subset; not the full 2% user sample"], payload["warnings"]
         )
@@ -478,9 +487,13 @@ class BehaviorMetricsRepositoryTests(unittest.TestCase):
         sql, parameters = cursor.execute.call_args.args
         self.assertIn("FROM behavior_metric_publications", sql)
         self.assertIn("WHERE status = %s", sql)
-        self.assertIn("ORDER BY published_at DESC, metric_run_id DESC", sql)
+        self.assertIn("source_table", sql)
+        self.assertIn("replay_first_at", sql)
+        self.assertIn("replay_last_at", sql)
+        self.assertIn("CASE WHEN data_scope = %s THEN 0 ELSE 1 END", sql)
+        self.assertIn("published_at DESC, metric_run_id DESC", sql)
         self.assertIn("LIMIT 1", sql)
-        self.assertEqual(("PUBLISHED",), parameters)
+        self.assertEqual(("PUBLISHED", "stable-user-2pct-full"), parameters)
 
     def test_rankings_use_whitelisted_order_expression_and_bound_values(self):
         repository, cursor, _ = make_repository(rows=[])
@@ -613,13 +626,37 @@ class BehaviorMetricsServiceTests(unittest.TestCase):
 
     def test_full_scope_requires_exact_count_and_omits_subset_warning(self):
         self.repository.fetch_latest_publication.return_value = publication_row(
-            data_scope="stable-user-2pct-full", source_event_count=2_199_938
+            data_scope="stable-user-2pct-full", source_event_count=2_199_938,
+            source_table="real_behavior_detail_v1_g5_full_01",
+            replay_first_at=datetime(2026, 10, 8, 9, 0, 0),
+            replay_last_at=datetime(2026, 10, 8, 10, 0, 0),
         )
 
         response = self.service.get_publication()
 
         self.assertEqual(2_199_938, response.meta.source_event_count)
         self.assertEqual([], response.meta.warnings)
+        self.assertEqual("real_behavior_detail_v1_g5_full_01", response.meta.source_table)
+        self.assertEqual(UTC, response.meta.replay_first_at.tzinfo)
+
+    def test_publication_rejects_unsafe_source_and_impossible_replay_identity(self):
+        invalid_rows = (
+            publication_row(source_table="real_behavior_detail_v1;DROP TABLE x"),
+            publication_row(source_table="other_table"),
+            publication_row(source_table=None),
+            publication_row(source_event_count=1002.5),
+            publication_row(window_start=date(2019, 12, 1)),
+            publication_row(replay_first_at=datetime(2026, 10, 8, 9)),
+            publication_row(
+                replay_first_at=datetime(2026, 10, 8, 10),
+                replay_last_at=datetime(2026, 10, 8, 9),
+            ),
+        )
+        for row in invalid_rows:
+            with self.subTest(row=row):
+                self.repository.fetch_latest_publication.return_value = row
+                with self.assertRaises(BehaviorMetricsUnavailableError):
+                    self.service.get_publication()
 
     def test_publication_identity_and_scope_count_must_be_exact(self):
         invalid_rows = (
@@ -781,6 +818,12 @@ class BehaviorMetricsRouteTests(unittest.TestCase):
             "1234.50",
             responses["overview"].json()["data"][0]["purchase_amount_proxy"],
         )
+        metas = [responses[name].json()["meta"] for name in (
+            "publication", "overview", "funnel", "rankings", "quality"
+        )]
+        self.assertTrue(all(meta == metas[0] for meta in metas))
+        self.assertEqual("real_behavior_detail_v1", metas[0]["source_table"])
+        self.assertIsNone(metas[0]["replay_first_at"])
         self.service.get_overview.assert_called_once_with("full")
         self.service.get_funnel.assert_called_once_with("full")
         self.service.get_rankings.assert_called_once_with("brand", "full", "purchases", 20)

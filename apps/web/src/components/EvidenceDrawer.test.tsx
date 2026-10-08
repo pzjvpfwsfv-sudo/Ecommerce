@@ -5,7 +5,7 @@ import { useState } from "react";
 import { expect, it } from "vitest";
 
 import { EvidenceDrawer } from "./EvidenceDrawer";
-import type { OrderMeta } from "../lib/types";
+import type { BehaviorMeta, OrderMeta } from "../lib/types";
 import { server } from "../test/handlers";
 
 const meta = {
@@ -49,4 +49,26 @@ it("shows live identity and definitions, closes on Escape, and restores focus", 
   await userEvent.keyboard("{Escape}");
   expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
   expect(opener).toHaveFocus();
+});
+
+it("shows behavior source, historical window and unknown legacy replay times", async () => {
+  const behaviorMeta = {
+    dataset_id: "rees46-multicategory", metric_version: "behavior-v1",
+    metric_run_id: "behavior-v1-s9", source_snapshot_id: "9",
+    source_table: "real_behavior_detail_v1", source_event_count: 1002,
+    data_scope: "g2c-correctness-subset", window_start: "2019-10-01",
+    window_end: "2019-11-30", calculated_at: "2026-09-18T00:00:00Z",
+    replay_first_at: null, replay_last_at: null, warnings: [],
+  } satisfies BehaviorMeta;
+  server.use(http.get("/api/v1/metrics/definitions", () => HttpResponse.json({
+    domain: "behavior", dataset_id: behaviorMeta.dataset_id,
+    metric_version: behaviorMeta.metric_version, definitions: [],
+  })));
+  render(<EvidenceDrawer open onClose={() => {}} meta={behaviorMeta} domain="behavior" />);
+  const dialog = screen.getByRole("dialog", { name: "数据证据" });
+  expect(dialog).toHaveTextContent("历史回放");
+  expect(dialog).toHaveTextContent("real_behavior_detail_v1");
+  expect(dialog).toHaveTextContent("回放时间未记录");
+  expect(dialog).toHaveTextContent("2019-10-01 至 2019-11-30");
+  expect(dialog).toHaveTextContent("9");
 });

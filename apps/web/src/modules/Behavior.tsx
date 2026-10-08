@@ -44,7 +44,7 @@ export function Behavior() {
       empty={!!overview && (overview.data.length === 0 || funnel?.data.length === 0)} retry={state.retry} onEvidence={overview ? () => setEvidenceOpen(true) : undefined}>
       {overview && funnel && quality && <>
         <div className="subset-banner"><div><span className="eyebrow">DATA SCOPE / 数据范围</span><strong>{overview.meta.data_scope === "g2c-correctness-subset" ? "正确性子集" : "稳定用户 2% 全量样本"}</strong>
-          <p>{formatCount(overview.meta.source_event_count)} 条来源事件；按本次发布的数据范围解读，不代表企业实时生产规模。</p></div>
+          <p>历史回放 · {formatCount(overview.meta.source_event_count)} 条来源事件；按本次发布的数据范围解读，不代表企业实时生产规模。</p></div>
           <small>{overview.meta.warnings.join("；")}</small></div>
         <div className="behavior-grid"><section className="surface-panel behavior-funnel"><div className="panel-heading"><h3>会话转化阶梯</h3><span>仅使用 API 提供的会话计数与比率</span></div>
           {funnel.data.length > 1 && <label className="date-select">查看日期 <select value={point?.window_start} onChange={(event) => setSelectedDate(event.target.value)}>

@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from decimal import Decimal, ROUND_HALF_UP
+import re
 from typing import Any
 
 from app.behavior_models import (
@@ -31,6 +32,7 @@ _SCOPE_COUNTS = {
 }
 _SUBSET_WARNING = "correctness subset; not the full 2% user sample"
 _RATE_QUANTUM = Decimal("0.000001")
+_SOURCE_TABLE = re.compile(r"real_behavior_detail_v1(?:_[a-z0-9][a-z0-9_]{0,31})?\Z")
 
 
 class BehaviorMetricsUnavailableError(RuntimeError):
@@ -234,6 +236,11 @@ class BehaviorMetricsService:
         snapshot_id = _as_int(publication["source_snapshot_id"])
         source_event_count = _as_int(publication["source_event_count"])
         data_scope = publication["data_scope"]
+        source_table = publication["source_table"]
+        window_start = publication["window_start"]
+        window_end = publication["window_end"]
+        replay_first = publication["replay_first_at"]
+        replay_last = publication["replay_last_at"]
         if (
             publication["status"] != "PUBLISHED"
             or publication["dataset_id"] != _DATASET_ID
@@ -242,18 +249,36 @@ class BehaviorMetricsService:
             or publication["metric_run_id"] != f"{_METRIC_VERSION}-s{snapshot_id}"
             or data_scope not in _SCOPE_COUNTS
             or source_event_count != _SCOPE_COUNTS[data_scope]
-            or publication["window_start"] > publication["window_end"]
+            or not isinstance(source_table, str)
+            or _SOURCE_TABLE.fullmatch(source_table) is None
+            or (data_scope == "stable-user-2pct-full" and source_table == "real_behavior_detail_v1")
+            or not isinstance(window_start, date)
+            or isinstance(window_start, datetime)
+            or not isinstance(window_end, date)
+            or isinstance(window_end, datetime)
+            or window_start > window_end
+            or (data_scope == "stable-user-2pct-full" and (
+                window_start != date(2019, 10, 1) or window_end != date(2019, 11, 30)
+            ))
+            or ((replay_first is None) != (replay_last is None))
         ):
+            raise _unavailable()
+        first_at = None if replay_first is None else _as_utc(replay_first)
+        last_at = None if replay_last is None else _as_utc(replay_last)
+        if first_at is not None and last_at is not None and first_at > last_at:
             raise _unavailable()
         warnings = [_SUBSET_WARNING] if data_scope == "g2c-correctness-subset" else []
         meta = BehaviorMetricMeta(
             dataset_id=publication["dataset_id"],
             metric_version=publication["metric_version"],
             metric_run_id=publication["metric_run_id"],
+            source_table=source_table,
             source_snapshot_id=str(snapshot_id),
-            window_start=publication["window_start"],
-            window_end=publication["window_end"],
+            window_start=window_start,
+            window_end=window_end,
             calculated_at=_as_utc(publication["calculated_at"]),
+            replay_first_at=first_at,
+            replay_last_at=last_at,
             data_scope=data_scope,
             source_event_count=source_event_count,
             warnings=warnings,
@@ -281,7 +306,13 @@ def _unavailable() -> BehaviorMetricsUnavailableError:
 def _as_int(value: Any) -> int:
     if isinstance(value, bool):
         raise ValueError("boolean is not an integer metric")
-    return int(value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, Decimal) and value == value.to_integral_value():
+        return int(value)
+    if isinstance(value, str) and value.isdecimal():
+        return int(value)
+    raise ValueError("invalid integer metric")
 
 
 def _as_bool(value: Any) -> bool:

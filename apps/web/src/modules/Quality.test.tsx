@@ -17,6 +17,7 @@ const orderMeta = {
 const behaviorMeta = {
   dataset_id: "rees46-multicategory", metric_version: "behavior-v1",
   metric_run_id: "behavior-v1-b" + "a".repeat(64), source_snapshot_id: "snapshot-1",
+  source_table: "real_behavior_detail_v1", replay_first_at: null, replay_last_at: null,
   data_scope: "g2c-correctness-subset", source_event_count: 1002,
   window_start: "2020-01-01", window_end: "2020-01-02",
   calculated_at: "2026-09-20T00:00:00Z", warnings: ["当前为正确性子集，不代表完整数据"],

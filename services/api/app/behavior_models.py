@@ -19,10 +19,15 @@ class BehaviorMetricMeta(StrictBehaviorModel):
     dataset_id: Literal["rees46-multicategory"]
     metric_version: Literal["behavior-v1"]
     metric_run_id: str = Field(pattern=r"^behavior-v1-s[1-9][0-9]*$")
+    source_table: str = Field(
+        pattern=r"^real_behavior_detail_v1(?:_[a-z0-9][a-z0-9_]{0,31})?$"
+    )
     source_snapshot_id: str = Field(pattern=r"^[1-9][0-9]*$")
     window_start: date
     window_end: date
     calculated_at: datetime
+    replay_first_at: datetime | None
+    replay_last_at: datetime | None
     data_scope: Literal["g2c-correctness-subset", "stable-user-2pct-full"]
     source_event_count: int = Field(gt=0)
     warnings: list[str]

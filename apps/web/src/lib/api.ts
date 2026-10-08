@@ -65,8 +65,12 @@ function checkMeta(value: unknown, domain: "orders" | "behavior"): asserts value
     throw new ApiError(502, "order meta missing");
   }
   if (domain === "behavior" &&
-      (typeof value.source_event_count !== "number" ||
+      (!Number.isInteger(value.source_event_count) ||
        typeof value.source_snapshot_id !== "string" ||
+       typeof value.source_table !== "string" ||
+       !/^real_behavior_detail_v1(?:_[a-z0-9][a-z0-9_]{0,31})?$/.test(value.source_table) ||
+       !((value.replay_first_at === null && value.replay_last_at === null) ||
+         (typeof value.replay_first_at === "string" && typeof value.replay_last_at === "string")) ||
        !["g2c-correctness-subset", "stable-user-2pct-full"].includes(String(value.data_scope)))) {
     throw new ApiError(502, "behavior meta missing");
   }
@@ -179,7 +183,11 @@ export async function fetchSameRun<T extends { meta: MetricMeta }, U extends { m
   const [a, b] = result;
   if (a.meta.dataset_id !== b.meta.dataset_id ||
       a.meta.metric_version !== b.meta.metric_version ||
-      a.meta.metric_run_id !== b.meta.metric_run_id) {
+      a.meta.metric_run_id !== b.meta.metric_run_id ||
+      (a.meta.metric_version === "behavior-v1" && (
+        (a.meta as BehaviorMeta).source_table !== (b.meta as BehaviorMeta).source_table ||
+        (a.meta as BehaviorMeta).source_snapshot_id !== (b.meta as BehaviorMeta).source_snapshot_id
+      ))) {
     throw new Error("metric run mismatch");
   }
   return result;

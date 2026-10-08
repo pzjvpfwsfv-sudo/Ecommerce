@@ -95,6 +95,7 @@ button:disabled { cursor: wait; opacity: .65; }
 .drawer-header h2 { margin: 7px 0 0; font-family: var(--display-font); font-size: 2rem; font-weight: 500; }
 .evidence-drawer h3 { margin: 30px 0 12px; font-family: var(--display-font); font-size: 1.2rem; font-weight: 500; }
 .evidence-facts { margin: 12px 0 0; }
+.evidence-replay-note { margin: 18px 0 0; padding: 10px 13px; border-left: 3px solid var(--copper); background: var(--mint); color: var(--forest); font-size: .76rem; line-height: 1.5; }
 .evidence-facts div { display: grid; grid-template-columns: 82px minmax(0, 1fr); gap: 10px; padding: 11px 0; border-bottom: 1px solid var(--line); font-size: .77rem; }
 .evidence-facts dt { color: var(--muted); }
 .evidence-facts dd { margin: 0; font-weight: 650; }

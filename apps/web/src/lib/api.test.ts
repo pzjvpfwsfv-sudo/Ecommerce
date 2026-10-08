@@ -38,6 +38,25 @@ describe("truthful metric client", () => {
     await expect(fetchSameRun(first, second)).rejects.toThrow("metric run mismatch");
   });
 
+  it("rejects missing behavior source and cross-table metadata for one run", async () => {
+    const behaviorMeta = {
+      dataset_id: "rees46-multicategory", metric_version: "behavior-v1",
+      metric_run_id: "behavior-v1-s9", source_snapshot_id: "9",
+      source_table: "real_behavior_detail_v1", data_scope: "g2c-correctness-subset",
+      source_event_count: 1002, window_start: "2019-10-01", window_end: "2019-11-30",
+      replay_first_at: null, replay_last_at: null,
+      calculated_at: "2026-09-20T00:00:00Z", warnings: [],
+    };
+    server.use(http.get("/api/v1/behavior/overview", () => HttpResponse.json({
+      meta: { ...behaviorMeta, source_table: undefined }, data: [],
+    })));
+    await expect(getBehaviorOverview({ window: "full" })).rejects.toThrow(/behavior meta/);
+    await expect(fetchSameRun(
+      Promise.resolve({ meta: behaviorMeta, data: [] }),
+      Promise.resolve({ meta: { ...behaviorMeta, source_table: "real_behavior_detail_v1_other" }, data: [] }),
+    )).rejects.toThrow("metric run mismatch");
+  });
+
   it("rejects illegal full-range dates and behavior-like month queries", async () => {
     await expect(getOrderOverview({ window: "full", startDate: "2016-09-04" })).rejects.toThrow();
     await expect(getBehaviorOverview({ window: "month" as "day" })).rejects.toThrow("invalid behavior window");

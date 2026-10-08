@@ -216,7 +216,7 @@ function Assert-G2dVerifierFieldEqual {
     }
     if ($Field -in @('window_start', 'window_end')) {
         $equal = (ConvertTo-G2dVerifierDate $Expected) -ceq (ConvertTo-G2dVerifierDate $Actual)
-    } elseif ($Field -in @('calculated_at', 'published_at')) {
+    } elseif ($Field -in @('calculated_at', 'published_at', 'replay_first_at', 'replay_last_at')) {
         $equal = (ConvertTo-G2dVerifierTimestamp $Expected) -ceq
             (ConvertTo-G2dVerifierTimestamp $Actual)
     } elseif ($Field -ceq 'is_unknown') {
@@ -264,8 +264,9 @@ function Assert-G2dApiMeta {
     )
 
     $fields = @(
-        'dataset_id', 'metric_version', 'metric_run_id', 'source_snapshot_id',
-        'window_start', 'window_end', 'calculated_at', 'data_scope',
+        'dataset_id', 'metric_version', 'metric_run_id', 'source_table',
+        'source_snapshot_id', 'window_start', 'window_end',
+        'replay_first_at', 'replay_last_at', 'calculated_at', 'data_scope',
         'source_event_count', 'warnings'
     )
     Assert-G2dVerifierProperties $Meta $fields "$Name meta"
@@ -273,10 +274,13 @@ function Assert-G2dApiMeta {
         dataset_id = [string]$Identity.DatasetId
         metric_version = [string]$Identity.MetricVersion
         metric_run_id = [string]$Identity.MetricRunId
+        source_table = Get-G2dVerifierValue $Publication 'source_table'
         source_snapshot_id = [string]$Identity.SourceSnapshotId
         window_start = Get-G2dVerifierValue $Publication 'window_start'
         window_end = Get-G2dVerifierValue $Publication 'window_end'
         calculated_at = Get-G2dVerifierValue $Publication 'calculated_at'
+        replay_first_at = Get-G2dVerifierValue $Publication 'replay_first_at'
+        replay_last_at = Get-G2dVerifierValue $Publication 'replay_last_at'
         data_scope = [string]$Identity.DataScope
         source_event_count = [long]$Identity.SourceEventCount
     }

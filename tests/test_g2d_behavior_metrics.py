@@ -1641,6 +1641,7 @@ $identity = Get-G2dMetricIdentity -SnapshotId 3854376992136224865 `
 $publication = [pscustomobject]@{
     metric_run_id='behavior-v1-s3854376992136224865'; dataset_id='rees46-multicategory'
     metric_version='behavior-v1'; data_scope='g2c-correctness-subset'
+    source_table='real_behavior_detail_v1'; replay_first_at=$null; replay_last_at=$null
     source_snapshot_id='3854376992136224865'; source_event_count='1002'
     window_start='2024-01-01'; window_end='2024-01-02'
     calculated_at='2024-01-03 00:00:00.000'; published_at='2024-01-03 00:01:00.000'
@@ -1676,6 +1677,7 @@ $quality = [pscustomobject]@{
 $meta = [pscustomobject]@{
     dataset_id='rees46-multicategory'; metric_version='behavior-v1'
     metric_run_id='behavior-v1-s3854376992136224865'
+    source_table='real_behavior_detail_v1'; replay_first_at=$null; replay_last_at=$null
     source_snapshot_id='3854376992136224865'; window_start='2024-01-01'
     window_end='2024-01-02'; calculated_at='2024-01-03T00:00:00Z'
     data_scope='g2c-correctness-subset'; source_event_count=1002
@@ -1732,10 +1734,12 @@ $fullIdentity = Get-G2dMetricIdentity -SnapshotId 3854376992136224865 `
     -DataScope stable-user-2pct-full -SourceEventCount 2199938
 $fullPublication = Copy-Value $publication
 $fullPublication.data_scope = 'stable-user-2pct-full'
+$fullPublication.source_table = 'real_behavior_detail_v1_g5_full_01'
 $fullPublication.source_event_count = '2199938'
 $fullPayloads = Copy-Value $apiPayloads
 foreach ($name in @('publication', 'overview', 'funnel', 'rankings', 'quality')) {
     $fullPayloads.$name.meta.data_scope = 'stable-user-2pct-full'
+    $fullPayloads.$name.meta.source_table = 'real_behavior_detail_v1_g5_full_01'
     $fullPayloads.$name.meta.source_event_count = 2199938
     $fullPayloads.$name.meta.warnings = @()
 }
