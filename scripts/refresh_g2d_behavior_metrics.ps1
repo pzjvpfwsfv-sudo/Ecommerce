@@ -2,6 +2,7 @@
 param(
     [ValidateSet('g2c-correctness-subset', 'stable-user-2pct-full')]
     [string]$DataScope = 'g2c-correctness-subset',
+    [string]$SourceRunId = '',
     [switch]$PlanOnly,
     [switch]$FunctionsOnly
 )
@@ -451,31 +452,37 @@ function Assert-G2dDependencies {
 
 function Get-G2dLatestSnapshotSql {
     [CmdletBinding()]
-    param()
+    param([string]$SourceTable = 'real_behavior_detail_v1')
 
-    return @'
+    $source = Assert-G2dSourceTable -SourceTable $SourceTable
+    $metadataTable = 'lakehouse.analytics."' + $source + '$snapshots"'
+    return @"
 SELECT snapshot_id AS source_snapshot_id
-FROM lakehouse.analytics."real_behavior_detail_v1$snapshots"
+FROM $metadataTable
 WHERE snapshot_id > 0
 ORDER BY committed_at DESC, snapshot_id DESC
 LIMIT 1;
-'@
+"@
 }
 
 function Get-G2dLatestSnapshotId {
     [CmdletBinding()]
-    param()
+    param([string]$SourceTable = 'real_behavior_detail_v1')
 
-    $tableRows = @(Invoke-G2dTrinoStatement -Name preflight_table -Sql @'
+    $source = Assert-G2dSourceTable -SourceTable $SourceTable
+    $tableLiteral = ConvertTo-G2dSqlString -Value $source
+    $tableRows = @(Invoke-G2dTrinoStatement -Name preflight_table -Sql @"
 SELECT table_name
 FROM lakehouse.information_schema.tables
-WHERE table_schema = 'analytics' AND table_name = 'real_behavior_detail_v1';
-'@)
-    if ($tableRows.Count -ne 1 -or [string]$tableRows[0].table_name -cne 'real_behavior_detail_v1') {
-        throw "The fixed G2-C source table is unavailable. $script:G2dSetupHelp"
+WHERE table_schema = 'analytics' AND table_name = $tableLiteral;
+"@)
+    if ($tableRows.Count -ne 1 -or [string]$tableRows[0].table_name -cne $source) {
+        throw "The selected G2-C source table is unavailable. $script:G2dSetupHelp"
     }
     $snapshotRows = @(
-        Invoke-G2dTrinoStatement -Name latest_snapshot -Sql (Get-G2dLatestSnapshotSql)
+        Invoke-G2dTrinoStatement -Name latest_snapshot -Sql (
+            Get-G2dLatestSnapshotSql -SourceTable $source
+        )
     )
     if ($snapshotRows.Count -ne 1 -or [string]$snapshotRows[0].source_snapshot_id -notmatch '^[1-9][0-9]*$') {
         throw 'The fixed G2-C source table has no positive Snapshot ID.'
@@ -956,21 +963,28 @@ function Invoke-G2dRefresh {
     param(
         [ValidateSet('g2c-correctness-subset', 'stable-user-2pct-full')]
         [string]$DataScope = 'g2c-correctness-subset',
+        [string]$SourceRunId = '',
         [switch]$PlanOnly
     )
 
+    $sourceTable = Resolve-G2dSourceTable -RunId $SourceRunId
+    if ($DataScope -ceq 'stable-user-2pct-full' -and $SourceRunId.Length -eq 0) {
+        throw 'G2-D full sample requires an isolated source run ID.'
+    }
     if ($PlanOnly) {
         return [pscustomobject][ordered]@{
             status = 'planned'
             data_scope = $DataScope
+            source_table = $sourceTable
             plan = @(Get-G2dRefreshPlan -MetricRunId 'behavior-v1-s1')
         }
     }
 
     Assert-G2dDependencies
-    $snapshotId = Get-G2dLatestSnapshotId
+    $snapshotId = Get-G2dLatestSnapshotId -SourceTable $sourceTable
     $template = [IO.File]::ReadAllText($script:G2dSqlTemplatePath, [Text.Encoding]::UTF8)
-    $statements = Split-G2dNamedSql -Sql $template -SnapshotId $snapshotId
+    $statements = Split-G2dNamedSql -Sql $template -SnapshotId $snapshotId `
+        -SourceTable $sourceTable
     Assert-G2dTrinoResultSet -Results $statements
 
     $sourceRows = @(Invoke-G2dTrinoStatement -Name source_identity -Sql $statements.source_identity)
@@ -978,6 +992,12 @@ function Invoke-G2dRefresh {
         throw 'G2-D source identity did not echo the selected Snapshot ID.'
     }
     $sourceIdentity = $sourceRows[0]
+    if ($DataScope -ceq 'stable-user-2pct-full' -and (
+            [string]$sourceIdentity.window_start -cne '2019-10-01' -or
+            [string]$sourceIdentity.window_end -cne '2019-11-30' -or
+            [string]$sourceIdentity.distinct_event_count -cne '2199938')) {
+        throw 'G2-D full sample source window or distinct event count is invalid.'
+    }
     $identity = Get-G2dMetricIdentity -SnapshotId $snapshotId -DataScope $DataScope `
         -SourceEventCount $sourceIdentity.source_event_count
     $null = Get-G2dRefreshPlan -MetricRunId $identity.MetricRunId
@@ -991,6 +1011,7 @@ function Invoke-G2dRefresh {
         metric_run_id = $identity.MetricRunId
         attempt_id = $attemptId
         data_scope = $identity.DataScope
+        source_table = $sourceTable
         source_snapshot_id = $identity.SourceSnapshotId
         source_event_count = $identity.SourceEventCount
         sql_template_sha256 = $sqlSha256
@@ -1107,5 +1128,6 @@ function Invoke-G2dRefresh {
 
 if ($FunctionsOnly) { return }
 
-$result = Invoke-G2dRefresh -DataScope $DataScope -PlanOnly:$PlanOnly
+$result = Invoke-G2dRefresh -DataScope $DataScope -SourceRunId $SourceRunId `
+    -PlanOnly:$PlanOnly
 $result | ConvertTo-Json -Depth 12 -Compress

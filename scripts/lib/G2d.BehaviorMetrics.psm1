@@ -379,18 +379,50 @@ function Get-G2dPublicationOrder {
     return @($script:G2dPublicationOrder)
 }
 
+function Resolve-G2dSourceTable {
+    [CmdletBinding()]
+    param([AllowEmptyString()][string]$RunId = '')
+
+    if ($RunId.Length -eq 0) { return 'real_behavior_detail_v1' }
+    if ($RunId -cnotmatch '^[a-z0-9][a-z0-9-]{0,31}$') {
+        throw 'G2-D source run ID is invalid.'
+    }
+    return 'real_behavior_detail_v1_' + $RunId.Replace('-', '_')
+}
+
+function Assert-G2dSourceTable {
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][string]$SourceTable)
+
+    $legacy = Resolve-G2dSourceTable
+    if ($SourceTable -ceq $legacy) { return $SourceTable }
+    $prefix = $legacy + '_'
+    if (-not $SourceTable.StartsWith($prefix, [StringComparison]::Ordinal)) {
+        throw 'G2-D source table is outside the approved namespace.'
+    }
+    $runId = $SourceTable.Substring($prefix.Length).Replace('_', '-')
+    if ((Resolve-G2dSourceTable -RunId $runId) -cne $SourceTable) {
+        throw 'G2-D source table does not map to a valid run ID.'
+    }
+    return $SourceTable
+}
+
 function Split-G2dNamedSql {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)][string]$Sql,
-        [Parameter(Mandatory = $true)]$SnapshotId
+        [Parameter(Mandatory = $true)]$SnapshotId,
+        [string]$SourceTable = 'real_behavior_detail_v1'
     )
 
     $snapshot = ConvertTo-G2dInt64 -Value $SnapshotId -Name 'G2-D snapshot ID' -Positive
+    $source = Assert-G2dSourceTable -SourceTable $SourceTable
     $placeholderMatches = [regex]::Matches($Sql, '__[^\r\n]*?__')
     if ($placeholderMatches.Count -eq 0) { throw 'G2-D SQL snapshot placeholder is missing.' }
     foreach ($match in $placeholderMatches) {
-        if ($match.Value -cne '__SNAPSHOT_ID__') { throw 'G2-D SQL contains an unknown placeholder.' }
+        if ($match.Value -cne '__SNAPSHOT_ID__' -and $match.Value -cne '__SOURCE_TABLE__') {
+            throw 'G2-D SQL contains an unknown placeholder.'
+        }
     }
 
     $markerMatches = [regex]::Matches($Sql, '(?m)^-- result:([a-z_]+)\r?$')
@@ -420,7 +452,7 @@ function Split-G2dNamedSql {
         $result[$name] = $statement.Replace(
             '__SNAPSHOT_ID__',
             $snapshot.ToString([Globalization.CultureInfo]::InvariantCulture)
-        )
+        ).Replace('__SOURCE_TABLE__', $source)
     }
     return $result
 }
@@ -1055,6 +1087,8 @@ function Export-G2dCandidateCsv {
 
 Export-ModuleMember -Function @(
     'Get-G2dMetricIdentity',
+    'Resolve-G2dSourceTable',
+    'Assert-G2dSourceTable',
     'Split-G2dNamedSql',
     'ConvertFrom-G2dCsv',
     'Assert-G2dMetricBundle',

@@ -1,12 +1,12 @@
 -- result:source_identity
 WITH base AS (
     SELECT event_date, event_id
-    FROM lakehouse.analytics.real_behavior_detail_v1
+    FROM lakehouse.analytics.__SOURCE_TABLE__
         FOR VERSION AS OF __SNAPSHOT_ID__
 ),
 snapshot_metadata AS (
     SELECT snapshot_id, committed_at
-    FROM lakehouse.analytics."real_behavior_detail_v1$snapshots"
+    FROM lakehouse.analytics."__SOURCE_TABLE__$snapshots"
     WHERE snapshot_id = __SNAPSHOT_ID__
 )
 SELECT
@@ -23,7 +23,7 @@ LEFT JOIN snapshot_metadata ON true;
 WITH base AS (
     SELECT event_date, event_type, user_id, user_session, product_id,
            price_decimal, event_id
-    FROM lakehouse.analytics.real_behavior_detail_v1
+    FROM lakehouse.analytics.__SOURCE_TABLE__
         FOR VERSION AS OF __SNAPSHOT_ID__
 ),
 day_rows AS (
@@ -61,7 +61,7 @@ ORDER BY window_type, window_start;
 WITH base AS (
     SELECT event_date, event_ts, event_type, user_session, source_file, source_row_number,
            event_id
-    FROM lakehouse.analytics.real_behavior_detail_v1
+    FROM lakehouse.analytics.__SOURCE_TABLE__
         FOR VERSION AS OF __SNAPSHOT_ID__
 ),
 windowed AS (
@@ -155,7 +155,7 @@ ORDER BY counts.window_type, counts.window_start;
 WITH base AS (
     SELECT event_date, event_type, user_id, product_id, category_id, category_code, brand,
            price_decimal
-    FROM lakehouse.analytics.real_behavior_detail_v1
+    FROM lakehouse.analytics.__SOURCE_TABLE__
         FOR VERSION AS OF __SNAPSHOT_ID__
 ),
 windowed AS (
@@ -226,7 +226,7 @@ WITH base AS (
     SELECT event_date, event_ts, event_time, event_type, user_id, user_session, product_id,
            category_code, brand, price_decimal, event_id, quality_route,
            try(from_iso8601_timestamp(event_time)) AS parsed_event_ts
-    FROM lakehouse.analytics.real_behavior_detail_v1
+    FROM lakehouse.analytics.__SOURCE_TABLE__
         FOR VERSION AS OF __SNAPSHOT_ID__
 ),
 quality_counts AS (

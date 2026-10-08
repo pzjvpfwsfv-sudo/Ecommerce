@@ -113,16 +113,19 @@ class G2dArtifactContractTests(unittest.TestCase):
                 key_columns = [column.strip() for column in key_text.split(",")]
                 self.assertEqual(key_columns, columns[: len(key_columns)])
 
-    def test_trino_template_has_five_fixed_results_and_no_dynamic_source(self):
-        """Protect every result family from current-table reads or caller-controlled SQL."""
+    def test_trino_template_has_five_fixed_results_and_bounded_source_placeholder(self):
+        """Every result uses the same validated source table and snapshot."""
         sql = TRINO_TEMPLATE.read_text(encoding="utf-8")
         result_names = re.findall(r"(?m)^-- result:([a-z_]+)$", sql)
         self.assertEqual(
             ["source_identity", "overview", "funnel", "dimension", "quality"], result_names
         )
         self.assertEqual(5, len([part for part in sql.split(";") if part.strip()]))
-        self.assertIn("lakehouse.analytics.real_behavior_detail_v1", sql)
-        self.assertEqual({"__SNAPSHOT_ID__"}, set(re.findall(r"__[A-Z0-9_]+__", sql)))
+        self.assertIn("lakehouse.analytics.__SOURCE_TABLE__", sql)
+        self.assertEqual(
+            {"__SNAPSHOT_ID__", "__SOURCE_TABLE__"},
+            set(re.findall(r"__[A-Z0-9_]+__", sql)),
+        )
         self.assertIn("FOR VERSION AS OF __SNAPSHOT_ID__", sql)
         self.assertIn("source_row_number", sql)
         self.assertIn("purchase_amount_proxy", sql)
@@ -133,7 +136,7 @@ class G2dArtifactContractTests(unittest.TestCase):
         self.assertIn("category_code", sql)
         self.assertIn("is_unknown", sql)
         self.assertIn("reconciliation_status", sql)
-        self.assertIn('"real_behavior_detail_v1$snapshots"', sql)
+        self.assertIn('"__SOURCE_TABLE__$snapshots"', sql)
 
     def test_quality_preserves_valid_removals_in_total_reconciliation(self):
         """Protect valid remove-from-cart facts from forcing an unreconciled publication."""
@@ -242,6 +245,55 @@ class G2dPowerShellContractTests(unittest.TestCase):
         result = self._run_powershell(command)
         self.assertEqual(0, result.returncode, result.stderr or result.stdout)
         return json.loads(result.stdout.strip().splitlines()[-1])
+
+    def test_source_table_derivation_and_sql_binding_reject_untrusted_names(self):
+        payload = self._payload(
+            r'''
+$ErrorActionPreference = 'Stop'
+Import-Module ./scripts/lib/G2d.BehaviorMetrics.psm1 -Force
+function Test-Rejected([scriptblock]$Action) {
+    try { & $Action | Out-Null; return $false } catch { return $true }
+}
+$template = Get-Content jobs/sql/18_g2d_behavior_metrics.sql.template -Raw -Encoding UTF8
+$legacy = Resolve-G2dSourceTable -RunId ''
+$isolated = Resolve-G2dSourceTable -RunId 'g5-a10k-01'
+$parts = Split-G2dNamedSql -Sql $template -SnapshotId 9 -SourceTable $isolated
+[ordered]@{
+    legacy = $legacy
+    isolated = $isolated
+    statements = @($parts.Keys)
+    all_on_isolated = @($parts.Values | Where-Object {
+        $_.Contains('lakehouse.analytics.real_behavior_detail_v1_g5_a10k_01')
+    }).Count -eq 5
+    snapshot_table = $parts.source_identity.Contains(
+        'lakehouse.analytics."real_behavior_detail_v1_g5_a10k_01$snapshots"'
+    )
+    no_unrendered = -not [bool](($parts.Values -join "`n") -match '__[A-Z0-9_]+__')
+    rejects_injection = Test-Rejected { Resolve-G2dSourceTable -RunId "x'; DROP TABLE y; --" }
+    rejects_underscore = Test-Rejected { Resolve-G2dSourceTable -RunId 'x_y' }
+    rejects_long = Test-Rejected { Resolve-G2dSourceTable -RunId ('a' * 33) }
+    rejects_arbitrary_table = Test-Rejected {
+        Split-G2dNamedSql -Sql $template -SnapshotId 9 -SourceTable 'other_table'
+    }
+} | ConvertTo-Json -Depth 5 -Compress
+'''
+        )
+        self.assertEqual("real_behavior_detail_v1", payload["legacy"])
+        self.assertEqual("real_behavior_detail_v1_g5_a10k_01", payload["isolated"])
+        self.assertEqual(
+            ["source_identity", "overview", "funnel", "dimension", "quality"],
+            payload["statements"],
+        )
+        for name in (
+            "all_on_isolated",
+            "snapshot_table",
+            "no_unrendered",
+            "rejects_injection",
+            "rejects_underscore",
+            "rejects_long",
+            "rejects_arbitrary_table",
+        ):
+            self.assertTrue(payload[name], name)
 
     def test_identity_rejects_invalid_values_and_publication_must_be_last(self):
         payload = self._payload(
@@ -799,6 +851,11 @@ $plan = Get-G2dRefreshPlan -MetricRunId 'behavior-v1-s3854376992136224865'
     targets = @($plan | ForEach-Object { $_.Target })
     publication_last = $plan[-1].Name -ceq 'publication'
     plan_only = Invoke-G2dRefresh -DataScope g2c-correctness-subset -PlanOnly
+    isolated_plan = Invoke-G2dRefresh -DataScope stable-user-2pct-full `
+        -SourceRunId 'g5-full-01' -PlanOnly
+    rejects_unbound_full = Test-Rejected {
+        Invoke-G2dRefresh -DataScope stable-user-2pct-full -PlanOnly
+    }
     unsafe_run_id = Test-Rejected {
         Get-G2dRefreshPlan -MetricRunId "behavior-v1-s1'; DROP TABLE analytics.x; --"
     }
@@ -823,6 +880,11 @@ $plan = Get-G2dRefreshPlan -MetricRunId 'behavior-v1-s3854376992136224865'
         self.assertTrue(payload["publication_last"])
         self.assertEqual("planned", payload["plan_only"]["status"])
         self.assertEqual("g2c-correctness-subset", payload["plan_only"]["data_scope"])
+        self.assertEqual("real_behavior_detail_v1", payload["plan_only"]["source_table"])
+        self.assertEqual(
+            "real_behavior_detail_v1_g5_full_01", payload["isolated_plan"]["source_table"]
+        )
+        self.assertTrue(payload["rejects_unbound_full"])
         self.assertTrue(payload["unsafe_run_id"])
         self.assertTrue(payload["zero_run_id"])
 
@@ -1051,6 +1113,8 @@ $rows = @(ConvertFrom-G2dMysqlBatch -Lines @(
 $ErrorActionPreference = 'Stop'
 . (Resolve-Path './scripts/refresh_g2d_behavior_metrics.ps1') -FunctionsOnly
 $sql = Get-G2dLatestSnapshotSql
+$isolated = Get-G2dLatestSnapshotSql `
+    -SourceTable 'real_behavior_detail_v1_g5_a10k_01'
 [ordered]@{
     fixed_metadata_table = $sql.Contains(
         'lakehouse.analytics."real_behavior_detail_v1$snapshots"'
@@ -1061,6 +1125,9 @@ $sql = Get-G2dLatestSnapshotSql
         'snapshot_id\s+DESC\s+LIMIT\s+1'
     ))
     numeric_max_absent = -not [bool]($sql -match '(?i)\bmax\s*\(\s*snapshot_id')
+    isolated_metadata_table = $isolated.Contains(
+        'lakehouse.analytics."real_behavior_detail_v1_g5_a10k_01$snapshots"'
+    )
 } | ConvertTo-Json -Compress
 '''
         )

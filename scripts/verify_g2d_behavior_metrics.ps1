@@ -2,6 +2,7 @@
 param(
     [ValidateSet('g2c-correctness-subset', 'stable-user-2pct-full')]
     [string]$ExpectedDataScope = 'g2c-correctness-subset',
+    [string]$ExpectedSourceRunId = '',
     [switch]$FunctionsOnly
 )
 
@@ -546,9 +547,15 @@ function Invoke-G2dVerification {
     [CmdletBinding()]
     param(
         [ValidateSet('g2c-correctness-subset', 'stable-user-2pct-full')]
-        [string]$ExpectedDataScope = 'g2c-correctness-subset'
+        [string]$ExpectedDataScope = 'g2c-correctness-subset',
+        [string]$ExpectedSourceRunId = ''
     )
 
+    $sourceTable = Resolve-G2dSourceTable -RunId $ExpectedSourceRunId
+    if ($ExpectedDataScope -ceq 'stable-user-2pct-full' -and
+            $ExpectedSourceRunId.Length -eq 0) {
+        throw 'G2-D full sample verification requires an isolated source run ID.'
+    }
     $stopwatch = [Diagnostics.Stopwatch]::StartNew()
     Assert-G2dDependencies
     try {
@@ -597,7 +604,8 @@ LIMIT 1;
 
     $templatePath = Join-Path $verifierProjectRoot 'jobs/sql/18_g2d_behavior_metrics.sql.template'
     $template = [IO.File]::ReadAllText($templatePath, [Text.Encoding]::UTF8)
-    $statements = Split-G2dNamedSql -Sql $template -SnapshotId $identity.SourceSnapshotId
+    $statements = Split-G2dNamedSql -Sql $template `
+        -SnapshotId $identity.SourceSnapshotId -SourceTable $sourceTable
     $sourceRows = @(
         Invoke-G2dTrinoStatement -Name source_identity -Sql $statements.source_identity
     )
@@ -756,7 +764,7 @@ LIMIT 1;
         )
         elapsed_ms = [long]$stopwatch.ElapsedMilliseconds
         source = [pscustomobject][ordered]@{
-            table = 'lakehouse.analytics.real_behavior_detail_v1'
+            table = "lakehouse.analytics.$sourceTable"
             snapshot_id = [string]$identity.SourceSnapshotId
             snapshot_committed_at = [string]$sourceIdentity.snapshot_committed_at
             window_start = [string]$sourceIdentity.window_start
@@ -790,7 +798,11 @@ LIMIT 1;
             limitations = @($proxyDefinition.limitations)
             forbidden_claims = @($proxyDefinition.forbidden_claims)
         }
-        capacity_boundary = 'The 1,002-row correctness subset is non-capacity evidence and is not the full 2% user sample.'
+        capacity_boundary = if ($ExpectedDataScope -ceq 'g2c-correctness-subset') {
+            'The 1,002-row correctness subset is non-capacity evidence and is not the full 2% user sample.'
+        } else {
+            'Historical full-sample replay; capacity claims require the separate G5 runtime report.'
+        }
     }
 
     $paths = Initialize-G2dRunDirectory -MetricRunId $identity.MetricRunId
@@ -813,6 +825,7 @@ LIMIT 1;
 }
 
 if (-not $FunctionsOnly) {
-    $result = Invoke-G2dVerification -ExpectedDataScope $ExpectedDataScope
+    $result = Invoke-G2dVerification -ExpectedDataScope $ExpectedDataScope `
+        -ExpectedSourceRunId $ExpectedSourceRunId
     $result | ConvertTo-Json -Depth 12 -Compress
 }
