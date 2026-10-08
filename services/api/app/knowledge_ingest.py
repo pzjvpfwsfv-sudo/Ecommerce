@@ -153,7 +153,9 @@ class Embedder:
             elif os.name == "nt":
                 cache_dir = Path("D:/EcommerceDev/cache/fastembed")
             else:
-                raise ValueError("G4_EMBED_CACHE_DIR must point to a D-drive-backed mount")
+                if allow_download:
+                    raise ValueError("G4_EMBED_CACHE_DIR must point to a D-drive-backed mount")
+                cache_dir = Path("/models/fastembed")
         self.cache_dir = Path(cache_dir)
         if not self.cache_dir.is_absolute():
             raise ValueError("embedding cache path must be absolute")

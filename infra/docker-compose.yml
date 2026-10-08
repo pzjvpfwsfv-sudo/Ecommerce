@@ -111,11 +111,18 @@ services:
       BEHAVIOR_METRIC_DEFINITIONS_PATH: ${BEHAVIOR_METRIC_DEFINITIONS_PATH}
       ORDER_METRIC_DEFINITIONS_PATH: ${ORDER_METRIC_DEFINITIONS_PATH}
       WEB_DIST_DIR: ${WEB_DIST_DIR:-}
+      G4_EMBED_CACHE_DIR: /models/fastembed
     volumes:
       - ../services/api:/app
       - ../configs/metrics:/app/configs/metrics:ro
+      - ../configs/knowledge:/app/configs/knowledge:ro
+      - ../docs/graduation:/app/docs/graduation:ro
       - ../scripts/bootstrap_g3_admin.py:/app/scripts/bootstrap_g3_admin.py:ro
       - ../apps/web/dist:/web:ro
+      - type: bind
+        source: ${G4_EMBED_CACHE_HOST_DIR:-D:/EcommerceDev/cache/fastembed}
+        target: /models/fastembed
+        read_only: true
     working_dir: /app
     command:
       - sh

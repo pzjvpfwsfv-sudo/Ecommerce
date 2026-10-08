@@ -165,6 +165,17 @@ class G4KnowledgeStoreTest(unittest.TestCase):
             ).fetchone()["version_count"]
         self.assertEqual(count, 1)
 
+    def test_version_history_hides_drafts_and_withdrawn_versions_from_viewer(self):
+        first = self.draft("公开口径")
+        self.assertEqual(self.store.list_versions(first.document_id, self.viewer), [])
+        self.assertEqual([v.id for v in self.store.list_versions(first.document_id, self.admin)], [first.id])
+        self.store.publish(first.document_id, first.id)
+        second = self.draft("未发布修订", document_id=first.document_id)
+        self.assertEqual([v.id for v in self.store.list_versions(first.document_id, self.viewer)], [first.id])
+        self.assertEqual([v.id for v in self.store.list_versions(first.document_id, self.admin)], [second.id, first.id])
+        self.store.withdraw(first.document_id)
+        self.assertEqual(self.store.list_versions(first.document_id, self.viewer), [])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -29,6 +29,10 @@ from app.behavior_models import (
 )
 from app.behavior_service import BehaviorMetricsService, BehaviorMetricsUnavailableError
 from app.config import ApiSettings, load_settings
+from app.knowledge_api import create_knowledge_router
+from app.knowledge_ingest import Embedder
+from app.knowledge_search import KnowledgeSearchService
+from app.knowledge_store import KnowledgeStore
 from app.dependencies import (
     build_analysis_service,
     build_behavior_metrics_service,
@@ -69,6 +73,9 @@ def create_app(
     behavior_service: BehaviorMetricsService | Any | None = None,
     order_service: OrderMetricsService | Any | None = None,
     auth_service: AuthService | None = None,
+    knowledge_store: KnowledgeStore | Any | None = None,
+    knowledge_search: KnowledgeSearchService | Any | None = None,
+    knowledge_embedder: Embedder | Any | None = None,
 ) -> FastAPI:
     settings = settings or load_settings()
     if settings.web_dist_dir is not None and not (settings.web_dist_dir / "index.html").is_file():
@@ -88,6 +95,9 @@ def create_app(
         behavior_service = build_behavior_metrics_service(settings)
     if order_service is None:
         order_service = build_order_metrics_service(settings)
+    knowledge_store = knowledge_store or KnowledgeStore(settings)
+    knowledge_embedder = knowledge_embedder or Embedder()
+    knowledge_search = knowledge_search or KnowledgeSearchService(knowledge_store, knowledge_embedder)
     tool_analysis_service_closed = False
     tool_analysis_service_close_lock = Lock()
 
@@ -105,6 +115,7 @@ def create_app(
     app = FastAPI(title="Realtime Metrics API", version="0.3.0", lifespan=lifespan)
     app.state.auth_service = auth_service
     app.include_router(auth_router)
+    app.include_router(create_knowledge_router(settings, knowledge_store, knowledge_search, knowledge_embedder))
 
     def behavior_response(stage: str, operation: Callable[[], Any]) -> Any:
         try:

@@ -177,6 +177,19 @@ class KnowledgeStore:
             published_version_id=row["published_version_id"],
         ) for row in rows]
 
+    def list_versions(self, document_id: UUID, principal: Principal) -> list[DocumentVersion]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT v.id, v.document_id, v.version_no, v.status, v.created_at, v.published_at "
+                "FROM knowledge.versions v JOIN knowledge.documents d ON d.id = v.document_id "
+                "WHERE d.id = %s AND ((%s = 'admin') OR "
+                "(v.status = 'published' AND d.withdrawn_at IS NULL "
+                "AND d.visibility_roles @> ARRAY[%s]::text[])) "
+                "ORDER BY v.version_no DESC",
+                (document_id, principal.role, principal.role),
+            ).fetchall()
+        return [_version(row) for row in rows]
+
     def preview(self, document_id: UUID, version_id: UUID, principal: Principal) -> DocumentPreview:
         with self._connect() as connection:
             with connection.cursor() as cursor:

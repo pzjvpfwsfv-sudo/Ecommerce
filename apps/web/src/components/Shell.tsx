@@ -10,6 +10,7 @@ const navigation = [
   ["/rankings", "商品与品类", "04"],
   ["/fulfillment", "履约与评价", "05"],
   ["/quality", "数据质量", "06"],
+  ["/knowledge", "知识库检索", "07"],
 ] as const;
 
 const roleNames = { admin: "管理员", analyst: "分析员", viewer: "只读用户" };
@@ -21,7 +22,8 @@ export function Shell({ user, onLogout, children }: {
 }) {
   const [mobileOpen, setMobileOpen] = useState(false);
   const location = useLocation();
-  const title = navigation.find(([path]) => path === location.pathname)?.[1] ?? "账户";
+  const title = location.pathname.startsWith("/knowledge/") ? "知识库检索"
+    : navigation.find(([path]) => path === location.pathname)?.[1] ?? "账户";
 
   return (
     <div className="workbench">
@@ -50,7 +52,6 @@ export function Shell({ user, onLogout, children }: {
           ))}
           <span className="nav-caption nav-caption--future">NEXT / 后续阶段</span>
           <div className="nav-future" aria-disabled="true">AI 指标分析 <small>G4 待开放</small></div>
-          <div className="nav-future" aria-disabled="true">知识库检索 <small>G4 待开放</small></div>
         </nav>
         <div className="sidebar-foot">
           <span className="status-dot" aria-hidden="true" />
