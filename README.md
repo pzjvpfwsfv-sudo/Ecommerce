@@ -2,7 +2,7 @@
 
 这是一个面向秋招展示与能力训练的实战项目，目标不是堆技术名词，而是做出一条能解释、能运行、能调优、能写进简历的数据工程主链路。
 
-## 毕设与校招版（2026-09）
+## 毕设与校招版（2026-10）
 
 新增方向为“基于实时湖仓与检索增强智能体的电商行为分析系统”。真实数据、业务可视化、知识库和受控 Agent 是核心范围，以下历史章节不是新版功能完成声明。
 
@@ -15,10 +15,13 @@
 - [G2-C 真实事件统一落湖与 Trino 验收](docs/graduation/real-event-lakehouse-runbook.md)
 - [G2-D 行为指标与版本化 API 验收](docs/graduation/behavior-metrics-api-runbook.md)
 - [G2-E Olist 订单域真实验收与运行手册](docs/graduation/olist-order-domain-runbook.md)
+- [G3 六个真实指标可视化模块与验收边界](docs/graduation/g3-visual-workbench-runbook.md)
+- [G5-A 220 万真实行为样本闭环设计（待审阅）](docs/superpowers/specs/2026-10-08-graduation-g5-full-behavior-acceptance-design.md)
+- [G4 知识库与有据 Agent 设计（尚未实现）](docs/superpowers/specs/2026-10-08-graduation-g4-knowledge-rag-design.md)
 
 已新增不依赖 Docker 的真实数据准备工具：`python -m generators.real_data --help`。它与旧模拟生成器隔离，不自动写 Kafka，不把历史前缀样本当作完整分析窗口。
 
-当前有两套职责隔离的真实数据：REES46 两个月 109,950,743 条行为源记录经稳定用户抽样得到 2,199,938 条事件；Olist 官方九文件共 1,550,922 条订单域记录。G2-A 至 G2-D 已完成行为链路的隔离动态验收，G2-E 已将 Olist 全量九文件顺序写入 9 张 Iceberg 源表和 9 张主题表，并以不可变 Doris run 发布 321,165 行六类指标；8 个版本化 API 合同于 2026-09-24 完整通过。两套匿名数据不做身份拼接。下一步是 G3 业务可视化和 G4 知识库/RAG，当前尚未宣称完成。GitHub 备份使用 `codex/chapter-10-controlled-tools` 开发分支；真实数据、密钥和服务卷不包含在 Git 中。
+当前有两套职责隔离的真实数据：REES46 两个月 109,950,743 条行为源记录经稳定用户抽样得到 2,199,938 条事件；Olist 官方九文件共 1,550,922 条订单域记录。G2-A 至 G2-D 已完成行为链路的 **1,002 条正确性子集**动态验收，尚未完成 220 万条入湖与发布；G2-E 已将 Olist 全量九文件写入 9 张 Iceberg 源表和 9 张主题表，并以不可变 Doris run 发布 321,165 行六类指标。G3 六个可视化模块已在宿主机临时 FastAPI + 真实 Doris 上通过浏览器验收，正式容器/持久身份库仍待复验。下一步优先 G5-A 全样本数据闭环与 G3 收尾，然后实施 G4 知识库/RAG 和单 Agent；两套匿名数据不做身份拼接。GitHub 备份使用 `codex/chapter-10-controlled-tools` 开发分支；真实数据、密钥和服务卷不包含在 Git 中。
 
 G2-A 已提供 `python -m generators.real_data.replay`：默认离线试跑，显式 Kafka 模式只允许真实数据专用 Topic，支持限速、确认后保存进度和 Ctrl+C 恢复。真实样本 400+600 条离线恢复与真实 Kafka 续传均通过，独立消费核对 1,000 条的业务字段、事件 ID、顺序与 key 全部一致。证据见运行手册，不等同于 220 万条全量回放或新 Flink/湖仓链路已完成。
 

@@ -8,12 +8,13 @@
 
 **Tech Stack:** FastAPI/Pydantic、LangChain、`langchain-openai`、`langchain-ollama`、现有 Doris 服务方法、PostgreSQL 应用库、React/Vitest/Playwright、Python unittest。
 
-**Spec:** [G4 知识库与有据 AI 分析设计](../specs/2026-10-08-graduation-g4-knowledge-rag-design.md)。必须先完成 [G4-A 计划](2026-10-08-g4a-knowledge-retrieval-implementation.md)，不直接把旧 `/analysis/tools` 执行器的模拟实时指标当业务证据。
+**Spec:** [G4 知识库与有据 AI 分析设计](../specs/2026-10-08-graduation-g4-knowledge-rag-design.md)。必须先完成 [G4-A 计划](2026-10-08-g4a-knowledge-retrieval-implementation.md)；正式 REES46 跨月分析另依赖 [G5-A 全样本验收](../specs/2026-10-08-graduation-g5-full-behavior-acceptance-design.md)，不直接把旧 `/analysis/tools` 执行器的模拟实时指标或 1,002 条正确性子集当作全样本业务证据。
 
 ## Global Constraints
 
 - 单 Agent、三个工具：`search_knowledge`、`get_published_behavior_metrics`、`get_published_order_metrics`；不得提供任意 SQL、网络、文件系统、写入或新增工具。
 - 只读指标来自现有 `BehaviorMetricsService`/`OrderMetricsService` 的已发布响应，返回原始 `dataset_id`、`metric_version`、`metric_run_id`、窗口、`calculated_at`/发布时间及局限；不得跨 Olist/REES46 关联个人或合并漏斗。
+- 行为域正式业务结论与 50 题最终验收需先确认 `data_scope=stable-user-2pct-full`、源数 2,199,938 和 G5-A 的来源表/Snapshot 对账；此前仅可标为 1,002 条正确性子集试验。Olist 全量订单域可独立验收。
 - 默认 `G4_AGENT_PROVIDER=off`；`openai_compatible` 和 `ollama` 由本机环境显式选择。没有密钥不发远程请求；远程故障不自动冷启本地模型，转确定性证据摘要。
 - 远程仅发送用户问题、最多五段有权短证据、聚合指标与最近三轮摘要；不上传原始 PDF/整库/明细/凭据。密钥只放未跟踪的本地环境配置，用户在官方平台自行登录并设消费限额。
 - 单请求最大 3 次模型调用、5 次工具调用、800 输出 token、45 秒总 deadline；每个后端/模型请求也用剩余时间设置传输超时。不得用隐藏思维链或模型自报置信度做验收。

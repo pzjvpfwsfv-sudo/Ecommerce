@@ -2,7 +2,7 @@
 
 ## 当前状态
 
-2026-09-17 已完成两个月完整源文件下载、全扫描与稳定用户样本核验：109,950,743 条源记录生成 2,199,938 条标准化事件，覆盖连续 61 天。G2-A 至 G2-D 已完成该行为链路的小规模真实动态验收。2026-09-24，G2-E 另以 Olist 官方全量九文件 1,550,922 条记录完成订单域 Iceberg、主题层、Doris 与 API 动态验收。**G3 业务可视化、G4 知识库/RAG 和 G5 容量验收尚未完成。**两套匿名数据职责隔离，不推断共同身份；此前的 1 万条/百万条前缀仅作为工具验证记录保留，不再充当正式分析窗口。
+2026-09-17 已完成两个月完整源文件下载、全扫描与稳定用户样本核验：109,950,743 条源记录生成 2,199,938 条标准化事件，覆盖连续 61 天。G2-A 至 G2-D 已完成该行为链路的 1,002 条真实正确性子集动态验收。2026-09-24，G2-E 另以 Olist 官方全量九文件 1,550,922 条记录完成订单域 Iceberg、主题层、Doris 与 API 动态验收。2026-10-08，[G3 六个业务模块](g3-visual-workbench-runbook.md)已在宿主机临时 FastAPI + 真实 Doris 上通过浏览器验收，正式容器/持久身份库尚待复验；**G5-A 2,199,938 条行为样本闭环与容量验收、G4 知识库/RAG 均未完成。**两套匿名数据职责隔离，不推断共同身份；此前的 1 万条/百万条前缀仅作为工具验证记录保留，不再充当正式分析窗口。后续优先级见[G5-A 设计](../superpowers/specs/2026-10-08-graduation-g5-full-behavior-acceptance-design.md)。
 
 来源登记：`configs/datasets/rees46-multicategory.json`。官方目录 https://data.rees46.com/ ，数据说明 https://www.kaggle.com/datasets/mkechinov/ecommerce-behavior-data-from-multi-category-store/data 。
 
