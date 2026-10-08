@@ -128,3 +128,26 @@ class Citation:
 class RevokedCitation:
     chunk_id: UUID
     status: Literal["revoked"] = "revoked"
+
+
+@dataclass(frozen=True)
+class KnowledgeHit:
+    chunk_id: UUID
+    document_id: UUID
+    version_id: UUID
+    section: str
+    page: int | None
+    text: str
+    source_label: str
+    source_ref: str
+    keyword_rank: int | None
+    vector_rank: int | None
+    score: float
+    locator: str
+
+
+@dataclass(frozen=True)
+class SearchResult:
+    hits: list[KnowledgeHit]
+    mode: Literal["hybrid", "keyword_only"]
+    elapsed_ms: float

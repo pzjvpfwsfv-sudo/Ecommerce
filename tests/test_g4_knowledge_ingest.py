@@ -17,7 +17,7 @@ sys.path.insert(0, str(ROOT / "services" / "api"))
 
 from app.config import ApiSettings  # noqa: E402
 from app.knowledge_ingest import (  # noqa: E402
-    Embedder, chunk_document, metric_definition_sections, parse_document,
+    Embedder, EmbeddingUnavailable, chunk_document, metric_definition_sections, parse_document,
 )
 from app.knowledge_models import DocumentMetadata  # noqa: E402
 
@@ -149,7 +149,13 @@ class G4KnowledgeIngestTest(unittest.TestCase):
 
         cache = Path("D:/EcommerceDev/cache/fastembed") if os.name == "nt" else Path("/tmp/g4-fastembed")
         with patch.dict(sys.modules, {"fastembed": SimpleNamespace(TextEmbedding=fake_constructor)}):
-            with self.assertRaisesRegex(FileNotFoundError, "cache empty"):
+            with self.assertRaisesRegex(EmbeddingUnavailable, "not prepared"):
+                Embedder(cache_dir=cache).embed_many(["test"])
+
+    def test_missing_fastembed_package_is_explicitly_unavailable(self):
+        cache = Path("D:/EcommerceDev/cache/fastembed") if os.name == "nt" else Path("/tmp/g4-fastembed")
+        with patch.dict(sys.modules, {"fastembed": None}):
+            with self.assertRaises(EmbeddingUnavailable):
                 Embedder(cache_dir=cache).embed_many(["test"])
 
 

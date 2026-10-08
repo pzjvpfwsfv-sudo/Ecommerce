@@ -22,6 +22,10 @@ _CJK = re.compile(r"[\u4e00-\u9fff]+")
 _TECH_WORD = re.compile(r"[A-Za-z][A-Za-z0-9_]*(?:[-.][A-Za-z0-9_]+)*")
 
 
+class EmbeddingUnavailable(RuntimeError):
+    pass
+
+
 def _paragraphs(filename: str, text: str, markdown: bool) -> tuple[ParsedSection, ...]:
     heading = Path(filename).stem
     sections: list[ParsedSection] = []
@@ -162,12 +166,15 @@ class Embedder:
         if not texts:
             return []
         if self._model is None:
-            from fastembed import TextEmbedding
+            try:
+                from fastembed import TextEmbedding
 
-            self._model = TextEmbedding(
-                model_name=MODEL_NAME, cache_dir=str(self.cache_dir),
-                threads=2, local_files_only=not self.allow_download,
-            )
+                self._model = TextEmbedding(
+                    model_name=MODEL_NAME, cache_dir=str(self.cache_dir),
+                    threads=2, local_files_only=not self.allow_download,
+                )
+            except (ImportError, OSError, ValueError) as exc:
+                raise EmbeddingUnavailable("embedding model is not prepared") from exc
         vectors = []
         for vector in self._model.embed(texts):
             values = [float(value) for value in vector]
