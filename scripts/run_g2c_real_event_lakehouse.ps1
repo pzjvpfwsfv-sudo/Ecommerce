@@ -228,9 +228,16 @@ function Wait-G2cHiveMetastore {
 function Wait-G2cTrinoReady {
     param(
         [int]$TimeoutSeconds = 120,
-        [string]$BaseUrl = "http://localhost:8088"
+        [string]$BaseUrl = ''
     )
 
+    if (-not $BaseUrl) {
+        $port = if ([string]::IsNullOrWhiteSpace($env:TRINO_PORT)) { '8088' } else { $env:TRINO_PORT }
+        if ($port -cnotmatch '^[1-9][0-9]{0,4}$' -or [int]$port -gt 65535) {
+            throw 'G2-C Trino host port is invalid.'
+        }
+        $BaseUrl = "http://localhost:$port"
+    }
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
     do {
         try {
@@ -271,9 +278,18 @@ function Get-G2cTargetRowCount {
     return Invoke-G2cTrinoScalar -Sql "SELECT count(*) FROM lakehouse.analytics.$TableName"
 }
 
-function Get-G2cFlinkJobs {
-    param([string]$FlinkRestUrl = "http://localhost:8081")
+function Get-G2cFlinkRestUrl {
+    $port = if ([string]::IsNullOrWhiteSpace($env:FLINK_REST_PORT)) { '8081' } else { $env:FLINK_REST_PORT }
+    if ($port -cnotmatch '^[1-9][0-9]{0,4}$' -or [int]$port -gt 65535) {
+        throw 'G2-C Flink host port is invalid.'
+    }
+    return "http://localhost:$port"
+}
 
+function Get-G2cFlinkJobs {
+    param([string]$FlinkRestUrl = '')
+
+    if (-not $FlinkRestUrl) { $FlinkRestUrl = Get-G2cFlinkRestUrl }
     $response = Invoke-RestMethod -Method Get -Uri "$FlinkRestUrl/jobs/overview" -TimeoutSec 10
     return @($response.jobs)
 }
@@ -308,7 +324,7 @@ function Wait-G2cJobRunning {
     param(
         [Parameter(Mandatory = $true)][string]$PipelineName,
         [int]$TimeoutSeconds = 90,
-        [string]$FlinkRestUrl = "http://localhost:8081"
+        [string]$FlinkRestUrl = ''
     )
 
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
@@ -377,7 +393,7 @@ Invoke-G2cChecked -Command { docker version --format "{{.Server.Version}}" } `
 Push-Location $repositoryRoot
 try {
     Invoke-G2cChecked -Command {
-        docker compose --env-file $envFile -f $composeFile --profile flink --profile lakehouse up -d `
+        docker compose --env-file $envFile -f $composeFile --profile flink --profile lakehouse up -d --no-recreate `
             kafka-controller kafka-broker flink-jobmanager flink-taskmanager flink-sql-client `
             minio minio-init metastore-postgres hive-metastore trino
     } -FailureMessage "Failed to start the G2-C Kafka/Flink/lakehouse services." | Out-Null

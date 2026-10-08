@@ -90,6 +90,79 @@ $checkpoint = $base.Clone(); $checkpoint.CheckpointExists = $true
         for forbidden in ("docker compose up", "docker run", "kafka-topics --create", "DROP TABLE", "TRUNCATE TABLE", "Remove-Item"):
             self.assertNotIn(forbidden, content)
 
+    def test_existing_g2c_health_checks_accept_isolated_trino_port(self):
+        for relative in (
+            "scripts/run_g2c_real_event_lakehouse.ps1",
+            "scripts/verify_g2c_real_event_lakehouse.ps1",
+        ):
+            with self.subTest(script=relative):
+                script = str(ROOT / relative).replace("'", "''")
+                command = f"""
+$ErrorActionPreference = 'Stop'
+$env:TRINO_PORT = '8333'
+. '{script}' -FunctionsOnly
+function Invoke-RestMethod {{ param($Method,$Uri,$TimeoutSec); $script:probed = $Uri; return [pscustomobject]@{{ nodeVersion=[pscustomobject]@{{ version='458' }} }} }}
+Wait-G2cTrinoReady -TimeoutSeconds 1
+[ordered]@{{ uri=$script:probed }} | ConvertTo-Json -Compress
+"""
+                result = subprocess.run(
+                    [POWERSHELL, "-NoProfile", "-NonInteractive", "-Command", command],
+                    cwd=ROOT, text=True, capture_output=True, timeout=10,
+                )
+                self.assertEqual(0, result.returncode, result.stderr or result.stdout)
+                self.assertEqual("http://localhost:8333/v1/info", json.loads(result.stdout)["uri"])
+
+    def test_existing_g2c_job_and_checkpoint_checks_accept_isolated_flink_port(self):
+        runner = str(ROOT / "scripts/run_g2c_real_event_lakehouse.ps1").replace("'", "''")
+        verifier = str(ROOT / "scripts/verify_g2c_real_event_lakehouse.ps1").replace("'", "''")
+        command = f"""
+$ErrorActionPreference = 'Stop'
+$env:FLINK_REST_PORT = '8334'
+. '{runner}' -FunctionsOnly
+function Invoke-RestMethod {{ param($Method,$Uri,$TimeoutSec); $script:jobUri = $Uri; return [pscustomobject]@{{ jobs=@() }} }}
+$null = Get-G2cFlinkJobs
+. '{verifier}' -FunctionsOnly
+function Invoke-RestMethod {{ param($Method,$Uri,$TimeoutSec); $script:checkpointUri = $Uri; return [pscustomobject]@{{}} }}
+function Get-G2cCheckpointEvidence {{ param($Checkpoints); return [pscustomobject]@{{ status='ok' }} }}
+$null = Wait-G2cCheckpointEvidence -JobId ('a' * 32) -TimeoutSeconds 1
+[ordered]@{{ jobs=$script:jobUri; checkpoint=$script:checkpointUri }} | ConvertTo-Json -Compress
+"""
+        result = subprocess.run(
+            [POWERSHELL, "-NoProfile", "-NonInteractive", "-Command", command],
+            cwd=ROOT, text=True, capture_output=True, timeout=10,
+        )
+        self.assertEqual(0, result.returncode, result.stderr or result.stdout)
+        payload = json.loads(result.stdout)
+        self.assertEqual("http://localhost:8334/jobs/overview", payload["jobs"])
+        self.assertEqual("http://localhost:8334/jobs/" + "a" * 32 + "/checkpoints", payload["checkpoint"])
+
+    def test_g2c_verifier_functions_only_can_resolve_flink_port_itself(self):
+        verifier = str(ROOT / "scripts/verify_g2c_real_event_lakehouse.ps1").replace("'", "''")
+        command = f"""
+$ErrorActionPreference = 'Stop'
+$env:FLINK_REST_PORT = '8334'
+. '{verifier}' -FunctionsOnly
+function Invoke-RestMethod {{ param($Method,$Uri,$TimeoutSec); $script:checkpointUri = $Uri; return [pscustomobject]@{{}} }}
+function Get-G2cCheckpointEvidence {{ param($Checkpoints); return [pscustomobject]@{{ status='ok' }} }}
+$null = Wait-G2cCheckpointEvidence -JobId ('a' * 32) -TimeoutSeconds 1
+[ordered]@{{ uri=$script:checkpointUri }} | ConvertTo-Json -Compress
+"""
+        result = subprocess.run(
+            [POWERSHELL, "-NoProfile", "-NonInteractive", "-Command", command],
+            cwd=ROOT, text=True, capture_output=True, timeout=10,
+        )
+        self.assertEqual(0, result.returncode, result.stderr or result.stdout)
+        self.assertEqual("http://localhost:8334/jobs/" + "a" * 32 + "/checkpoints", json.loads(result.stdout)["uri"])
+
+    def test_existing_g2c_entrypoints_do_not_recreate_running_services(self):
+        for relative in (
+            "scripts/run_g2c_real_event_lakehouse.ps1",
+            "scripts/verify_g2c_real_event_lakehouse.ps1",
+        ):
+            with self.subTest(script=relative):
+                content = (ROOT / relative).read_text(encoding="utf-8")
+                self.assertIn("up -d --no-recreate", content)
+
 
 if __name__ == "__main__":
     unittest.main()

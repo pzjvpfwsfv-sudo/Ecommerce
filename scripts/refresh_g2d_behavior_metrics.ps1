@@ -362,8 +362,12 @@ function Get-G2dTrinoEndpoints {
     [CmdletBinding()]
     param()
 
+    $port = if ([string]::IsNullOrWhiteSpace($env:TRINO_PORT)) { '8088' } else { $env:TRINO_PORT }
+    if ($port -cnotmatch '^[1-9][0-9]{0,4}$' -or [int]$port -gt 65535) {
+        throw 'G2-D Trino host port is invalid.'
+    }
     return [pscustomobject][ordered]@{
-        HostHealthBaseUrl = 'http://localhost:8088'
+        HostHealthBaseUrl = "http://localhost:$port"
         ContainerCliBaseUrl = 'http://localhost:8080'
     }
 }

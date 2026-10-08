@@ -894,14 +894,23 @@ $plan = Get-G2dRefreshPlan -MetricRunId 'behavior-v1-s3854376992136224865'
 $ErrorActionPreference = 'Stop'
 . (Resolve-Path './scripts/refresh_g2d_behavior_metrics.ps1') -FunctionsOnly
 $endpoints = Get-G2dTrinoEndpoints
+$env:TRINO_PORT = '8333'
+$alternate = Get-G2dTrinoEndpoints
+$env:TRINO_PORT = 'not-a-port'
+$invalid = $false
+try { Get-G2dTrinoEndpoints | Out-Null } catch { $invalid = $true }
 [ordered]@{
     host_health = $endpoints.HostHealthBaseUrl
     container_cli = $endpoints.ContainerCliBaseUrl
+    alternate_health = $alternate.HostHealthBaseUrl
+    invalid_rejected = $invalid
 } | ConvertTo-Json -Compress
 '''
         )
         self.assertEqual("http://localhost:8088", payload["host_health"])
         self.assertEqual("http://localhost:8080", payload["container_cli"])
+        self.assertEqual("http://localhost:8333", payload["alternate_health"])
+        self.assertTrue(payload["invalid_rejected"])
 
     def test_trino_cli_uses_dumb_terminal_without_weakening_csv_validation(self):
         payload = self._payload(

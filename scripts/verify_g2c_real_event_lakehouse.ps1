@@ -179,9 +179,16 @@ function Get-G2cSingleRunningJob {
 function Wait-G2cTrinoReady {
     param(
         [int]$TimeoutSeconds = 120,
-        [string]$BaseUrl = "http://localhost:8088"
+        [string]$BaseUrl = ''
     )
 
+    if (-not $BaseUrl) {
+        $port = if ([string]::IsNullOrWhiteSpace($env:TRINO_PORT)) { '8088' } else { $env:TRINO_PORT }
+        if ($port -cnotmatch '^[1-9][0-9]{0,4}$' -or [int]$port -gt 65535) {
+            throw 'G2-C Trino host port is invalid.'
+        }
+        $BaseUrl = "http://localhost:$port"
+    }
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
     do {
         try {
@@ -253,9 +260,16 @@ function Wait-G2cCheckpointEvidence {
     param(
         [Parameter(Mandatory = $true)][string]$JobId,
         [int]$TimeoutSeconds = 120,
-        [string]$FlinkRestUrl = "http://localhost:8081"
+        [string]$FlinkRestUrl = ''
     )
 
+    if (-not $FlinkRestUrl) {
+        $port = if ([string]::IsNullOrWhiteSpace($env:FLINK_REST_PORT)) { '8081' } else { $env:FLINK_REST_PORT }
+        if ($port -cnotmatch '^[1-9][0-9]{0,4}$' -or [int]$port -gt 65535) {
+            throw 'G2-C Flink host port is invalid.'
+        }
+        $FlinkRestUrl = "http://localhost:$port"
+    }
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
     do {
         try {
@@ -312,7 +326,7 @@ Enable-G2cDockerCli | Out-Null
 Invoke-G2cChecked -Command { docker version --format "{{.Server.Version}}" } `
     -FailureMessage "Docker daemon is unavailable for G2-C verification." | Out-Null
 Invoke-G2cChecked -Command {
-    docker compose --env-file $envFile -f $composeFile --profile lakehouse up -d hive-metastore trino
+    docker compose --env-file $envFile -f $composeFile --profile lakehouse up -d --no-recreate hive-metastore trino
 } -FailureMessage "Failed to start Hive Metastore and Trino for G2-C verification." | Out-Null
 Wait-G2cTrinoReady -TimeoutSeconds $requestedTimeout
 
