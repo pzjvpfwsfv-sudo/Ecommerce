@@ -1273,6 +1273,7 @@ $identity = [pscustomobject]@{
 }
 $source = [pscustomobject]@{
     window_start='2024-01-01'; window_end='2024-01-02'
+    replay_first_at='2026-09-17T23:00:00.000Z'; replay_last_at='2026-09-17T23:01:00.000Z'
 }
 $evidence = [ordered]@{
     overview=[pscustomobject]@{ RowCount=3; Sha256=('a' * 64) }
@@ -1283,8 +1284,11 @@ $evidence = [ordered]@{
 $publication = [pscustomobject]@{
     metric_run_id='behavior-v1-s9'; dataset_id='rees46-multicategory'
     metric_version='behavior-v1'; data_scope='g2c-correctness-subset'
-    source_snapshot_id='9'; source_event_count='1002'; window_start='2024-01-01'
+    source_table='real_behavior_detail_v1'; source_snapshot_id='9'
+    source_event_count='1002'; window_start='2024-01-01'
     window_end='2024-01-02'; calculated_at='2026-09-18T00:00:00.000Z'
+    replay_first_at='2026-09-17T23:00:00.000Z'
+    replay_last_at='2026-09-17T23:01:00.000Z'
     published_at='2026-09-18T00:00:01.000Z'; overview_row_count='3'
     overview_sha256=('a' * 64); funnel_row_count='3'; funnel_sha256=('b' * 64)
     dimension_row_count='30'; dimension_sha256=('c' * 64); quality_row_count='1'
@@ -1296,6 +1300,14 @@ $wrongHash = ($publication | ConvertTo-Json | ConvertFrom-Json)
 $wrongHash.quality_sha256 = 'e' * 64
 $wrongStatus = ($publication | ConvertTo-Json | ConvertFrom-Json)
 $wrongStatus.status = 'PASS'
+$wrongTable = ($publication | ConvertTo-Json | ConvertFrom-Json)
+$wrongTable.source_table = 'real_behavior_detail_v1_g5_full_01'
+$missingTable = ($publication | ConvertTo-Json | ConvertFrom-Json)
+$missingTable.PSObject.Properties.Remove('source_table')
+$wrongReplay = ($publication | ConvertTo-Json | ConvertFrom-Json)
+$wrongReplay.replay_first_at = '2026-09-17T23:02:00.000Z'
+$unsafeTable = ($publication | ConvertTo-Json | ConvertFrom-Json)
+$unsafeTable.source_table = 'other_table'
 $emptyDigest = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855'
 $zeroEvidence = [ordered]@{}
 foreach ($entry in $evidence.GetEnumerator()) { $zeroEvidence[$entry.Key] = $entry.Value }
@@ -1308,7 +1320,7 @@ $storedIdentity = [pscustomobject]@{
 $wrongStoredIdentity = ($storedIdentity | ConvertTo-Json | ConvertFrom-Json)
 $wrongStoredIdentity.dataset_id = 'other-dataset'
 $exact = Assert-G2dExistingPublication -Identity $identity -SourceIdentity $source `
-    -Publication $publication -StoredEvidence $evidence
+    -SourceTable 'real_behavior_detail_v1' -Publication $publication -StoredEvidence $evidence
 $insertSql = New-G2dPublicationInsertSql -Publication $publication
 [ordered]@{
     exact_status = $exact.status
@@ -1316,6 +1328,8 @@ $insertSql = New-G2dPublicationInsertSql -Publication $publication
         'INSERT INTO analytics.behavior_metric_publications ('
     )
     exact_published_literal = $insertSql.Contains("'PUBLISHED'")
+    insert_source_table = $insertSql.Contains("'real_behavior_detail_v1'")
+    insert_replay_time = $insertSql.Contains('2026-09-17 23:00:00.000')
     valid_stored_identity = -not (Test-Rejected {
         Assert-G2dStoredIdentity -Identity $identity -Rows @($storedIdentity) -Name overview
     })
@@ -1338,18 +1352,173 @@ $insertSql = New-G2dPublicationInsertSql -Publication $publication
         Assert-G2dExistingPublication -Identity $identity -SourceIdentity $source `
             -Publication $wrongStatus -StoredEvidence $evidence
     }
+    wrong_source_table = Test-Rejected {
+        Assert-G2dExistingPublication -Identity $identity -SourceIdentity $source `
+            -SourceTable 'real_behavior_detail_v1' -Publication $wrongTable -StoredEvidence $evidence
+    }
+    missing_source_table = Test-Rejected {
+        Assert-G2dExistingPublication -Identity $identity -SourceIdentity $source `
+            -SourceTable 'real_behavior_detail_v1' -Publication $missingTable -StoredEvidence $evidence
+    }
+    mismatched_replay = Test-Rejected {
+        Assert-G2dExistingPublication -Identity $identity -SourceIdentity $source `
+            -SourceTable 'real_behavior_detail_v1' -Publication $wrongReplay -StoredEvidence $evidence
+    }
+    wrong_insert_source = Test-Rejected { New-G2dPublicationInsertSql -Publication $unsafeTable }
 } | ConvertTo-Json -Compress
 '''
         )
         self.assertEqual("already_published", payload["exact_status"])
         self.assertTrue(payload["fixed_insert_target"])
         self.assertTrue(payload["exact_published_literal"])
+        self.assertTrue(payload["insert_source_table"])
+        self.assertTrue(payload["insert_replay_time"])
         self.assertTrue(payload["valid_stored_identity"])
         self.assertTrue(payload["mismatched_stored_identity"])
         self.assertTrue(payload["empty_metric_table"])
         self.assertTrue(payload["mismatched_identity"])
         self.assertTrue(payload["mismatched_digest"])
         self.assertTrue(payload["wrong_status"])
+        self.assertTrue(payload["wrong_source_table"])
+        self.assertTrue(payload["missing_source_table"])
+        self.assertTrue(payload["mismatched_replay"])
+        self.assertTrue(payload["wrong_insert_source"])
+
+    def test_publication_schema_and_replay_source_are_explicit(self):
+        ddl = DORIS_SCHEMA.read_text(encoding="utf-8")
+        sql = TRINO_TEMPLATE.read_text(encoding="utf-8")
+        self.assertIn("source_table VARCHAR(128) NOT NULL", ddl)
+        self.assertIn("replay_first_at DATETIME(3) NULL", ddl)
+        self.assertIn("replay_last_at DATETIME(3) NULL", ddl)
+        source_sql = sql.split("-- result:overview", 1)[0]
+        self.assertIn("replayed_at", source_sql)
+        self.assertIn("replay_first_at", source_sql)
+        self.assertIn("replay_last_at", source_sql)
+
+    def test_publication_migration_only_adds_missing_columns_with_legacy_default(self):
+        payload = self._payload(
+            r'''
+$ErrorActionPreference = 'Stop'
+. (Resolve-Path './scripts/refresh_g2d_behavior_metrics.ps1') -FunctionsOnly
+$old = @(Get-G2dPublicationMigrationSql -ExistingColumns @('metric_run_id', 'status'))
+$again = @(Get-G2dPublicationMigrationSql -ExistingColumns @(
+    'metric_run_id', 'status', 'source_table', 'replay_first_at', 'replay_last_at'
+))
+[ordered]@{
+    count = $old.Count
+    legacy_default = ($old -join ' ').Contains("DEFAULT 'real_behavior_detail_v1'")
+    source_not_null = ($old -join ' ').Contains('source_table VARCHAR(128) NOT NULL')
+    replay_nullable = ($old -join ' ').Contains('replay_first_at DATETIME(3) NULL') -and
+        ($old -join ' ').Contains('replay_last_at DATETIME(3) NULL')
+    no_overwrite = ($old -join ' ') -notmatch '(?i)\b(update|delete|drop|truncate)\b'
+    retry_count = $again.Count
+} | ConvertTo-Json -Compress
+'''
+        )
+        self.assertEqual(3, payload["count"])
+        self.assertTrue(payload["legacy_default"])
+        self.assertTrue(payload["source_not_null"])
+        self.assertTrue(payload["replay_nullable"])
+        self.assertTrue(payload["no_overwrite"])
+        self.assertEqual(0, payload["retry_count"])
+
+    def test_cancelled_publication_migration_fails_without_another_alter(self):
+        payload = self._payload(
+            r'''
+$ErrorActionPreference = 'Stop'
+. (Resolve-Path './scripts/refresh_g2d_behavior_metrics.ps1') -FunctionsOnly
+$script:alters = 0
+function Invoke-G2dDorisQuery {
+    param([string]$Sql)
+    if ($Sql -match 'information_schema.columns') {
+        return @([pscustomobject]@{ column_name='metric_run_id' })
+    }
+    if ($Sql -match 'SHOW ALTER TABLE COLUMN') {
+        return @([pscustomobject]@{ State='CANCELLED' })
+    }
+    throw 'Unexpected SQL'
+}
+function Invoke-G2dDorisSql {
+    param([string]$Sql)
+    $script:alters++
+}
+$rejected = $false
+try { Ensure-G2dPublicationSchema } catch { $rejected = $true }
+[ordered]@{ rejected=$rejected; alters=$script:alters } | ConvertTo-Json -Compress
+'''
+        )
+        self.assertTrue(payload["rejected"])
+        self.assertEqual(0, payload["alters"])
+
+    def test_verifier_rejects_mismatched_source_table(self):
+        payload = self._payload(
+            r'''
+$ErrorActionPreference = 'Stop'
+. (Resolve-Path './scripts/verify_g2d_behavior_metrics.ps1') -FunctionsOnly
+function Test-Rejected([scriptblock]$Action) {
+    try { & $Action | Out-Null; return $false } catch { return $true }
+}
+$publication = [pscustomobject]@{ source_table='real_behavior_detail_v1' }
+$missing = [pscustomobject]@{}
+[ordered]@{
+    valid = -not (Test-Rejected {
+        Assert-G2dVerifierPublicationSource -Publication $publication `
+            -ExpectedSourceTable 'real_behavior_detail_v1'
+    })
+    mismatch = Test-Rejected {
+        Assert-G2dVerifierPublicationSource -Publication $publication `
+            -ExpectedSourceTable 'real_behavior_detail_v1_g5_full_01'
+    }
+    missing = Test-Rejected {
+        Assert-G2dVerifierPublicationSource -Publication $missing `
+            -ExpectedSourceTable 'real_behavior_detail_v1'
+    }
+} | ConvertTo-Json -Compress
+'''
+        )
+        self.assertTrue(payload["valid"])
+        self.assertTrue(payload["mismatch"])
+        self.assertTrue(payload["missing"])
+
+    def test_publication_record_preserves_missing_replay_time(self):
+        payload = self._payload(
+            r'''
+$ErrorActionPreference = 'Stop'
+. (Resolve-Path './scripts/refresh_g2d_behavior_metrics.ps1') -FunctionsOnly
+function Test-Rejected([scriptblock]$Action) {
+    try { & $Action | Out-Null; return $false } catch { return $true }
+}
+$identity = Get-G2dMetricIdentity -SnapshotId 9 -DataScope g2c-correctness-subset -SourceEventCount 1002
+$source = [pscustomobject]@{
+    window_start='2024-01-01'; window_end='2024-01-02'
+    replay_first_at=$null; replay_last_at=$null
+}
+$evidence = [ordered]@{}
+foreach ($name in @('overview', 'funnel', 'dimension', 'quality')) {
+    $evidence[$name] = [pscustomobject]@{ RowCount=1; Sha256=('a' * 64) }
+}
+$record = New-G2dPublicationRecord -Identity $identity -SourceIdentity $source `
+    -SourceTable 'real_behavior_detail_v1' -Evidence $evidence `
+    -CalculatedAt '2026-09-18T00:00:00.000Z' -PublishedAt '2026-09-18T00:00:01.000Z'
+$sql = New-G2dPublicationInsertSql -Publication $record
+$missing = ($record | ConvertTo-Json -Depth 5 | ConvertFrom-Json)
+$missing.PSObject.Properties.Remove('source_table')
+[ordered]@{
+    source_table = $record.source_table
+    first_missing = $null -eq $record.replay_first_at
+    last_missing = $null -eq $record.replay_last_at
+    insert_nulls = $sql.Contains('NULL')
+    readback_missing_source_rejected = Test-Rejected {
+        Assert-G2dPublicationReadback -Expected $record -Actual $missing
+    }
+} | ConvertTo-Json -Compress
+'''
+        )
+        self.assertEqual("real_behavior_detail_v1", payload["source_table"])
+        self.assertTrue(payload["first_missing"])
+        self.assertTrue(payload["last_missing"])
+        self.assertTrue(payload["insert_nulls"])
+        self.assertTrue(payload["readback_missing_source_rejected"])
 
     def test_unpublished_partial_candidates_continue_with_fresh_attempt_identity(self):
         payload = self._payload(

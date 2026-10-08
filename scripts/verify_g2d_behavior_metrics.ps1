@@ -37,6 +37,43 @@ $script:G2dExpectedMetricNames = @(
     'invalid_price_count', 'invalid_derived_date_count'
 )
 
+function Assert-G2dVerifierPublicationSource {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]$Publication,
+        [Parameter(Mandatory = $true)][string]$ExpectedSourceTable
+    )
+
+    $expected = Assert-G2dSourceTable -SourceTable $ExpectedSourceTable
+    $property = $Publication.PSObject.Properties['source_table']
+    if ($null -eq $property) { throw 'G2-D publication source table is missing.' }
+    $actual = Assert-G2dSourceTable -SourceTable ([string]$property.Value)
+    if ($actual -cne $expected) { throw 'G2-D publication source table does not match.' }
+}
+
+function Assert-G2dVerifierReplayRange {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]$Publication,
+        [Parameter(Mandatory = $true)]$SourceIdentity
+    )
+
+    $sourceRange = Get-G2dReplayRange -SourceIdentity $SourceIdentity
+    foreach ($field in @('replay_first_at', 'replay_last_at')) {
+        $property = $Publication.PSObject.Properties[$field]
+        if ($null -eq $property) { throw "G2-D publication $field is missing." }
+        $actual = if ($null -eq $property.Value) {
+            $null
+        } else { Assert-G2dTimestamp -Value $property.Value -Name $field }
+        $expected = if ($field -ceq 'replay_first_at') { $sourceRange.First } else { $sourceRange.Last }
+        $legacyUnknown = [string]$Publication.metric_run_id -ceq 'behavior-v1-s881836466779140976' -and
+            [string]$Publication.source_table -ceq 'real_behavior_detail_v1' -and $null -eq $actual
+        if (-not $legacyUnknown -and $actual -ne $expected) {
+            throw "G2-D publication $field does not match the selected Snapshot."
+        }
+    }
+}
+
 function Get-G2dVerifierValue {
     param(
         [Parameter(Mandatory = $true)]$Object,
@@ -571,8 +608,9 @@ function Invoke-G2dVerification {
     }
 
     $publicationRows = @(Invoke-G2dDorisQuery -Sql @'
-SELECT metric_run_id, dataset_id, metric_version, data_scope, source_snapshot_id,
-       source_event_count, window_start, window_end, calculated_at, published_at,
+SELECT metric_run_id, dataset_id, metric_version, data_scope, source_table,
+       source_snapshot_id, source_event_count, window_start, window_end,
+       replay_first_at, replay_last_at, calculated_at, published_at,
        overview_row_count, overview_sha256, funnel_row_count, funnel_sha256,
        dimension_row_count, dimension_sha256, quality_row_count, quality_sha256, status
 FROM analytics.behavior_metric_publications
@@ -584,6 +622,7 @@ LIMIT 1;
         throw 'G2-D requires exactly one latest PUBLISHED Doris run.'
     }
     $publication = $publicationRows[0]
+    Assert-G2dVerifierPublicationSource -Publication $publication -ExpectedSourceTable $sourceTable
     $identity = Get-G2dMetricIdentity -SnapshotId $publication.source_snapshot_id `
         -DataScope $ExpectedDataScope -SourceEventCount $publication.source_event_count
     if ([string]$publication.metric_run_id -cne [string]$identity.MetricRunId -or
@@ -616,6 +655,7 @@ LIMIT 1;
         throw 'G2-D Trino source identity does not match the publication.'
     }
     $sourceIdentity = $sourceRows[0]
+    Assert-G2dVerifierReplayRange -Publication $publication -SourceIdentity $sourceIdentity
 
     $metricRows = [ordered]@{}
     $metricEvidence = [ordered]@{}
@@ -767,6 +807,8 @@ LIMIT 1;
             table = "lakehouse.analytics.$sourceTable"
             snapshot_id = [string]$identity.SourceSnapshotId
             snapshot_committed_at = [string]$sourceIdentity.snapshot_committed_at
+            replay_first_at = $publication.replay_first_at
+            replay_last_at = $publication.replay_last_at
             window_start = [string]$sourceIdentity.window_start
             window_end = [string]$sourceIdentity.window_end
             event_count = [long]$identity.SourceEventCount
@@ -775,6 +817,7 @@ LIMIT 1;
         publication = [pscustomobject][ordered]@{
             metric_run_id = [string]$identity.MetricRunId
             data_scope = [string]$identity.DataScope
+            source_table = [string]$publication.source_table
             calculated_at = [string]$publication.calculated_at
             published_at = [string]$publication.published_at
         }

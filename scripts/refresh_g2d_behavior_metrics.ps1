@@ -237,20 +237,43 @@ function Assert-G2dTimestamp {
     return $parsed.ToUniversalTime()
 }
 
+function Get-G2dReplayRange {
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)]$SourceIdentity)
+
+    $first = $SourceIdentity.PSObject.Properties['replay_first_at']
+    $last = $SourceIdentity.PSObject.Properties['replay_last_at']
+    $firstValue = if ($null -eq $first -or [string]::IsNullOrWhiteSpace([string]$first.Value)) {
+        $null
+    } else { Assert-G2dTimestamp -Value $first.Value -Name 'replay_first_at' }
+    $lastValue = if ($null -eq $last -or [string]::IsNullOrWhiteSpace([string]$last.Value)) {
+        $null
+    } else { Assert-G2dTimestamp -Value $last.Value -Name 'replay_last_at' }
+    if (($null -eq $firstValue) -ne ($null -eq $lastValue) -or
+            ($null -ne $firstValue -and $firstValue -gt $lastValue)) {
+        throw 'G2-D replay time range is incomplete or reversed.'
+    }
+    return [pscustomobject]@{ First = $firstValue; Last = $lastValue }
+}
+
 function Assert-G2dExistingPublication {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)]$Identity,
         [Parameter(Mandatory = $true)]$SourceIdentity,
+        [string]$SourceTable = 'real_behavior_detail_v1',
         [Parameter(Mandatory = $true)]$Publication,
         [Parameter(Mandatory = $true)][Collections.IDictionary]$StoredEvidence
     )
 
+    $source = Assert-G2dSourceTable -SourceTable $SourceTable
+    $replay = Get-G2dReplayRange -SourceIdentity $SourceIdentity
     $expected = [ordered]@{
         metric_run_id = [string]$Identity.MetricRunId
         dataset_id = [string]$Identity.DatasetId
         metric_version = [string]$Identity.MetricVersion
         data_scope = [string]$Identity.DataScope
+        source_table = $source
         source_snapshot_id = [string]$Identity.SourceSnapshotId
         source_event_count = [string]$Identity.SourceEventCount
         window_start = [string]$SourceIdentity.window_start
@@ -267,6 +290,20 @@ function Assert-G2dExistingPublication {
     $calculated = Assert-G2dTimestamp -Value $Publication.calculated_at -Name 'calculated_at'
     $published = Assert-G2dTimestamp -Value $Publication.published_at -Name 'published_at'
     if ($published -lt $calculated) { throw 'G2-D publication timestamp precedes calculation.' }
+    foreach ($field in @('replay_first_at', 'replay_last_at')) {
+        $expectedReplay = if ($field -ceq 'replay_first_at') { $replay.First } else { $replay.Last }
+        $actualProperty = $Publication.PSObject.Properties[$field]
+        if ($null -eq $actualProperty) { throw "G2-D existing publication field '$field' is missing." }
+        $actualReplay = if ($null -eq $actualProperty.Value -or
+                [string]::IsNullOrWhiteSpace([string]$actualProperty.Value)) {
+            $null
+        } else { Assert-G2dTimestamp -Value $actualProperty.Value -Name $field }
+        $legacyUnknown = [string]$Identity.MetricRunId -ceq 'behavior-v1-s881836466779140976' -and
+            $source -ceq 'real_behavior_detail_v1' -and $null -eq $actualReplay
+        if (-not $legacyUnknown -and $actualReplay -ne $expectedReplay) {
+            throw "G2-D existing publication field '$field' does not match."
+        }
+    }
 
     foreach ($name in @('overview', 'funnel', 'dimension', 'quality')) {
         if (-not $StoredEvidence.Contains($name)) {
@@ -500,6 +537,103 @@ function Initialize-G2dDorisSchema {
 
     $ddl = [IO.File]::ReadAllText($script:G2dDdlPath, [Text.Encoding]::UTF8)
     $null = Invoke-G2dDorisSql -Sql $ddl -NoHeaders
+    Ensure-G2dPublicationSchema
+}
+
+function Get-G2dPublicationMigrationSql {
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][string[]]$ExistingColumns)
+
+    $known = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($column in $ExistingColumns) { $null = $known.Add($column) }
+    $definitions = [ordered]@{
+        source_table = "source_table VARCHAR(128) NOT NULL DEFAULT 'real_behavior_detail_v1'"
+        replay_first_at = 'replay_first_at DATETIME(3) NULL'
+        replay_last_at = 'replay_last_at DATETIME(3) NULL'
+    }
+    foreach ($column in $definitions.Keys) {
+        if (-not $known.Contains($column)) {
+            "ALTER TABLE analytics.behavior_metric_publications ADD COLUMN $($definitions[$column]);"
+        }
+    }
+}
+
+function Get-G2dPublicationColumns {
+    [CmdletBinding()]
+    param()
+
+    $rows = @(Invoke-G2dDorisQuery -Sql @'
+SELECT column_name
+FROM information_schema.columns
+WHERE table_schema = 'analytics' AND table_name = 'behavior_metric_publications';
+'@)
+    return @($rows | ForEach-Object { [string]$_.column_name })
+}
+
+function Get-G2dPublicationAlterState {
+    [CmdletBinding()]
+    param()
+
+    $jobs = @(Invoke-G2dDorisQuery -Sql @'
+SHOW ALTER TABLE COLUMN FROM analytics
+WHERE TableName = "behavior_metric_publications"
+ORDER BY CreateTime DESC LIMIT 1;
+'@)
+    if ($jobs.Count -eq 0) { return $null }
+    return [string]$jobs[0].State
+}
+
+function Wait-G2dPublicationColumn {
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][string]$Column)
+
+    for ($attempt = 0; $attempt -lt 40; $attempt++) {
+        if (@(Get-G2dPublicationColumns) -ccontains $Column) { return $true }
+        $state = Get-G2dPublicationAlterState
+        if ($state -ceq 'CANCELLED') { throw 'G2-D publication schema change was cancelled.' }
+        if ($state -ceq 'FINISHED' -or $null -eq $state) { return $false }
+        Start-Sleep -Seconds 2
+    }
+    throw 'G2-D publication schema change did not finish within 80 seconds.'
+}
+
+function Ensure-G2dPublicationSchema {
+    [CmdletBinding()]
+    param()
+
+    foreach ($column in @('source_table', 'replay_first_at', 'replay_last_at')) {
+        $existing = @(Get-G2dPublicationColumns)
+        if ($existing -ccontains $column) { continue }
+        $state = Get-G2dPublicationAlterState
+        if ($state -ceq 'CANCELLED') {
+            throw 'G2-D publication schema change was cancelled.'
+        }
+        if (@('PENDING', 'WAITING_TXN', 'RUNNING') -ccontains $state) {
+            if (Wait-G2dPublicationColumn -Column $column) { continue }
+        }
+        $sql = @(Get-G2dPublicationMigrationSql -ExistingColumns $existing | Where-Object {
+            $_ -match " ADD COLUMN $column "
+        })
+        if ($sql.Count -ne 1) { throw "G2-D publication migration for '$column' is ambiguous." }
+        $null = Invoke-G2dDorisSql -Sql $sql[0] -NoHeaders
+        if (-not (Wait-G2dPublicationColumn -Column $column)) {
+            throw "G2-D publication column '$column' did not become visible."
+        }
+    }
+    $columns = @(Get-G2dPublicationColumns)
+    foreach ($column in @('source_table', 'replay_first_at', 'replay_last_at')) {
+        if ($columns -cnotcontains $column) { throw "G2-D publication column '$column' is missing." }
+    }
+    $legacy = @(Invoke-G2dDorisQuery -Sql @'
+SELECT metric_run_id, source_table, source_event_count
+FROM analytics.behavior_metric_publications
+WHERE metric_run_id = 'behavior-v1-s881836466779140976';
+'@)
+    if ($legacy.Count -gt 1 -or ($legacy.Count -eq 1 -and (
+            [string]$legacy[0].source_table -cne 'real_behavior_detail_v1' -or
+            [string]$legacy[0].source_event_count -cne '1002'))) {
+        throw 'G2-D legacy publication source identity changed during migration.'
+    }
 }
 
 function Assert-G2dDorisTables {
@@ -559,8 +693,9 @@ function Read-G2dPublicationRows {
     $null = Get-G2dRefreshPlan -MetricRunId $MetricRunId
     $runLiteral = ConvertTo-G2dSqlString -Value $MetricRunId
     $columns = @(
-        'metric_run_id', 'dataset_id', 'metric_version', 'data_scope', 'source_snapshot_id',
-        'source_event_count', 'window_start', 'window_end', 'calculated_at', 'published_at',
+        'metric_run_id', 'dataset_id', 'metric_version', 'data_scope', 'source_table',
+        'source_snapshot_id', 'source_event_count', 'window_start', 'window_end',
+        'replay_first_at', 'replay_last_at', 'calculated_at', 'published_at',
         'overview_row_count', 'overview_sha256', 'funnel_row_count', 'funnel_sha256',
         'dimension_row_count', 'dimension_sha256', 'quality_row_count', 'quality_sha256', 'status'
     ) -join ', '
@@ -594,7 +729,8 @@ function Get-G2dExistingPublicationResult {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)]$Identity,
-        [Parameter(Mandatory = $true)]$SourceIdentity
+        [Parameter(Mandatory = $true)]$SourceIdentity,
+        [string]$SourceTable = 'real_behavior_detail_v1'
     )
 
     $rows = @(Read-G2dPublicationRows -MetricRunId $Identity.MetricRunId)
@@ -602,6 +738,7 @@ function Get-G2dExistingPublicationResult {
     if ($rows.Count -ne 1) { throw 'G2-D metric run has multiple publication rows.' }
     $evidence = Get-G2dStoredEvidence -Identity $Identity
     return Assert-G2dExistingPublication -Identity $Identity -SourceIdentity $SourceIdentity `
+        -SourceTable $SourceTable `
         -Publication $rows[0] -StoredEvidence $evidence
 }
 
@@ -807,6 +944,7 @@ function New-G2dPublicationRecord {
     param(
         [Parameter(Mandatory = $true)]$Identity,
         [Parameter(Mandatory = $true)]$SourceIdentity,
+        [string]$SourceTable = 'real_behavior_detail_v1',
         [Parameter(Mandatory = $true)][Collections.IDictionary]$Evidence,
         [Parameter(Mandatory = $true)][string]$CalculatedAt,
         [Parameter(Mandatory = $true)][string]$PublishedAt
@@ -814,15 +952,19 @@ function New-G2dPublicationRecord {
 
     $null = Assert-G2dTimestamp -Value $CalculatedAt -Name 'calculated_at'
     $null = Assert-G2dTimestamp -Value $PublishedAt -Name 'published_at'
+    $replay = Get-G2dReplayRange -SourceIdentity $SourceIdentity
     $record = [ordered]@{
         metric_run_id = [string]$Identity.MetricRunId
         dataset_id = [string]$Identity.DatasetId
         metric_version = [string]$Identity.MetricVersion
         data_scope = [string]$Identity.DataScope
+        source_table = Assert-G2dSourceTable -SourceTable $SourceTable
         source_snapshot_id = [string]$Identity.SourceSnapshotId
         source_event_count = [string]$Identity.SourceEventCount
         window_start = [string]$SourceIdentity.window_start
         window_end = [string]$SourceIdentity.window_end
+        replay_first_at = if ($null -eq $replay.First) { $null } else { $replay.First.ToString("yyyy-MM-dd'T'HH:mm:ss.fff'Z'") }
+        replay_last_at = if ($null -eq $replay.Last) { $null } else { $replay.Last.ToString("yyyy-MM-dd'T'HH:mm:ss.fff'Z'") }
         calculated_at = $CalculatedAt
         published_at = $PublishedAt
     }
@@ -850,7 +992,8 @@ function New-G2dPublicationInsertSql {
     param([Parameter(Mandatory = $true)]$Publication)
 
     $textFields = @(
-        'metric_run_id', 'dataset_id', 'metric_version', 'data_scope', 'window_start', 'window_end',
+        'metric_run_id', 'dataset_id', 'metric_version', 'data_scope', 'source_table',
+        'window_start', 'window_end',
         'overview_sha256', 'funnel_sha256', 'dimension_sha256', 'quality_sha256', 'status'
     )
     foreach ($field in @('overview_sha256', 'funnel_sha256', 'dimension_sha256', 'quality_sha256')) {
@@ -859,6 +1002,7 @@ function New-G2dPublicationInsertSql {
         }
     }
     if ([string]$Publication.status -cne 'PUBLISHED') { throw 'G2-D publication status must be PUBLISHED.' }
+    $null = Assert-G2dSourceTable -SourceTable ([string]$Publication.source_table)
     $values = [ordered]@{}
     foreach ($field in $textFields) {
         $values[$field] = ConvertTo-G2dSqlString -Value ([string]$Publication.$field)
@@ -872,9 +1016,25 @@ function New-G2dPublicationInsertSql {
     }
     $values.calculated_at = ConvertTo-G2dDorisTimestampLiteral -Value ([string]$Publication.calculated_at)
     $values.published_at = ConvertTo-G2dDorisTimestampLiteral -Value ([string]$Publication.published_at)
+    foreach ($field in @('replay_first_at', 'replay_last_at')) {
+        $property = $Publication.PSObject.Properties[$field]
+        if ($null -eq $property) { throw "G2-D publication field '$field' is missing." }
+        $values[$field] = if ($null -eq $property.Value) {
+            'NULL'
+        } else { ConvertTo-G2dDorisTimestampLiteral -Value ([string]$property.Value) }
+    }
+    if (($values.replay_first_at -ceq 'NULL') -ne ($values.replay_last_at -ceq 'NULL')) {
+        throw 'G2-D publication replay range is incomplete.'
+    }
+    if ($values.replay_first_at -cne 'NULL' -and
+            (Assert-G2dTimestamp -Value $Publication.replay_first_at -Name 'replay_first_at') -gt
+            (Assert-G2dTimestamp -Value $Publication.replay_last_at -Name 'replay_last_at')) {
+        throw 'G2-D publication replay range is reversed.'
+    }
     $columns = @(
-        'metric_run_id', 'dataset_id', 'metric_version', 'data_scope', 'source_snapshot_id',
-        'source_event_count', 'window_start', 'window_end', 'calculated_at', 'published_at',
+        'metric_run_id', 'dataset_id', 'metric_version', 'data_scope', 'source_table',
+        'source_snapshot_id', 'source_event_count', 'window_start', 'window_end',
+        'replay_first_at', 'replay_last_at', 'calculated_at', 'published_at',
         'overview_row_count', 'overview_sha256', 'funnel_row_count', 'funnel_sha256',
         'dimension_row_count', 'dimension_sha256', 'quality_row_count', 'quality_sha256', 'status'
     )
@@ -890,7 +1050,7 @@ function Assert-G2dPublicationReadback {
     )
 
     $fields = @(
-        'metric_run_id', 'dataset_id', 'metric_version', 'data_scope', 'source_snapshot_id',
+        'metric_run_id', 'dataset_id', 'metric_version', 'data_scope', 'source_table', 'source_snapshot_id',
         'source_event_count', 'window_start', 'window_end', 'overview_row_count',
         'overview_sha256', 'funnel_row_count', 'funnel_sha256', 'dimension_row_count',
         'dimension_sha256', 'quality_row_count', 'quality_sha256', 'status'
@@ -900,7 +1060,10 @@ function Assert-G2dPublicationReadback {
             throw "G2-D publication readback mismatch for '$field'."
         }
     }
-    foreach ($field in @('calculated_at', 'published_at')) {
+    foreach ($field in @('calculated_at', 'published_at', 'replay_first_at', 'replay_last_at')) {
+        if ($field -match '^replay_' -and $null -eq $Expected.$field -and $null -eq $Actual.$field) {
+            continue
+        }
         $expectedTime = Assert-G2dTimestamp -Value $Expected.$field -Name $field
         $actualTime = Assert-G2dTimestamp -Value $Actual.$field -Name $field
         if ($actualTime -ne $expectedTime) { throw "G2-D publication readback mismatch for '$field'." }
@@ -1014,6 +1177,8 @@ function Invoke-G2dRefresh {
         source_table = $sourceTable
         source_snapshot_id = $identity.SourceSnapshotId
         source_event_count = $identity.SourceEventCount
+        replay_first_at = if ($null -eq $sourceIdentity.replay_first_at) { $null } else { [string]$sourceIdentity.replay_first_at }
+        replay_last_at = if ($null -eq $sourceIdentity.replay_last_at) { $null } else { [string]$sourceIdentity.replay_last_at }
         sql_template_sha256 = $sqlSha256
         candidate_counts_before = $null
         candidates = [ordered]@{}
@@ -1023,7 +1188,8 @@ function Invoke-G2dRefresh {
     try {
         Initialize-G2dDorisSchema
         Assert-G2dDorisTables
-        $existing = Get-G2dExistingPublicationResult -Identity $identity -SourceIdentity $sourceIdentity
+        $existing = Get-G2dExistingPublicationResult -Identity $identity -SourceIdentity $sourceIdentity `
+            -SourceTable $sourceTable
         if ($null -ne $existing) {
             $report.status = 'already_published'
             $report.publication = $existing
@@ -1104,7 +1270,8 @@ function Invoke-G2dRefresh {
                 [Globalization.CultureInfo]::InvariantCulture
             )
             $publication = New-G2dPublicationRecord -Identity $identity -SourceIdentity $sourceIdentity `
-                -Evidence $Evidence -CalculatedAt $calculatedAt -PublishedAt $publishedAt
+                -SourceTable $sourceTable -Evidence $Evidence -CalculatedAt $calculatedAt `
+                -PublishedAt $publishedAt
             return Publish-G2dMetadata -Publication $publication
         }
         $publicationResult = Invoke-G2dPublicationSequence `

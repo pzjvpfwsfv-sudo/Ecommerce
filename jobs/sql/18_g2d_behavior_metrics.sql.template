@@ -1,6 +1,6 @@
 -- result:source_identity
 WITH base AS (
-    SELECT event_date, event_id
+    SELECT event_date, event_id, replayed_at
     FROM lakehouse.analytics.__SOURCE_TABLE__
         FOR VERSION AS OF __SNAPSHOT_ID__
 ),
@@ -14,6 +14,8 @@ SELECT
     min(base.event_date) AS window_start,
     max(base.event_date) AS window_end,
     count(DISTINCT base.event_id) AS distinct_event_count,
+    to_iso8601(min(try(from_iso8601_timestamp(base.replayed_at)))) AS replay_first_at,
+    to_iso8601(max(try(from_iso8601_timestamp(base.replayed_at)))) AS replay_last_at,
     CAST(__SNAPSHOT_ID__ AS BIGINT) AS source_snapshot_id,
     max(snapshot_metadata.committed_at) AS snapshot_committed_at
 FROM base
