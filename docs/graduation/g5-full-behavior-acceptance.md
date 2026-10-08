@@ -2,14 +2,15 @@
 
 ## 当前状态
 
-截至 2026-10-08，2,199,938 条 REES46 历史事件的源文件已在本机重新核验：1,045,479,893 字节，SHA-256 为 `18a3202d380c8f6c53ad767ec2043d0717df1d3604d2211639bb0fc4699a5437`。**1 万轮真实 Kafka → Flink → Iceberg → Trino 对账通过；10 万轮只发送 50,000 条后因主机可用物理内存降至约 0.61 GiB 停止，未通过；全样本未启动。**没有发布 `stable-user-2pct-full`，旧 1,002 条 Doris 发布和表未删除或覆盖。试验结束后项目容器已停止，Topic、湖表、断点和卷保留。
+截至 2026-10-08，2,199,938 条 REES46 历史事件的源文件已在本机重新核验：1,045,479,893 字节，SHA-256 为 `18a3202d380c8f6c53ad767ec2043d0717df1d3604d2211639bb0fc4699a5437`。**1 万轮真实 Kafka → Flink → Iceberg → Trino 对账通过；10 万轮第二次尝试已完成 100,000 条 Kafka → Flink 质量处理，但启动 Hive/Trino 后内存只余约 0.46 GiB，未提交 Iceberg writer，因此端到端未通过；全样本未启动。**没有发布 `stable-user-2pct-full`，旧 1,002 条 Doris 发布和表未删除或覆盖。试验结束后项目容器已停止，Topic、湖表、断点和卷保留。
 
 ### 本次实测
 
 | 阶段 | 结果 | 可核对证据 |
 | --- | --- | --- |
 | 10,000，`g5-a10k-01` | `PASS` | 回放确认和 raw offset 均为 10,000，G2-B lag 0；Kafka `read_committed` clean 10,000，late/DLQ 0；Trino 总数与不同 `event_id` 均为 10,000，Kafka/Trino `event_id:route` 摘要一致，五类字段违规均为 0；验收时 G2-C 已完成 29 次 Checkpoint，Iceberg 有 15 个 Snapshot。详见本机 `tmp/graduation/g5/pilot-10000.json` 与 `tmp/graduation/g2c/g5-a10k-01/verification.json`。 |
-| 100,000，`g5-a100k-01` | `BLOCKED` | 独立身份预检通过，MinIO 断点前缀为空；第一段按断点确认 50,000，raw offset 50,000、G2-B lag 0。Windows 可用物理内存最低观测约 0.61 GiB，D 盘最低观测余量约 32.59 GiB。未执行后 50,000 条，也未在停机前做该轮 Trino 表对账；两个作业已取消，不允许无状态重提写入非空表。本机报告为 `tmp/graduation/g5/pilot-100000.json`。 |
+| 100,000，`g5-a100k-01` | `BLOCKED` | 首次并行尝试只确认 50,000 条；内存降至约 0.61 GiB 后取消 G2-B/G2-C。该 run 的 writer 已提交，不能无状态重提到非空表。本机报告为 `tmp/graduation/g5/pilot-100000-attempt-01.json`。 |
+| 100,000，`g5-a100k-02` | `BLOCKED` | 新身份只读预检及 MinIO 空前缀确认后，按同一回放断点分两次发送 50,000 + 50,000。raw offset 和 G2-B 已提交 offset 均为 100,000、lag 0；Kafka `read_committed` clean 恰好 100,000、late/DLQ 0，G2-B 取消前完成 70 次 Checkpoint、失败 0。启动 Hive/Trino 后可用物理内存约 0.46 GiB，故未提交 G2-C writer，也没有 Iceberg/Trino 数量、唯一性或 Snapshot 证据。本机报告为 `tmp/graduation/g5/pilot-100000.json`。 |
 | 2,199,938，`g5-full-01` | `NOT_RUN` | 10 万轮未通过，缺少实际 `d_delta_bytes`，容量门禁不能推算；Doris/API/六模块的全样本验收与性能 P95 均未验证。 |
 
 本机 Windows 保留了宿主端口 8081、8088，试验分别使用 `FLINK_REST_PORT=8334`、`TRINO_PORT=8333`；不要改容器内部端口。现有 Hive PostgreSQL 已有 3.1.0 schema，重建 Metastore 时必须在当前 PowerShell 进程设置 `HIVE_METASTORE_IS_RESUME=true`，否则镜像会重复执行建表并退出。G2-C runner/verifier 已改为不自动重建运行中的服务；仍须在启动前核对 Compose 参数。Doris BE 默认宿主端口 8040 也落在本机保留范围，本轮未启动 Doris，后续发布前须单独处理并验证。
@@ -38,7 +39,7 @@
 
 原始 Topic offset、Flink Job/Checkpoint、clean/late/DLQ、Trino Snapshot、Doris 指标哈希、容量与浏览器截图保存在被忽略的 `tmp/graduation/g5/`，Git 只保存不含原始业务记录的汇总。业务时间是 2019 年历史事件，`replayed_at` 是本机回放时间，`calculated_at` 是指标计算时间，三者不能混用。Olist 订单域独立，不能按两源 ID 拼接；没有订单支付、退款、库存等源字段的 REES46 分析不得编造。
 
-下一次 10 万轮需使用新的 run ID，并先解决主机内存余量，再从零提交隔离作业。现有 `g5-a100k-01` 的 50,000 条及其湖表不能当作新 run 的基础，更不能用同名无状态 writer 继续追加。只有新的 10 万轮完成对账并量得真实 D 盘增量，才能判断 Docker 数据仍在 D 盘时是否足以承载 2,199,938 条；E 盘有空闲空间不会自动扩大 D 盘 Docker 数据容量。
+先解决主机内存余量，再继续入湖验收。`g5-a100k-01` 的 writer 已取消且目标可能非空，不能无状态重提；`g5-a100k-02` 从未提交 G2-C writer，其 Kafka clean 记录已完整保留，未来可在**重新只读确认目标表为空、无同名 writer 历史**后用同一 run ID 启动入湖，不得重新发送 raw。只有 10 万轮完成 Iceberg/Trino 对账并量得真实 D 盘增量，才能判断 Docker 数据仍在 D 盘时是否足以承载 2,199,938 条；E 盘有空闲空间不会自动扩大 D 盘 Docker 数据容量。
 
 ## 回归与未验证项
 
