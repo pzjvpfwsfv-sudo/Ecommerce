@@ -13,6 +13,7 @@ import { Rankings } from "./modules/Rankings";
 import { Fulfillment } from "./modules/Fulfillment";
 import { Quality } from "./modules/Quality";
 import { Knowledge } from "./modules/Knowledge";
+import { Agent } from "./modules/Agent";
 
 const moduleNames: Record<string, string> = {
   overview: "运营总览",
@@ -95,6 +96,7 @@ export default function App() {
           <Route path="/account" element={<AccountPage user={session} />} />
           <Route path="/knowledge" element={<Knowledge user={session} />} />
           <Route path="/knowledge/documents/:documentId/versions/:versionId" element={<Knowledge user={session} />} />
+          <Route path="/agent" element={<Agent user={session} />} />
           <Route path="*" element={<Navigate to="/overview" replace />} />
         </Routes>
       </Shell>

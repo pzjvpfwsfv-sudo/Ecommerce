@@ -5,12 +5,15 @@ import { EvidenceDrawer } from "../components/EvidenceDrawer";
 import { MetricFrame } from "../components/MetricFrame";
 import { fetchSameRun, getOrderDelivery, getOrderReviews, getPublication, type OrderQuery } from "../lib/api";
 import { formatCount, formatRate } from "../lib/format";
+import { metricLinkParam } from "../lib/metricNavigation";
 import { useMetricQuery } from "../lib/useMetricQuery";
 import { deliveryBandChart, formatDays, lateRateChart, reviewChart } from "./fulfillmentChart";
 
 export function Fulfillment() {
-  const [view, setView] = useState<"delivery" | "reviews">("delivery");
-  const [window, setWindow] = useState<OrderQuery["window"]>("month");
+  const [view, setView] = useState<"delivery" | "reviews">(() =>
+    metricLinkParam(globalThis.location.hash, "/fulfillment", "view", ["delivery", "reviews"] as const) ?? "delivery");
+  const [window, setWindow] = useState<OrderQuery["window"]>(() =>
+    metricLinkParam(globalThis.location.hash, "/fulfillment", "window", ["day", "month", "full"] as const) ?? "month");
   const [startDate, setStartDate] = useState("");
   const [endDate, setEndDate] = useState("");
   const [activeRange, setActiveRange] = useState<{ startDate: string; endDate: string } | null>(null);

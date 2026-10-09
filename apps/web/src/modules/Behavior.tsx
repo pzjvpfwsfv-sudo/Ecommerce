@@ -5,11 +5,13 @@ import { EvidenceDrawer } from "../components/EvidenceDrawer";
 import { MetricFrame } from "../components/MetricFrame";
 import { fetchSameRun, getBehaviorFunnel, getBehaviorOverview, getBehaviorQuality, type BehaviorQuery } from "../lib/api";
 import { formatCount, formatRate } from "../lib/format";
+import { metricLinkParam } from "../lib/metricNavigation";
 import { useMetricQuery } from "../lib/useMetricQuery";
 import { behaviorChart } from "./behaviorChart";
 
 export function Behavior() {
-  const [window, setWindow] = useState<BehaviorQuery["window"]>("full");
+  const [window, setWindow] = useState<BehaviorQuery["window"]>(() =>
+    metricLinkParam(globalThis.location.hash, "/behavior", "window", ["day", "full"] as const) ?? "full");
   const [selectedDate, setSelectedDate] = useState("");
   const [activeStage, setActiveStage] = useState("view_sessions");
   const [evidenceOpen, setEvidenceOpen] = useState(false);

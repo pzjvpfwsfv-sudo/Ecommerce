@@ -5,11 +5,13 @@ import { EvidenceDrawer } from "../components/EvidenceDrawer";
 import { MetricFrame } from "../components/MetricFrame";
 import { fetchSameRun, getOrderOverview, getOrderPayments, getPublication, type OrderQuery } from "../lib/api";
 import { formatCount, formatRate, formatValue } from "../lib/format";
+import { metricLinkParam } from "../lib/metricNavigation";
 import { useMetricQuery } from "../lib/useMetricQuery";
 import { orderStatusChart, paymentChart } from "./ordersChart";
 
 export function Orders() {
-  const [window, setWindow] = useState<OrderQuery["window"]>("month");
+  const [window, setWindow] = useState<OrderQuery["window"]>(() =>
+    metricLinkParam(globalThis.location.hash, "/orders", "window", ["day", "month", "full"] as const) ?? "month");
   const [period, setPeriod] = useState("");
   const [mode, setMode] = useState<"count" | "value">("count");
   const [evidenceOpen, setEvidenceOpen] = useState(false);

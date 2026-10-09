@@ -23,14 +23,14 @@ describe("workbench shell", () => {
     expect(screen.queryByText("99,441")).not.toBeInTheDocument();
   });
 
-  it("navigates authenticated modules and labels future AI work honestly", async () => {
+  it("navigates authenticated modules and exposes analyst AI work", async () => {
     server.use(http.get("/api/v1/auth/me", () => HttpResponse.json(admin)));
     render(<App />);
     expect(await screen.findByRole("navigation", { name: "主导航" })).toBeVisible();
     const orders = screen.getByRole("link", { name: /订单与支付/ });
     await userEvent.click(orders);
     expect(orders).toHaveAttribute("aria-current", "page");
-    expect(screen.getAllByText(/G4 待开放/).length).toBeGreaterThan(0);
+    expect(screen.getByRole("link", { name: /AI 指标分析/ })).toHaveAttribute("href", "#/agent");
   });
 
   it("makes account creation available only to administrators", async () => {
@@ -48,6 +48,7 @@ describe("workbench shell", () => {
     render(<App />);
     expect(await screen.findByText(/只读账户/)).toBeVisible();
     expect(screen.queryByRole("button", { name: "创建账户" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("link", { name: /AI 指标分析/ })).not.toBeInTheDocument();
   });
 
   it("exposes a collapsible navigation control on narrow screens", async () => {

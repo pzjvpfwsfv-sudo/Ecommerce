@@ -5,6 +5,7 @@ import { EvidenceDrawer } from "../components/EvidenceDrawer";
 import { MetricFrame } from "../components/MetricFrame";
 import { fetchSameRun, getBehaviorRankings, getOrderRankings, getPublication } from "../lib/api";
 import { formatCount, formatRate, formatValue } from "../lib/format";
+import { metricLinkParam } from "../lib/metricNavigation";
 import type { BehaviorDimension, BehaviorRankingPoint, BehaviorSort, OrderDimension, OrderRankingPoint, OrderSort } from "../lib/types";
 import { useMetricQuery } from "../lib/useMetricQuery";
 import { behaviorDimensions, behaviorSortLabels, behaviorValue, orderDimensions, orderSortLabels, orderSorts, orderValue, rankingChart, rankingName } from "./rankingOptions";
@@ -40,13 +41,16 @@ function BehaviorDetail({ row }: { row: BehaviorRankingPoint }) {
 }
 
 export function Rankings() {
-  const [domain, setDomain] = useState<Domain>("orders");
+  const [domain, setDomain] = useState<Domain>(() =>
+    metricLinkParam(globalThis.location.hash, "/rankings", "source", ["orders", "behavior"] as const) ?? "orders");
   const [orderDimension, setOrderDimension] = useState<OrderDimension>("product");
   const [orderSort, setOrderSort] = useState<OrderSort>("order_count");
-  const [orderWindow, setOrderWindow] = useState<"day" | "month" | "full">("full");
+  const [orderWindow, setOrderWindow] = useState<"day" | "month" | "full">(() =>
+    metricLinkParam(globalThis.location.hash, "/rankings", "window", ["day", "month", "full"] as const) ?? "full");
   const [behaviorDimension, setBehaviorDimension] = useState<BehaviorDimension>("product");
   const [behaviorSort, setBehaviorSort] = useState<BehaviorSort>("views");
-  const [behaviorWindow, setBehaviorWindow] = useState<"day" | "full">("full");
+  const [behaviorWindow, setBehaviorWindow] = useState<"day" | "full">(() =>
+    metricLinkParam(globalThis.location.hash, "/rankings", "window", ["day", "full"] as const) ?? "full");
   const [limit, setLimit] = useState(20);
   const [period, setPeriod] = useState("");
   const [selectedId, setSelectedId] = useState("");

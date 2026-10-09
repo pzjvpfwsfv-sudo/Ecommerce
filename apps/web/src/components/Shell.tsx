@@ -11,6 +11,7 @@ const navigation = [
   ["/fulfillment", "履约与评价", "05"],
   ["/quality", "数据质量", "06"],
   ["/knowledge", "知识库检索", "07"],
+  ["/agent", "AI 指标分析", "08"],
 ] as const;
 
 const roleNames = { admin: "管理员", analyst: "分析员", viewer: "只读用户" };
@@ -42,7 +43,7 @@ export function Shell({ user, onLogout, children }: {
         >{mobileOpen ? "收起菜单" : "浏览模块"}</button>
         <nav id="main-navigation" aria-label="主导航" className={mobileOpen ? "nav nav--open" : "nav"}>
           <span className="nav-caption">WORKSPACE / 工作区</span>
-          {navigation.map(([path, label, number]) => (
+          {navigation.filter(([path]) => path !== "/agent" || user.role !== "viewer").map(([path, label, number]) => (
             <NavLink
               key={path}
               to={path}
@@ -50,8 +51,6 @@ export function Shell({ user, onLogout, children }: {
               onClick={() => setMobileOpen(false)}
             ><span aria-hidden="true">{number}</span>{label}</NavLink>
           ))}
-          <span className="nav-caption nav-caption--future">NEXT / 后续阶段</span>
-          <div className="nav-future" aria-disabled="true">AI 指标分析 <small>G4 待开放</small></div>
         </nav>
         <div className="sidebar-foot">
           <span className="status-dot" aria-hidden="true" />
