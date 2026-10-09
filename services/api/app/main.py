@@ -16,6 +16,10 @@ from app.analysis_service import (
     AnalysisUnavailableError,
     RealtimeDataUnavailableError,
 )
+from app.agent_api import create_agent_router
+from app.agent_provider import build_model
+from app.agent_service import AgentService
+from app.agent_store import AgentStore
 from app.auth_api import router as auth_router
 from app.auth_service import AuthService, require_analyst, require_csrf, require_principal
 from app.auth_store import AuthStore
@@ -76,6 +80,8 @@ def create_app(
     knowledge_store: KnowledgeStore | Any | None = None,
     knowledge_search: KnowledgeSearchService | Any | None = None,
     knowledge_embedder: Embedder | Any | None = None,
+    agent_service: AgentService | Any | None = None,
+    agent_store: AgentStore | Any | None = None,
 ) -> FastAPI:
     settings = settings or load_settings()
     if settings.web_dist_dir is not None and not (settings.web_dist_dir / "index.html").is_file():
@@ -98,6 +104,13 @@ def create_app(
     knowledge_store = knowledge_store or KnowledgeStore(settings)
     knowledge_embedder = knowledge_embedder or Embedder()
     knowledge_search = knowledge_search or KnowledgeSearchService(knowledge_store, knowledge_embedder)
+    if agent_service is None:
+        agent_service = AgentService(
+            model=build_model(settings.g4_agent), knowledge=knowledge_search,
+            behavior=behavior_service, orders=order_service,
+            model_name=settings.g4_agent.model if settings.g4_agent.provider != "off" else None,
+        )
+    agent_store = agent_store or AgentStore(settings, knowledge_store, behavior_service, order_service)
     tool_analysis_service_closed = False
     tool_analysis_service_close_lock = Lock()
 
@@ -116,6 +129,7 @@ def create_app(
     app.state.auth_service = auth_service
     app.include_router(auth_router)
     app.include_router(create_knowledge_router(settings, knowledge_store, knowledge_search, knowledge_embedder))
+    app.include_router(create_agent_router(agent_service, agent_store))
 
     def behavior_response(stage: str, operation: Callable[[], Any]) -> Any:
         try:
