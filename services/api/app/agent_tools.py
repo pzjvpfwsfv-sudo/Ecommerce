@@ -2,13 +2,14 @@ from __future__ import annotations
 
 from datetime import date
 import json
+from time import perf_counter
 from typing import Annotated, Any, Literal, Self
 from uuid import uuid4
 
 from langchain_core.tools import BaseTool, StructuredTool
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
 
-from app.agent_models import ToolBudget, ToolEvidence
+from app.agent_models import ToolBudget, ToolEvidence, ToolTrace
 from app.auth_service import Principal
 from app.behavior_service import BehaviorMetricsService
 from app.knowledge_search import KnowledgeSearchService
@@ -201,6 +202,23 @@ def build_tools(
     if principal.role not in {"admin", "analyst"}:
         raise PermissionError("agent tools require analyst or admin")
 
+    def traced(name: str, operation):
+        def invoke(**kwargs: Any) -> str:
+            started = perf_counter()
+            try:
+                result = operation(**kwargs)
+            except Exception:
+                budget.record_trace(ToolTrace(
+                    name=name, status="error", elapsed_ms=(perf_counter() - started) * 1000,
+                ))
+                raise
+            budget.record_trace(ToolTrace(
+                name=name, status="ok", elapsed_ms=(perf_counter() - started) * 1000,
+                evidence_ids=[item["evidence_id"] for item in json.loads(result)],
+            ))
+            return result
+        return invoke
+
     def search_knowledge(**kwargs: Any) -> str:
         args = SearchKnowledgeArgs.model_validate(kwargs)
         budget.consume()
@@ -263,17 +281,19 @@ def build_tools(
 
     return [
         StructuredTool.from_function(
-            func=search_knowledge, name="search_knowledge",
+            func=traced("search_knowledge", search_knowledge), name="search_knowledge",
             description="Search up to five authorized published knowledge excerpts for a question.",
             args_schema=SearchKnowledgeArgs,
         ),
         StructuredTool.from_function(
-            func=get_behavior, name="get_published_behavior_metrics",
+            func=traced("get_published_behavior_metrics", get_behavior),
+            name="get_published_behavior_metrics",
             description="Read published REES46 aggregate behavior metrics; no row-level events or SQL.",
             args_schema=BehaviorMetricsArgs,
         ),
         StructuredTool.from_function(
-            func=get_orders, name="get_published_order_metrics",
+            func=traced("get_published_order_metrics", get_orders),
+            name="get_published_order_metrics",
             description="Read published Olist aggregate order metrics; no row-level orders or SQL.",
             args_schema=OrderMetricsArgs,
         ),
