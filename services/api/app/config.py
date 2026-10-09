@@ -1,7 +1,7 @@
 ﻿from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from os import environ as os_environ
 from pathlib import Path
 
@@ -13,6 +13,7 @@ _DEFAULT_BEHAVIOR_METRIC_DEFINITIONS_PATH = (
 _DEFAULT_ORDER_METRIC_DEFINITIONS_PATH = (
     _CONFIG_PATH.parent.parent / "configs" / "metrics" / "orders-v1.json"
 )
+_G4_DEFAULT_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 for _parent in _CONFIG_PATH.parents:
     _metrics = _parent / "configs" / "metrics"
     _behavior_candidate = _metrics / "behavior-v1.json"
@@ -23,6 +24,26 @@ for _parent in _CONFIG_PATH.parents:
         _DEFAULT_ORDER_METRIC_DEFINITIONS_PATH = _order_candidate
     if _behavior_candidate.is_file() and _order_candidate.is_file():
         break
+
+
+@dataclass(frozen=True)
+class AgentProviderSettings:
+    provider: str = "off"
+    base_url: str = _G4_DEFAULT_BASE_URL
+    model: str = "qwen-plus"
+    api_key: str = field(default="", repr=False)
+    timeout_seconds: float = 30
+
+
+def load_agent_provider_settings(environ: Mapping[str, str] | None = None) -> AgentProviderSettings:
+    values = os_environ if environ is None else environ
+    return AgentProviderSettings(
+        provider=values.get("G4_AGENT_PROVIDER", "off"),
+        base_url=values.get("G4_AGENT_BASE_URL", _G4_DEFAULT_BASE_URL),
+        model=values.get("G4_AGENT_MODEL", "qwen-plus"),
+        api_key=values.get("G4_AGENT_API_KEY", ""),
+        timeout_seconds=float(values.get("G4_AGENT_TIMEOUT_SECONDS", "30")),
+    )
 
 
 @dataclass(frozen=True)
@@ -48,6 +69,7 @@ class ApiSettings:
     ai_model: str = ""
     ai_request_timeout_seconds: float = 15
     ai_max_question_length: int = 500
+    g4_agent: AgentProviderSettings = field(default_factory=AgentProviderSettings)
     flink_rest_url: str = "http://flink-jobmanager:8081"
     chapter9_production_job_name: str = "chapter-9-datastream-quality-production"
     flink_checkpoint_max_age_seconds: int = 120
@@ -119,6 +141,7 @@ def load_settings(environ: Mapping[str, str] | None = None) -> ApiSettings:
         ai_model=values.get("AI_MODEL", ""),
         ai_request_timeout_seconds=float(values.get("AI_REQUEST_TIMEOUT_SECONDS", "15")),
         ai_max_question_length=int(values.get("AI_MAX_QUESTION_LENGTH", "500")),
+        g4_agent=load_agent_provider_settings(values),
         flink_rest_url=values.get("FLINK_REST_URL", "http://flink-jobmanager:8081"),
         chapter9_production_job_name=values.get(
             "CHAPTER9_PRODUCTION_JOB_NAME", "chapter-9-datastream-quality-production"
