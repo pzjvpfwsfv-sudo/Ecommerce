@@ -33,6 +33,7 @@ from tests.test_order_metrics_api import make_order_service  # noqa: E402
 class ScriptedModel(BaseChatModel):
     tool_batches: list[list[dict]] = Field(default_factory=list)
     final_mode: str = "valid"
+    report_usage: bool = False
     calls: int = 0
     received: list[BaseMessage] = Field(default_factory=list, exclude=True)
     bound_tool_names: list[str] = Field(default_factory=list, exclude=True)
@@ -48,6 +49,10 @@ class ScriptedModel(BaseChatModel):
     def _generate(self, messages, stop=None, run_manager=None, **kwargs):
         self.calls += 1
         self.received = list(messages)
+        metadata = ({
+            "usage_metadata": {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+            "response_metadata": {"eval_duration": 8_000_000},
+        } if self.report_usage else {})
         if self.final_mode == "error":
             raise RuntimeError("internal-secret-should-not-leak")
         if self.final_mode == "repeat" and self.calls > len(self.tool_batches):
@@ -60,7 +65,7 @@ class ScriptedModel(BaseChatModel):
             message = AIMessage(content="", tool_calls=[
                 {"name": call["name"], "args": call["args"], "id": f"call-{self.calls}-{index}"}
                 for index, call in enumerate(batch)
-            ])
+            ], **metadata)
         else:
             evidence_ids = []
             for item in messages:
@@ -81,7 +86,7 @@ class ScriptedModel(BaseChatModel):
             )
             message = AIMessage(content=json.dumps({
                 "insights": [{"text": text, "evidence_ids": evidence_ids}],
-            }, ensure_ascii=False))
+            }, ensure_ascii=False), **metadata)
         return ChatResult(generations=[ChatGeneration(message=message)])
 
 
@@ -163,6 +168,31 @@ class G4AgentServiceTest(unittest.TestCase):
         self.assertEqual(answer.insights[0].evidence_ids, [answer.evidence[0].evidence_id])
         self.assertEqual(answer.trace[0].name, "search_knowledge")
         self.assertGreaterEqual(answer.trace[0].elapsed_ms, 0)
+
+    def test_model_usage_aggregates_only_reported_provider_metadata(self):
+        model = ScriptedModel(report_usage=True, tool_batches=[[
+            {"name": "search_knowledge", "args": {"query": "指标口径"}},
+        ]])
+        answer = self.service(model).ask("指标口径是什么？", self.principal, [])
+        self.assertEqual(answer.status, "answered")
+        self.assertEqual(answer.usage.input_tokens, 20)
+        self.assertEqual(answer.usage.output_tokens, 10)
+        self.assertEqual(answer.usage.generation_ms, 16)
+        self.assertIsNone(self.service(ScriptedModel(tool_batches=[[
+            {"name": "search_knowledge", "args": {"query": "指标口径"}},
+        ]])).ask("指标口径是什么？", self.principal, []).usage)
+
+    def test_model_usage_excludes_history_assistant_messages(self):
+        model = ScriptedModel(report_usage=True, tool_batches=[[
+            {"name": "search_knowledge", "args": {"query": "指标口径"}},
+        ]])
+        answer = self.service(model).ask(
+            "指标口径是什么？", self.principal,
+            [ConversationTurn(question="上一个问题", summary="旧回答摘要")],
+        )
+        self.assertEqual(answer.status, "answered")
+        self.assertEqual(answer.usage.input_tokens, 20)
+        self.assertEqual(answer.usage.output_tokens, 10)
 
     def test_subset_behavior_stays_evidence_only_while_orders_can_be_answered(self):
         model = ScriptedModel(tool_batches=[[{

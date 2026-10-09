@@ -13,7 +13,7 @@ from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, ToolMessage
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from app.agent_models import AgentAnswer, Insight, ToolBudget
+from app.agent_models import AgentAnswer, AgentUsage, Insight, ToolBudget
 from app.agent_tools import build_tools
 from app.auth_service import Principal
 from app.behavior_service import BehaviorMetricsService
@@ -85,6 +85,27 @@ class _ModelOutput(BaseModel):
 
 class _BehaviorScopeNotFullError(ValueError):
     pass
+
+
+def _measured_model_usage(state: Any, initial_message_count: int) -> AgentUsage | None:
+    messages = [item for item in state["messages"][initial_message_count:]
+                if isinstance(item, AIMessage)]
+    if not messages:
+        return None
+    input_tokens = output_tokens = duration_ns = 0
+    for message in messages:
+        usage = message.usage_metadata or {}
+        values = (usage.get("input_tokens"), usage.get("output_tokens"),
+                  message.response_metadata.get("eval_duration"))
+        if any(type(value) is not int or value < 0 for value in values):
+            return None
+        input_tokens += values[0]
+        output_tokens += values[1]
+        duration_ns += values[2]
+    return AgentUsage(
+        input_tokens=input_tokens, output_tokens=output_tokens,
+        generation_ms=round(duration_ns / 1_000_000, 3),
+    )
 
 
 class AgentService:
@@ -167,6 +188,7 @@ class AgentService:
         return AgentAnswer(
             status="answered", insights=insights, evidence=list(budget.evidence),
             trace=list(budget.trace), model_name=self.model_name,
+            usage=_measured_model_usage(state, len(messages)),
         )
 
     def _validate_model_result(self, state: Any, budget: ToolBudget) -> list[Insight]:

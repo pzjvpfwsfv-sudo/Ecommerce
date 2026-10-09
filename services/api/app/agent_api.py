@@ -61,7 +61,7 @@ def create_agent_router(service: AgentService, store: AgentStore) -> APIRouter:
             history = store.last_turns(principal.id)
             answer = service.ask(question, principal, history, template_id=body.template_id)
             answer_id = store.save_answer(principal.id, answer, question=question)
-            return {"answer_id": answer_id, "answer": answer}
+            return {"answer_id": answer_id, "answer": answer, "usage": answer.usage}
         return _run(perform)
 
     @router.get("/reports")

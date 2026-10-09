@@ -106,6 +106,19 @@ class G4AgentApiTest(unittest.TestCase):
         self.assertEqual(self.service.ask.call_args.kwargs["template_id"], "orders_payments")
         self.assertEqual(str(next(iter(self.store.answers))), answer_id)
 
+    def test_ask_exposes_only_measured_usage(self):
+        headers = self.login("analyst")
+        self.service.ask.return_value = AgentAnswer(
+            status="answered", usage={"input_tokens": 20, "output_tokens": 10,
+                                      "generation_ms": 16},
+        )
+        response = self.client.post("/api/v1/agent/ask", headers=headers,
+                                    json={"question": "订单口径？"})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["usage"], {
+            "input_tokens": 20, "output_tokens": 10, "generation_ms": 16.0,
+        })
+
     def test_report_accepts_only_owned_answer_id_and_hides_other_users(self):
         analyst_headers = self.login("analyst")
         ask = self.client.post("/api/v1/agent/ask", headers=analyst_headers,

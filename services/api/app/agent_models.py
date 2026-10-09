@@ -35,6 +35,14 @@ class Insight(BaseModel):
     evidence_ids: list[str] = Field(min_length=1, max_length=5)
 
 
+class AgentUsage(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    input_tokens: int = Field(ge=0)
+    output_tokens: int = Field(ge=0)
+    generation_ms: float = Field(ge=0)
+
+
 class AgentAnswer(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -43,6 +51,7 @@ class AgentAnswer(BaseModel):
     evidence: list[ToolEvidence] = Field(default_factory=list)
     trace: list[ToolTrace] = Field(default_factory=list)
     model_name: str | None = None
+    usage: AgentUsage | None = None
     retrieval_version: str = "g4-a-hybrid-v1"
     fallback_reason: str | None = None
     fallback_summary: str | None = None
