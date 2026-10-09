@@ -30,6 +30,20 @@ class G4KnowledgeSearchUnitTest(unittest.TestCase):
         self.assertLessEqual(len([row for row in ranked if row["document_id"] == "doc-1"]), 2)
         self.assertEqual(len({row["chunk_id"] for row in ranked}), len(ranked))
 
+    def test_rrf_ties_use_source_and_ordinal_not_random_chunk_ids(self):
+        by_source = [
+            {"chunk_id": "0000", "document_id": "doc-b", "source_ref": "z.md", "ordinal": 0},
+            {"chunk_id": "ffff", "document_id": "doc-a", "source_ref": "a.md", "ordinal": 0},
+        ]
+        ranked = reciprocal_rank_fusion(by_source, list(reversed(by_source)), limit=5)
+        self.assertEqual([row["chunk_id"] for row in ranked], ["ffff", "0000"])
+        by_ordinal = [
+            {"chunk_id": "0000", "document_id": "doc-a", "source_ref": "a.md", "ordinal": 1},
+            {"chunk_id": "ffff", "document_id": "doc-a", "source_ref": "a.md", "ordinal": 0},
+        ]
+        ranked = reciprocal_rank_fusion(by_ordinal, list(reversed(by_ordinal)), limit=5)
+        self.assertEqual([row["chunk_id"] for row in ranked], ["ffff", "0000"])
+
     def test_database_error_is_not_disguised_as_keyword_fallback(self):
         class BrokenStore:
             def _connect(self):
@@ -42,6 +56,36 @@ class G4KnowledgeSearchUnitTest(unittest.TestCase):
         principal = Principal(1, "viewer", "viewer", "csrf")
         with self.assertRaisesRegex(RuntimeError, "database unavailable"):
             KnowledgeSearchService(BrokenStore(), MissingEmbedder()).search("订单口径", principal)
+
+    def test_keyword_route_does_not_embed_and_vector_route_fails_without_model(self):
+        class EmptyConnection:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                return None
+
+            def execute(self, *_):
+                return self
+
+            def fetchall(self):
+                return []
+
+        class EmptyStore:
+            def _connect(self):
+                return EmptyConnection()
+
+        class MissingEmbedder:
+            def embed_many(self, texts):
+                raise EmbeddingUnavailable("cache missing")
+
+        search = KnowledgeSearchService(EmptyStore(), MissingEmbedder())
+        principal = Principal(1, "viewer", "viewer", "csrf")
+        self.assertEqual(search.search("订单口径", principal, route="keyword").mode, "keyword_only")
+        with self.assertRaises(EmbeddingUnavailable):
+            search.search("订单口径", principal, route="vector")
+        with self.assertRaisesRegex(ValueError, "unsupported search route"):
+            search.search("订单口径", principal, route="unknown")
 
 
 @unittest.skipUnless(os.environ.get("G4_TEST_DB_PASSWORD"), "isolated G4 PostgreSQL is not configured")

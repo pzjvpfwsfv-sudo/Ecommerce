@@ -18,7 +18,7 @@ _VISIBLE_CHUNKS = (
 )
 _COLUMNS = (
     "SELECT c.id AS chunk_id, d.id AS document_id, v.id AS version_id, "
-    "c.section, c.page, c.content, d.source_type, d.source_ref, "
+    "c.ordinal, c.section, c.page, c.content, d.source_type, d.source_ref, "
 )
 
 
@@ -33,7 +33,12 @@ def reciprocal_rank_fusion(
                 fused[key] = {**candidate, "keyword_rank": None, "vector_rank": None, "score": 0.0}
             fused[key][label] = rank
             fused[key]["score"] += 1.0 / (60 + rank)
-    ranked = sorted(fused.values(), key=lambda row: (-row["score"], str(row["chunk_id"])))
+    ranked = sorted(
+        fused.values(),
+        key=lambda row: (
+            -row["score"], row.get("source_ref", ""), row.get("ordinal", 0), str(row["chunk_id"]),
+        ),
+    )
     chosen: list[dict] = []
     counts: dict[object, int] = {}
     for row in ranked:
@@ -52,18 +57,26 @@ class KnowledgeSearchService:
         self.store = store
         self.embedder = embedder or Embedder()
 
-    def search(self, query: str, principal: Principal, limit: int = 5) -> SearchResult:
+    def search(
+        self, query: str, principal: Principal, limit: int = 5,
+        *, route: str = "hybrid",
+    ) -> SearchResult:
         started = perf_counter()
         query = query.strip()
         if not query or len(query) > 500 or not 1 <= limit <= 5:
             raise ValueError("query must have 1-500 characters and limit must be 1-5")
+        if route not in {"hybrid", "keyword", "vector"}:
+            raise ValueError("unsupported search route")
         if principal.role not in {"admin", "analyst", "viewer"}:
             raise ValueError("invalid role")
-        terms = list(_terms(query))
-        try:
-            vector = self.embedder.embed_many([query])[0]
-        except EmbeddingUnavailable:
-            vector = None
+        terms = list(_terms(query)) if route != "vector" else []
+        vector = None
+        if route != "keyword":
+            try:
+                vector = self.embedder.embed_many([query])[0]
+            except EmbeddingUnavailable:
+                if route == "vector":
+                    raise
         if vector is not None and (len(vector) != 512 or not all(math.isfinite(v) for v in vector)):
             raise ValueError("query embedding must have 512 finite values")
 
@@ -73,7 +86,7 @@ class KnowledgeSearchService:
                     _COLUMNS +
                     "(SELECT count(*) FROM unnest(c.terms) t WHERE t = ANY(%s::text[])) AS overlap " +
                     _VISIBLE_CHUNKS + "AND c.terms && %s::text[] "
-                    "ORDER BY overlap DESC, c.id LIMIT 20",
+                    "ORDER BY overlap DESC, d.source_ref, c.ordinal, c.id LIMIT 20",
                     (terms, principal.role, terms),
                 ).fetchall()
             else:
@@ -84,7 +97,7 @@ class KnowledgeSearchService:
                 vector_literal = "[" + ",".join(str(value) for value in vector) + "]"
                 nearest = connection.execute(
                     _COLUMNS + "c.embedding <=> %s::vector AS distance " +
-                    _VISIBLE_CHUNKS + "ORDER BY distance, c.id LIMIT 20",
+                    _VISIBLE_CHUNKS + "ORDER BY distance, d.source_ref, c.ordinal, c.id LIMIT 20",
                     (vector_literal, principal.role),
                 ).fetchall()
 
@@ -97,6 +110,7 @@ class KnowledgeSearchService:
             locator=f"/knowledge/documents/{row['document_id']}/versions/{row['version_id']}#chunk-{row['chunk_id']}",
         ) for row in reciprocal_rank_fusion(keyword, nearest, limit)]
         return SearchResult(
-            hits=hits, mode="hybrid" if vector is not None else "keyword_only",
+            hits=hits, mode=("vector_only" if route == "vector" else
+                            "hybrid" if vector is not None else "keyword_only"),
             elapsed_ms=(perf_counter() - started) * 1000,
         )

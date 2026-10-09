@@ -149,5 +149,5 @@ class KnowledgeHit:
 @dataclass(frozen=True)
 class SearchResult:
     hits: list[KnowledgeHit]
-    mode: Literal["hybrid", "keyword_only"]
+    mode: Literal["hybrid", "keyword_only", "vector_only"]
     elapsed_ms: float
