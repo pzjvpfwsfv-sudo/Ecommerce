@@ -245,6 +245,37 @@ class RealDataReplayTest(unittest.TestCase):
         self.assertEqual(before, self.checkpoint.read_bytes())
         self.assertEqual([], list(self.root.glob("*.part")))
 
+    def test_transient_checkpoint_replace_permission_error_is_retried(self):
+        from generators.real_data.replay_state import os
+        self.run_replay(max_events=1)
+        replace = os.replace
+        attempts = 0
+
+        def replace_after_one_lock(source, target):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise PermissionError("test-only temporary file lock")
+            replace(source, target)
+
+        with patch("generators.real_data.replay_state.os.replace", side_effect=replace_after_one_lock), \
+                patch("generators.real_data.replay_state.time.sleep"):
+            self.run_replay(max_events=1, checkpoint_every=99)
+        self.assertEqual(2, attempts)
+        self.assertEqual(2, self.state()["confirmed_records"])
+        self.assertEqual([], list(self.root.glob("*.part")))
+
+    def test_persistent_checkpoint_replace_permission_error_preserves_progress(self):
+        self.run_replay(max_events=2)
+        before = self.checkpoint.read_bytes()
+        with patch("generators.real_data.replay_state.os.replace", side_effect=PermissionError("test-only persistent lock")) as replace, \
+                patch("generators.real_data.replay_state.time.sleep"):
+            with self.assertRaises(PermissionError):
+                self.run_replay(max_events=1)
+        self.assertEqual(5, replace.call_count)
+        self.assertEqual(before, self.checkpoint.read_bytes())
+        self.assertEqual([], list(self.root.glob("*.part")))
+
     def test_cli_defaults_to_dry_run_and_returns_nonzero_for_errors(self):
         with patch("generators.real_data.replay_kafka.ReplayKafkaSink", side_effect=AssertionError("must stay offline")):
             self.assertEqual(0, self.module.main(["--input", str(self.input), "--checkpoint", str(self.checkpoint), "--rate", "10000", "--max-events", "2"]))

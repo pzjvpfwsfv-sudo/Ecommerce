@@ -3,6 +3,7 @@ import json
 import os
 from pathlib import Path
 import tempfile
+import time
 from uuid import UUID, uuid4
 
 from .replay_source import read_metadata
@@ -46,7 +47,14 @@ def save_checkpoint(path, state):
             stream.write("\n")
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(temporary, path)
+        for attempt in range(5):
+            try:
+                os.replace(temporary, path)
+                break
+            except PermissionError:
+                if attempt == 4:
+                    raise
+                time.sleep(0.05 * (attempt + 1))
     finally:
         if temporary is not None:
             temporary.unlink(missing_ok=True)

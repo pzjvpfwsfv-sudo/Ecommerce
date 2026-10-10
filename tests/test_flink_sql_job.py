@@ -82,6 +82,7 @@ class FlinkSqlArtifactsTest(unittest.TestCase):
         self.assertIn("flink-sql-client:", text)
         self.assertIn("FLINK_PROPERTIES", text)
         self.assertIn("rest.address: flink-jobmanager", text)
+        self.assertIn("taskmanager.memory.process.size: ${FLINK_TASKMANAGER_PROCESS_MEMORY:-1728m}", text)
         self.assertIn("/workspace", text)
         self.assertIn("flink-sql-connector-kafka-3.3.0-1.19.jar", text)
         self.assertEqual(
