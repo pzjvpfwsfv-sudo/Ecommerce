@@ -1,5 +1,6 @@
 import sys
 import os
+import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
@@ -108,6 +109,20 @@ class FakeSearch:
 
 
 class G4KnowledgeApiTest(unittest.TestCase):
+    def test_project_root_resolves_shallow_container_layout(self):
+        try:
+            from app.knowledge_api import _find_project_root
+        except ImportError as exc:
+            self.fail(f"knowledge source root resolver is missing: {exc}")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "app"
+            source = root / "app" / "knowledge_api.py"
+            source.parent.mkdir(parents=True)
+            manifest = root / "configs" / "knowledge" / "g4_sources.json"
+            manifest.parent.mkdir(parents=True)
+            manifest.touch()
+            self.assertTrue(root.samefile(_find_project_root(source)))
+
     def setUp(self):
         auth_store = MemoryAuthStore()
         auth_store.create_user("admin", hash_password("admin-password"), "admin")

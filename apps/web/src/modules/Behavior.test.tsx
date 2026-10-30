@@ -6,7 +6,8 @@ import { beforeEach, expect, it, vi } from "vitest";
 import { Behavior } from "./Behavior";
 import { server } from "../test/handlers";
 
-vi.mock("../components/Chart", () => ({ Chart: ({ label }: { label: string }) => <div role="img" aria-label={label} /> }));
+vi.mock("../components/Chart", () => ({ Chart: ({ label, option }: { label: string; option: { xAxis: { data: string[] } } }) =>
+  <div role="img" aria-label={label} data-window-count={option.xAxis.data.length} /> }));
 
 const meta = {
   dataset_id: "rees46-multicategory", metric_version: "behavior-v1",
@@ -46,6 +47,29 @@ it("shows the correctness subset, missing sessions, and non-applicable rates", a
   expect(screen.getByText(/缺失会话/)).toBeVisible();
   expect(screen.getAllByText(/不适用/).length).toBeGreaterThan(0);
   expect(screen.queryByRole("option", { name: "按月" })).not.toBeInTheDocument();
+});
+
+it("shows daily trend points while keeping the full-window funnel", async () => {
+  let dailyRequests = 0;
+  server.use(http.get("/api/v1/behavior/overview", ({ request }) => {
+    if (new URL(request.url).searchParams.get("window") === "day") {
+      dailyRequests += 1;
+      return HttpResponse.json({ meta, data: [
+        { window_start: "2019-10-01", view_count: 10, purchase_count: 2 },
+        { window_start: "2019-10-02", view_count: 12, purchase_count: 3 },
+      ] });
+    }
+    return HttpResponse.json({ meta, data: [{
+      window_type: "FULL", window_start: "2019-10-01", window_end: "2019-11-30",
+      event_count: 1002, view_count: 800, cart_count: 100, purchase_count: 20,
+      unique_user_count: 80, session_count: 90, product_count: 60, purchase_amount_proxy: null,
+    }] });
+  }));
+  render(<Behavior />);
+  expect(await screen.findByRole("img", { name: "浏览与购买事件时间趋势" })).toHaveAttribute("data-window-count", "2");
+  expect(screen.getByText(/1,002 条来源事件/)).toBeVisible();
+  expect(screen.getByText(/完整链路转化率/)).toBeVisible();
+  expect(dailyRequests).toBe(1);
 });
 
 it("selects a stage and opens its real metric definition", async () => {

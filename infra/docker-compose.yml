@@ -117,7 +117,7 @@ services:
       - ../configs/metrics:/app/configs/metrics:ro
       - ../configs/knowledge:/app/configs/knowledge:ro
       - ../docs/graduation:/app/docs/graduation:ro
-      - ../scripts/bootstrap_g3_admin.py:/app/scripts/bootstrap_g3_admin.py:ro
+      - ../scripts/bootstrap_g3_admin.py:/opt/bootstrap_g3_admin.py:ro
       - ../apps/web/dist:/web:ro
       - type: bind
         source: ${G4_EMBED_CACHE_HOST_DIR:-D:/EcommerceDev/cache/fastembed}

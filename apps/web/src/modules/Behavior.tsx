@@ -20,11 +20,15 @@ export function Behavior() {
       getBehaviorOverview({ window, signal }), getBehaviorFunnel({ window, signal }),
     );
     const [, quality] = await fetchSameRun(Promise.resolve(overview), getBehaviorQuality(signal));
-    return { overview, funnel, quality };
+    const trend = window === "full"
+      ? (await fetchSameRun(Promise.resolve(overview), getBehaviorOverview({ window: "day", signal })))[1]
+      : overview;
+    return { overview, funnel, quality, trend };
   }, window);
   const overview = state.data?.overview;
   const funnel = state.data?.funnel;
   const quality = state.data?.quality;
+  const trend = state.data?.trend;
   const point = funnel?.data.find((row) => row.window_start === selectedDate) ?? funnel?.data[0];
   const stages = point ? [
     { metric: "view_sessions", label: "浏览会话", count: point.view_sessions, rate: null,
@@ -43,8 +47,8 @@ export function Behavior() {
           <option value="full">全量</option><option value="day">按日</option>
         </select></div></div>
     <MetricFrame title="REES46 行为与转化" meta={overview?.meta} loading={state.loading} error={state.error}
-      empty={!!overview && (overview.data.length === 0 || funnel?.data.length === 0)} retry={state.retry} onEvidence={overview ? () => setEvidenceOpen(true) : undefined}>
-      {overview && funnel && quality && <>
+      empty={!!overview && (overview.data.length === 0 || funnel?.data.length === 0 || trend?.data.length === 0)} retry={state.retry} onEvidence={overview ? () => setEvidenceOpen(true) : undefined}>
+      {overview && funnel && quality && trend && <>
         <div className="subset-banner"><div><span className="eyebrow">DATA SCOPE / 数据范围</span><strong>{overview.meta.data_scope === "g2c-correctness-subset" ? "正确性子集" : "稳定用户 2% 全量样本"}</strong>
           <p>历史回放 · {formatCount(overview.meta.source_event_count)} 条来源事件；按本次发布的数据范围解读，不代表企业实时生产规模。</p></div>
           <small>{overview.meta.warnings.join("；")}</small></div>
@@ -59,9 +63,9 @@ export function Behavior() {
           </button>)}</div>
           <p className="missing-note">当前窗口缺失会话标识事件 {formatCount(point?.missing_session_event_count ?? 0)} 条；全量质量表缺失会话 {formatCount(quality.data.missing_session_count)} 条。</p>
           {point && <p className="full-rate">完整链路转化率 {formatRate(point.full_conversion_rate, point.completed_sessions, point.view_sessions)}</p>}
-        </section><section className="surface-panel"><div className="panel-heading"><h3>事件走势</h3><span>不据此推导会话转化</span></div>
-          <Chart label="浏览与购买事件时间趋势" option={behaviorChart(overview.data)} fallback={<table><thead><tr><th>窗口</th><th>浏览事件</th><th>购买事件</th></tr></thead>
-            <tbody>{overview.data.map((row) => <tr key={row.window_start}><td>{row.window_start}</td><td>{formatCount(row.view_count)}</td><td>{formatCount(row.purchase_count)}</td></tr>)}</tbody></table>} />
+        </section><section className="surface-panel"><div className="panel-heading"><h3>按日事件走势</h3><span>不据此推导会话转化</span></div>
+          <Chart label="浏览与购买事件时间趋势" option={behaviorChart(trend.data)} fallback={<table><thead><tr><th>日期</th><th>浏览事件</th><th>购买事件</th></tr></thead>
+            <tbody>{trend.data.map((row) => <tr key={row.window_start}><td>{row.window_start}</td><td>{formatCount(row.view_count)}</td><td>{formatCount(row.purchase_count)}</td></tr>)}</tbody></table>} />
           <div className="behavior-quality-strip"><span>全量质量表 · 来源事件 {formatCount(quality.data.source_event_count)}</span>
             <span>清洗后 {formatCount(quality.data.clean_event_count)}</span><span>晚到 {formatCount(quality.data.late_event_count)}</span></div>
         </section></div>

@@ -23,7 +23,7 @@ API 容器正常启动后，在同一终端交互输入一次性管理员账号�
 $env:APP_ADMIN_USERNAME = Read-Host 'APP_ADMIN_USERNAME'
 $adminSecret = Read-Host 'APP_ADMIN_PASSWORD (至少 12 位)' -AsSecureString
 $env:APP_ADMIN_PASSWORD = [System.Net.NetworkCredential]::new('', $adminSecret).Password
-docker exec -e APP_ADMIN_USERNAME -e APP_ADMIN_PASSWORD ecom-api python /app/scripts/bootstrap_g3_admin.py
+docker exec -e APP_ADMIN_USERNAME -e APP_ADMIN_PASSWORD -e PYTHONPATH=/app ecom-api python /opt/bootstrap_g3_admin.py
 $LASTEXITCODE
 Remove-Item Env:APP_ADMIN_PASSWORD
 ```
@@ -42,4 +42,4 @@ Remove-Item Env:APP_ADMIN_PASSWORD
 
 - 离线 `tests.test_g3_auth_api` 通过 16 项；完整回归通过 688 项、跳过 1 项；Compose `config --quiet` 通过。
 - 另起 `g3-auth-verify` Compose 项目和独立 `app-postgres-data` 卷，仅向 `127.0.0.1:15432` 开放测试端口；没有重启现有 `ecom-api`、Metastore 或 Doris。真实 PostgreSQL 中确认三张表、管理员重复初始化、生产默认 `create_app(settings=...)` 装配、登录与 401/403、CSRF、注销后会话撤销、数据库仅保存会话摘要。主动停止**这个隔离库**后，登录和已登录指标请求均返回 503，之后恢复并停止测试容器；测试卷保留，未删除。
-- 这不是现有 `ecom-api` 容器的端到端 HTTP 验收，也未验证前端登录流程。上线或答辩前仍需按“本机启动”步骤用目标容器再检查一次。业务数据仍来自 Olist 与 REES46 的已发布指标，不因登录功能改变口径。
+- 以上是 2026-09-25 的隔离验收历史，不是当时现有 `ecom-api` 容器的端到端 HTTP 验收。2026-10-30 已补正式 Compose 容器的真实登录和浏览器验收，见 `docs/graduation/g5-full-behavior-acceptance.md`；业务数据口径不因登录功能改变。

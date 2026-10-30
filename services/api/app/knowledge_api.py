@@ -22,9 +22,17 @@ from .knowledge_store import KnowledgeStore
 
 
 logger = logging.getLogger(__name__)
-_PROJECT_ROOT = Path(__file__).resolve().parents[3]
-if not (_PROJECT_ROOT / "configs/knowledge/g4_sources.json").is_file():
-    _PROJECT_ROOT = Path("/app")
+
+
+def _find_project_root(source: Path) -> Path:
+    return next(
+        (parent for parent in source.resolve().parents
+         if (parent / "configs/knowledge/g4_sources.json").is_file()),
+        Path("/app"),
+    )
+
+
+_PROJECT_ROOT = _find_project_root(Path(__file__))
 
 
 class MetricImport(BaseModel):
