@@ -150,6 +150,16 @@ class G2dArtifactContractTests(unittest.TestCase):
         self.assertIn("count(*) AS overview_event_count", quality_sql)
         self.assertIn("source_event_count = overview_event_count", quality_sql)
 
+    def test_funnel_uses_grouped_first_events_instead_of_per_event_ranking(self):
+        """Avoid the full-sample row-number indexes that exceeded Trino memory."""
+        funnel_sql = TRINO_TEMPLATE.read_text(encoding="utf-8").split(
+            "-- result:funnel\n", 1
+        )[1].split("-- result:dimension\n", 1)[0]
+        self.assertNotIn("row_number()", funnel_sql.lower())
+        self.assertIn("AS first_view_key", funnel_sql)
+        self.assertIn("AS first_cart_key", funnel_sql)
+        self.assertIn("AS first_purchase_key", funnel_sql)
+
     def test_quality_emits_exact_pass_status_contract(self):
         """Protect the quality result consumed by Task 2 and later publication gates."""
         quality_sql = TRINO_TEMPLATE.read_text(encoding="utf-8").split(

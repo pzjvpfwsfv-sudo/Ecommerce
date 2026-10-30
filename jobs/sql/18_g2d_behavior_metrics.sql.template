@@ -66,14 +66,18 @@ WITH base AS (
     FROM lakehouse.analytics.__SOURCE_TABLE__
         FOR VERSION AS OF __SNAPSHOT_ID__
 ),
+bounds AS (
+    SELECT min(event_date) AS window_start, max(event_date) AS window_end
+    FROM base
+),
 windowed AS (
     SELECT 'DAY' AS window_type, event_date AS window_start, event_date AS window_end,
            event_ts, event_type, user_session, source_file, source_row_number, event_id
     FROM base
     UNION ALL
-    SELECT 'FULL' AS window_type, min(event_date) OVER (), max(event_date) OVER (),
+    SELECT 'FULL' AS window_type, bounds.window_start, bounds.window_end,
            event_ts, event_type, user_session, source_file, source_row_number, event_id
-    FROM base
+    FROM base CROSS JOIN bounds
 ),
 window_counts AS (
     SELECT window_type, window_start, window_end,
@@ -81,22 +85,17 @@ window_counts AS (
     FROM windowed
     GROUP BY window_type, window_start, window_end
 ),
-view_ranked AS (
-    SELECT *, row_number() OVER (
-        PARTITION BY window_type, window_start, user_session
-        ORDER BY event_ts, source_file, source_row_number, event_id
-    ) AS sequence_rank
+first_views AS (
+    SELECT window_type, window_start, window_end, user_session,
+           min(ROW(event_ts, source_file, source_row_number, event_id)) AS first_view_key
     FROM windowed
     WHERE user_session IS NOT NULL AND event_type = 'view'
+    GROUP BY window_type, window_start, window_end, user_session
 ),
-first_views AS (
-    SELECT * FROM view_ranked WHERE sequence_rank = 1
-),
-eligible_carts AS (
-    SELECT carts.*, row_number() OVER (
-        PARTITION BY views.window_type, views.window_start, views.user_session
-        ORDER BY carts.event_ts, carts.source_file, carts.source_row_number, carts.event_id
-    ) AS sequence_rank
+first_carts AS (
+    SELECT views.window_type, views.window_start, views.window_end, views.user_session,
+           min(ROW(carts.event_ts, carts.source_file, carts.source_row_number, carts.event_id))
+               AS first_cart_key
     FROM first_views views
     JOIN windowed carts
         ON carts.window_type = views.window_type
@@ -104,16 +103,13 @@ eligible_carts AS (
        AND carts.user_session = views.user_session
        AND carts.event_type = 'cart'
        AND ROW(carts.event_ts, carts.source_file, carts.source_row_number, carts.event_id)
-           >= ROW(views.event_ts, views.source_file, views.source_row_number, views.event_id)
+           >= views.first_view_key
+    GROUP BY views.window_type, views.window_start, views.window_end, views.user_session
 ),
-first_carts AS (
-    SELECT * FROM eligible_carts WHERE sequence_rank = 1
-),
-eligible_purchases AS (
-    SELECT purchases.*, row_number() OVER (
-        PARTITION BY carts.window_type, carts.window_start, carts.user_session
-        ORDER BY purchases.event_ts, purchases.source_file, purchases.source_row_number, purchases.event_id
-    ) AS sequence_rank
+first_purchases AS (
+    SELECT carts.window_type, carts.window_start, carts.window_end, carts.user_session,
+           min(ROW(purchases.event_ts, purchases.source_file, purchases.source_row_number,
+                   purchases.event_id)) AS first_purchase_key
     FROM first_carts carts
     JOIN windowed purchases
         ON purchases.window_type = carts.window_type
@@ -121,10 +117,8 @@ eligible_purchases AS (
        AND purchases.user_session = carts.user_session
        AND purchases.event_type = 'purchase'
        AND ROW(purchases.event_ts, purchases.source_file, purchases.source_row_number, purchases.event_id)
-           >= ROW(carts.event_ts, carts.source_file, carts.source_row_number, carts.event_id)
-),
-first_purchases AS (
-    SELECT * FROM eligible_purchases WHERE sequence_rank = 1
+           >= carts.first_cart_key
+    GROUP BY carts.window_type, carts.window_start, carts.window_end, carts.user_session
 ),
 funnel_counts AS (
     SELECT views.window_type, views.window_start, views.window_end,
